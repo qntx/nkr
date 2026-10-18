@@ -81,5 +81,5 @@ Each reader thread keeps a queue: new scans always run before resumed ones, so s
 
 ## Durability and format
 
-- An `OK` is sent only after the commit that contains the event has returned. The environment uses LMDB's default synchronous commit.
+- An `OK` is sent only after the commit that contains the event has returned. The environment uses LMDB's default fully synchronous commit: data pages are synced, then the meta page. `MDB_NOMETASYNC` is deliberately not used. It would save one sync per commit, but a system crash could undo the last acknowledged transaction, which strfry effectively accepts ([Benchmarks](/benchmarks#durability)).
 - The format version is stored in `meta`. A binary that finds a different version refuses to open the database. Upgrades go through `nkr export` and `nkr import`. There is no in-place migration code.
