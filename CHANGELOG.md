@@ -71,13 +71,18 @@ The format is based on [Keep a Changelog]; this project follows
     NIP-11 document, CORS preflight, `real_ip_header`.
   - `nkr relay --config <path>` CLI (also `NKR_CONFIG`), TOML config
     (`[db]`/`[events]`/`[relay]`, `deny_unknown_fields`, strfry
-    defaults, `nkr.example.toml`), tracing-subscriber, mimalloc,
+    defaults, `nkr.example.toml`), tracing-subscriber,
     graceful SIGTERM/Ctrl-C shutdown (close code 1001, writer drains
     and commits, threads joined).
 - Benchmarks — reproducible harnesses under `bench/` (standalone
   `nkrbench` crate, Linux container recipe with CPU pinning, macOS
   driver, `aggregate.py`); methodology and results in
   `docs/benchmarks.mdx`.
+
+### Changed
+
+- `nkr-server`: use the system allocator; mimalloc raised memory per
+  connection by 40-55% with no throughput gain in the Linux benchmark.
 
 ### Fixed
 

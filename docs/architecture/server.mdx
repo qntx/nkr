@@ -90,7 +90,7 @@ Layer 2 adds hot reload of the keys that do not need a restart, the write-policy
 
 ## Process
 
-- The global allocator is mimalloc. Logging uses tracing, with JSON output available.
+- nkr uses the system allocator. In the Linux benchmark, mimalloc raised anonymous memory per connection by 40% to 55% with no throughput gain. Logging uses tracing, with JSON output available.
 - On SIGTERM or Ctrl-C, the server stops accepting connections, closes open connections with status 1001, lets the writer finish and commit its queue, and exits.
 - Layer 4 adds zero-downtime restarts in the strfry style: SO_REUSEPORT plus a graceful drain on SIGUSR1. While draining, the old process tails the sequence index, so its remaining subscribers keep receiving events written by the new process.
 - TLS is terminated by a reverse proxy, as strfry recommends.

@@ -118,8 +118,14 @@ impl PartialOrd for Head {
 struct Plan {
     /// `None` for finished or impossible filters.
     mode: Option<Mode>,
-    /// `(created_at, id, seq)` matches collected so far.
+    /// `(created_at, id, seq)` matches collected so far (`Ids` plans
+    /// only; they are bounded by the id count).
     collected: Vec<Match>,
+    /// Matches sharing the merge's current `created_at`; flushed when a
+    /// lower `created_at` pops or the merge is exhausted.
+    group: Vec<Match>,
+    /// Entries counted toward `limit` by flushed groups.
+    taken: u64,
     /// The last seq considered; duplicates of one event (several tag
     /// values reaching it) share the `(created_at, seq)` suffix and
     /// therefore pop consecutively.
@@ -225,6 +231,8 @@ impl Scan {
                 Plan {
                     mode: (!finished).then(|| plan(filter)),
                     collected: Vec::new(),
+                    group: Vec::new(),
+                    taken: 0,
                     last_seq: None,
                     limit,
                     finished,
@@ -326,6 +334,9 @@ fn run_plan(
     emit: &mut dyn FnMut(&str),
 ) -> Result<(), StoreError> {
     let collected = &mut plan.collected;
+    let group = &mut plan.group;
+    let taken = &mut plan.taken;
+    let limit = plan.limit;
     let last_seq = &mut plan.last_seq;
     let Some(mode) = &mut plan.mode else {
         plan.finished = true;
@@ -350,7 +361,7 @@ fn run_plan(
                     return Ok(());
                 }
             }
-            finalize(store, txn, collected, plan.limit, emitted, emit)?;
+            finalize(store, txn, collected, limit, emitted, emit)?;
             plan.finished = true;
         }
         Mode::Ranges { db, cursors } => {
@@ -389,22 +400,61 @@ fn run_plan(
                         cursor: head.cursor,
                     });
                 }
-                try_candidate(store, txn, filter, collected, last_seq, snapshot, head.seq)?;
-                if collected.len() as u64 >= plan.limit {
-                    let boundary = collected.last().map_or(0, |(created_at, _, _)| *created_at);
-                    let ties_done = heap.peek().is_none_or(|next| next.created_at < boundary);
-                    if ties_done {
-                        break;
+                // A lower created_at completes the current group; keys
+                // are popped in non-increasing order.
+                if group.first().is_some_and(|m| head.created_at < m.0) {
+                    flush_group(store, txn, group, taken, limit, emitted, emit)?;
+                    if *taken >= limit {
+                        plan.finished = true;
+                        return Ok(());
                     }
                 }
+                try_candidate(store, txn, filter, group, last_seq, snapshot, head.seq)?;
                 if budget_elapsed(*processed, start, budget) {
                     restore_heads(&mut heap, cursors);
                     return Ok(());
                 }
             }
-            finalize(store, txn, collected, plan.limit, emitted, emit)?;
+            flush_group(store, txn, group, taken, limit, emitted, emit)?;
             plan.finished = true;
         }
+    }
+    Ok(())
+}
+
+/// Emit one complete `created_at` group: id-ascending, at most
+/// `limit - taken` entries, each counted toward `taken` whether or not
+/// it is re-sent (limit-then-dedup across filters).
+fn flush_group(
+    store: &Store,
+    txn: &Reader<'_>,
+    group: &mut Vec<Match>,
+    taken: &mut u64,
+    limit: u64,
+    emitted: &mut HashSet<u64>,
+    emit: &mut dyn FnMut(&str),
+) -> Result<(), StoreError> {
+    group.sort_by_key(|m| m.1);
+    let remaining = usize::try_from(limit.saturating_sub(*taken)).unwrap_or(usize::MAX);
+    for (_, _, seq) in group.drain(..).take(remaining) {
+        *taken += 1;
+        if emitted.insert(seq) {
+            emit_payload(store, txn, seq, emit)?;
+        }
+    }
+    Ok(())
+}
+
+/// Fetch and emit one payload; an entry deleted between slices is
+/// skipped but still counts toward the limit.
+fn emit_payload(
+    store: &Store,
+    txn: &Reader<'_>,
+    seq: u64,
+    emit: &mut dyn FnMut(&str),
+) -> Result<(), StoreError> {
+    if let Some(bytes) = store.payloads.get(txn, &seq.to_be_bytes())? {
+        emit(std::str::from_utf8(bytes).map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?);
     }
     Ok(())
 }
@@ -465,12 +515,7 @@ fn finalize(
         if !emitted.insert(seq) {
             continue;
         }
-        if let Some(bytes) = store.payloads.get(txn, &seq.to_be_bytes())? {
-            emit(
-                std::str::from_utf8(bytes)
-                    .map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?,
-            );
-        }
+        emit_payload(store, txn, seq, emit)?;
     }
     Ok(())
 }
