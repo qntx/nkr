@@ -1,0 +1,35 @@
+---
+title: 0001 Strict protocol layer
+description: Why nkr implements its own strict NIP-01 layer on serde_json and secp256k1 instead of building on rust-nostr.
+---
+
+## Context
+
+The organization's policy is that Rust clients use rust-nostr, and the shared conformance vectors are replayed against it continuously. A relay is in a different position from a client: it is the party that enforces the protocol for everyone else. The registered divergences between rust-nostr 0.45 and the shared vectors include behavior a relay cannot ship:
+
+- an empty `ids` or `authors` list matches every event, while NIP-01 says it MUST match none;
+- uppercase hex is accepted in `id`, `pubkey`, and `sig`, and an over-long `id` is truncated instead of rejected;
+- subscription id length (1 to 64 characters) is not enforced;
+- fixed message arity is not enforced: trailing elements are dropped silently;
+- non-hex NEG payloads are accepted;
+- `COUNT` responses drop `hll` and `approximate`.
+
+The relay hot path also needs things a general SDK model does not provide:
+
+- the raw canonical JSON preserved byte for byte;
+- a packed, zero-copy index record;
+- filter matching without allocation. rust-nostr builds a tag map of owned strings for every event it matches.
+
+## Decision
+
+The `nkr` crate implements the relay-side protocol itself: event validation, canonical encoding, filters, messages, and sessions. It builds on established primitives: serde_json, secp256k1 (libsecp256k1), sha2, faster-hex, and negentropy. Conformance is measured against the same shared vector set used by `@qntx/nostr` and the rust-nostr interop suite. The vectors are vendored with provenance, and every divergence must be listed with its reason.
+
+## Alternatives
+
+- **Build on rust-nostr and patch around it.** Rejected: the violations sit in core types (`Filter`, message parsing) that would have to be rewrapped and revalidated, which costs more than owning a small strict layer. API churn across 0.x releases would also land on the hot path.
+- **Contribute fixes upstream first.** Worth doing on its own merits, but the relay cannot be blocked on another project's release cadence for MUST-level behavior.
+
+## Consequences
+
+- The protocol surface nkr owns is small and relay-specific (a few thousand lines), and it is fully covered by vectors and property tests.
+- NIPs whose behavior is client-side (encryption, NIP-19 encoding, NIP-46) are never implemented here.

@@ -1,0 +1,13 @@
+{
+  "title": "Decisions",
+  "description": "Architecture decision records with the evidence behind each choice.",
+  "pages": [
+    "index",
+    "0001-strict-protocol-layer",
+    "0002-sans-io-core",
+    "0003-lmdb-via-heed",
+    "0004-yawc-websockets",
+    "0005-sequence-snapshot-delivery",
+    "0006-durable-object-sqlite"
+  ]
+}

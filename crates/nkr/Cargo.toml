@@ -1,0 +1,32 @@
+[package]
+name = "nkr"
+description = "Sans-IO Nostr relay protocol core (strict NIP-01)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+secp256k1.workspace = true
+sha2.workspace = true
+faster-hex.workspace = true
+thiserror.workspace = true
+foldhash.workspace = true
+slab.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "event"
+harness = false

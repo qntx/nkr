@@ -1,0 +1,1076 @@
+{
+  "schema": 1,
+  "capability": "core.filter.match",
+  "source": {
+    "kind": "generated",
+    "generator": "@qntx/nostr",
+    "version": "0.12.1",
+    "cross_check": null
+  },
+  "cases": [
+    {
+      "filter": {
+        "ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "ids": [
+          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "ids": [
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "ids": []
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "authors": [
+          "90A80DB6EB294B9EAB0B4E8DDFA3EFE7263458CE2D07566DF4E6C58868FEEF23"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "authors": [
+          "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "authors": []
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "kinds": [
+          1,
+          7
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "kinds": [
+          6
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "since": 1000
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "since": 1001
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "until": 1000
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "until": 999
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "#e": [
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#e": [
+          "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#e": [
+          "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "#p": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#p": [
+          "90A80DB6EB294B9EAB0B4E8DDFA3EFE7263458CE2D07566DF4E6C58868FEEF23"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#t": [
+          "nostr"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#t": [
+          "NOSTR"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "#custom": [
+          "v1"
+        ]
+      },
+      "event": {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pubkey": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "created_at": 2000,
+        "kind": 30023,
+        "tags": [
+          [
+            "d",
+            "post"
+          ],
+          [
+            "a",
+            "30023:90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23:post"
+          ],
+          [
+            "custom",
+            "v1",
+            "v2"
+          ]
+        ],
+        "content": "b",
+        "sig": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#custom": [
+          "v2"
+        ]
+      },
+      "event": {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pubkey": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "created_at": 2000,
+        "kind": 30023,
+        "tags": [
+          [
+            "d",
+            "post"
+          ],
+          [
+            "a",
+            "30023:90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23:post"
+          ],
+          [
+            "custom",
+            "v1",
+            "v2"
+          ]
+        ],
+        "content": "b",
+        "sig": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#d": [
+          "post"
+        ]
+      },
+      "event": {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pubkey": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "created_at": 2000,
+        "kind": 30023,
+        "tags": [
+          [
+            "d",
+            "post"
+          ],
+          [
+            "a",
+            "30023:90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23:post"
+          ],
+          [
+            "custom",
+            "v1",
+            "v2"
+          ]
+        ],
+        "content": "b",
+        "sig": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#a": [
+          "30023:90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23:post"
+        ]
+      },
+      "event": {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pubkey": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "created_at": 2000,
+        "kind": 30023,
+        "tags": [
+          [
+            "d",
+            "post"
+          ],
+          [
+            "a",
+            "30023:90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23:post"
+          ],
+          [
+            "custom",
+            "v1",
+            "v2"
+          ]
+        ],
+        "content": "b",
+        "sig": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#missing": [
+          "x"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#1": [
+          "x"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#e": [
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ]
+      },
+      "event": {
+        "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+          ],
+          [
+            "p",
+            "90A80DB6EB294B9EAB0B4E8DDFA3EFE7263458CE2D07566DF4E6C58868FEEF23"
+          ]
+        ],
+        "content": "c",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "#p": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "event": {
+        "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+          ],
+          [
+            "p",
+            "90A80DB6EB294B9EAB0B4E8DDFA3EFE7263458CE2D07566DF4E6C58868FEEF23"
+          ]
+        ],
+        "content": "c",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "#A": [
+          "x"
+        ]
+      },
+      "event": {
+        "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1500,
+        "kind": 1,
+        "tags": [
+          [
+            "A",
+            "x"
+          ],
+          [
+            "a",
+            "y"
+          ]
+        ],
+        "content": "d",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "#a": [
+          "x"
+        ]
+      },
+      "event": {
+        "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1500,
+        "kind": 1,
+        "tags": [
+          [
+            "A",
+            "x"
+          ],
+          [
+            "a",
+            "y"
+          ]
+        ],
+        "content": "d",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    },
+    {
+      "filter": {
+        "#a": [
+          "y"
+        ]
+      },
+      "event": {
+        "id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1500,
+        "kind": 1,
+        "tags": [
+          [
+            "A",
+            "x"
+          ],
+          [
+            "a",
+            "y"
+          ]
+        ],
+        "content": "d",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "since": 2000,
+        "until": 2000
+      },
+      "event": {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "pubkey": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "created_at": 2000,
+        "kind": 30023,
+        "tags": [
+          [
+            "d",
+            "post"
+          ],
+          [
+            "a",
+            "30023:90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23:post"
+          ],
+          [
+            "custom",
+            "v1",
+            "v2"
+          ]
+        ],
+        "content": "b",
+        "sig": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {},
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "kinds": [
+          1
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ],
+        "since": 500,
+        "until": 1500,
+        "#e": [
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": true
+    },
+    {
+      "filter": {
+        "kinds": [
+          1
+        ],
+        "#e": [
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ],
+        "#t": [
+          "other"
+        ]
+      },
+      "event": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "pubkey": "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+        "created_at": 1000,
+        "kind": 1,
+        "tags": [
+          [
+            "e",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+          ],
+          [
+            "p",
+            "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+          ],
+          [
+            "t",
+            "nostr"
+          ]
+        ],
+        "content": "a",
+        "sig": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "matches": false
+    }
+  ]
+}

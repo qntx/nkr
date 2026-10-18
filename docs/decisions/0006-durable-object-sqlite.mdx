@@ -1,0 +1,23 @@
+---
+title: 0006 Durable Object SQLite
+description: Why the Workers edition stores events in Durable Object SQLite with SQL-native indexes, rather than D1 or an emulated key-value engine.
+---
+
+## Context
+
+On Workers the options are D1, Durable Object storage (SQLite or KV), KV, and R2. A relay needs strongly consistent writes, ordered index scans, and transactional replace semantics, and it needs them close to where its sockets live.
+
+## Decision
+
+Use the SQLite database embedded in the relay Durable Object. Use a relational schema with SQL indexes and queries pinned with `INDEXED BY` ([Workers deployment](/architecture/workers)). The store logic lives in `nkr-sql` behind a minimal executor interface. Production runs it on the object's synchronous SQL API; tests run it natively on rusqlite.
+
+## Alternatives
+
+- **D1.** It is SQLite accessed over the network from the Worker. Every query becomes an asynchronous round trip, while Durable Object SQLite runs in the same thread in microseconds.
+- **The LMDB key layout emulated on a SQLite key-value table.** This would share one query engine with the native store, but every cursor step would cross the wasm/JavaScript boundary, and index emulation multiplies billed rows.
+- **KV or R2.** Eventually consistent or object-granular. Neither supports ordered multi-index queries.
+
+## Consequences
+
+- Two query engines exist, LMDB and SQL. Their equivalence is enforced by the shared differential suite against the core's reference matcher, not assumed.
+- The Workers edition inherits the platform limits: 10 GB, one thread, and the parameter and statement limits. They are stated in the documentation rather than worked around.

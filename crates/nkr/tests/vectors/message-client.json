@@ -1,0 +1,368 @@
+{
+  "schema": 1,
+  "capability": "core.message.client",
+  "source": {
+    "kind": "generated",
+    "generator": "@qntx/nostr",
+    "version": "0.12.1",
+    "cross_check": null
+  },
+  "cases": [
+    {
+      "raw": "[\"EVENT\",{\"id\":\"791e76a4715f1514309947f51c1d20a6f80698833ecc97b7b3a9c56cc3063113\",\"pubkey\":\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"created_at\":1700000000,\"kind\":1,\"tags\":[[\"t\",\"hi\"]],\"content\":\"gm\",\"sig\":\"35931bdb21989c9049272418de0df733b0ebede3bcb45c54161511d8633cab516d6b25cd808ddb8cbba7600940678e3ba3fe655a830abbe631e640e9fc460ff1\"}]"
+    },
+    {
+      "raw": "[\"REQ\",\"sub1\",{\"kinds\":[1]},{\"#e\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"],\"authors\":[\"90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23\"]}]"
+    },
+    {
+      "raw": "[\"REQ\",\"sub\",{\"foo\":1,\"ids\":[]}]",
+      "encoded": "[\"REQ\",\"sub\",{\"ids\":[]}]"
+    },
+    {
+      "raw": "[\"REQ\",\"sub2\",{\"ids\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"]}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":[\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"],\"#e\":[\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\"],\"#custom\":[\"x\"],\"junk\":1}]",
+      "encoded": "[\"REQ\",\"s\",{\"#e\":[\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"],\"ids\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[9],\"kinds\":[1],\"limit\":1e2}]",
+      "encoded": "[\"REQ\",\"s\",{\"kinds\":[1],\"limit\":100}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":\"x\",\"since\":5}]",
+      "encoded": "[\"REQ\",\"s\",{\"since\":5}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[{}],\"kinds\":[7]}]",
+      "encoded": "[\"REQ\",\"s\",{\"kinds\":[7]}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":[123],\"ids\":[\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"]}]",
+      "encoded": "[\"REQ\",\"s\",{\"ids\":[\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"]}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"limit\":null,\"limit\":3}]",
+      "encoded": "[\"REQ\",\"s\",{\"limit\":3}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":1e3,\"until\":2.0,\"limit\":-0}]",
+      "encoded": "[\"REQ\",\"s\",{\"limit\":0,\"since\":1000,\"until\":2}]"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"until\":9007199254740991.0}]",
+      "encoded": "[\"REQ\",\"s\",{\"until\":9007199254740991}]"
+    },
+    {
+      "raw": "[\"CLOSE\",\"sub1\"]"
+    },
+    {
+      "raw": "[\"AUTH\",{\"id\":\"791e76a4715f1514309947f51c1d20a6f80698833ecc97b7b3a9c56cc3063113\",\"pubkey\":\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"created_at\":1700000000,\"kind\":1,\"tags\":[[\"t\",\"hi\"]],\"content\":\"gm\",\"sig\":\"35931bdb21989c9049272418de0df733b0ebede3bcb45c54161511d8633cab516d6b25cd808ddb8cbba7600940678e3ba3fe655a830abbe631e640e9fc460ff1\"}]"
+    },
+    {
+      "raw": "[\"COUNT\",\"c1\",{\"kinds\":[0]}]"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"sub\",{\"kinds\":[1]},\"aabb00\"]"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"sub\",{\"kinds\":[1,2]},\"aabb\"]"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"sub\",{\"kinds\":[1]},\"AABB\"]",
+      "encoded": "[\"NEG-OPEN\",\"sub\",{\"kinds\":[1]},\"aabb\"]"
+    },
+    {
+      "raw": "[\"NEG-MSG\",\"sub\",\"deadbeef\"]"
+    },
+    {
+      "raw": "[\"NEG-MSG\",\"sub\",\"FF00\"]",
+      "encoded": "[\"NEG-MSG\",\"sub\",\"ff00\"]"
+    },
+    {
+      "raw": "[\"NEG-CLOSE\",\"sub\"]"
+    },
+    {
+      "raw": "[\"CLOSE\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]"
+    },
+    {
+      "raw": "[\"CLOSE\",\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\"]"
+    },
+    {
+      "raw": "not json",
+      "error": "MessageError"
+    },
+    {
+      "raw": "{}",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"sub\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",1,{\"kinds\":[1]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"sub\",42]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"sub\",null]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":[\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":[123]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"authors\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[65536]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[-1]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[1.5]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":\"x\"}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":-1}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":\"x\"}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"until\":1.5}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":9007199254740992}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"limit\":-1}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"limit\":-0.5}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"limit\":1e20}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[1e10]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"search\":1}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"#e\":\"x\"}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"#t\":[1]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":[]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":null}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"until\":{}}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"limit\":true}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[1,\"x\"]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[{}]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[{},\"x\"]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":[{}]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":[123,\"x\"]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"#t\":[1,\"x\"]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"ids\":[\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"search\":[]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"since\":5,\"since\":\"x\"}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"s\",{\"kinds\":[7],\"kinds\":\"x\"}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"COUNT\",\"s\",{\"authors\":[1]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"s\",{\"limit\":\"x\"},\"aabb\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"EVENT\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"EVENT\",{}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"EVENT\",{\"id\":\"791e76a4715f1514309947f51c1d20a6f80698833ecc97b7b3a9c56cc3063113\",\"pubkey\":\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"created_at\":1700000000,\"kind\":1,\"tags\":[[\"t\",\"hi\"]],\"content\":\"gm\",\"sig\":\"35931bdb21989c9049272418de0df733b0ebede3bcb45c54161511d8633cab516d6b25cd808ddb8cbba7600940678e3ba3fe655a830abbe631e640e9fc460ff1\"},{}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"CLOSE\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"CLOSE\",\"a\",\"b\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"AUTH\",{}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"COUNT\",\"s\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"COUNT\",\"s\",[]]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"s\",{\"kinds\":[1]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"s\",{\"kinds\":[1]},\"aabb\",\"extra\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"s\",{\"kinds\":[1]},\"abc\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"s\",{\"kinds\":[1]},\"zz\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"s\",42,\"aabb\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-OPEN\",\"s\",{\"kinds\":[1]},42]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-MSG\",\"s\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-MSG\",\"s\",\"\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-MSG\",\"s\",\"a\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-MSG\",\"s\",42]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"CLOSE\",42]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-CLOSE\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-CLOSE\",\"s\",\"x\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"UNKNOWN\",\"s\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"REQ\",\"\",{\"kinds\":[1]}]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"CLOSE\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"CLOSE\",\"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀\"]",
+      "error": "MessageError"
+    },
+    {
+      "raw": "[\"NEG-MSG\",\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"aabb\"]",
+      "error": "MessageError"
+    }
+  ]
+}

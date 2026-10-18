@@ -1,0 +1,40 @@
+---
+title: Testing
+description: How nkr proves correctness and performance — shared vectors, differential and property tests, end-to-end suites, fuzzing, benchmarks against strfry, and CI gates.
+---
+
+## Conformance vectors
+
+The core runs the cross-language vector set maintained with `@qntx/nostr`. The set includes BIP-340 official vectors, event validation, serialization and id, event ordering, filter matching and effective limits, kind classes, and client message parsing; layer 2 adds NIP-42 and HyperLogLog. The vectors are vendored under `crates/nkr/tests/vectors` with their source commit, and are never edited by hand.
+
+Every case must pass. A case that intentionally differs is listed in the runner with its reason. The only accepted class so far is a JSON platform difference: serde rejects duplicate keys and float spellings of integers, which JavaScript's `JSON.parse` accepts. A new divergence needs review. It is never silently skipped.
+
+## Property and differential tests
+
+- **Filter matching:** the compiled matcher on packed records against a naive reference matcher on owned fields, over random events and filters (empty lists, tags, time bounds).
+- **Live index:** the inverted index against brute-force evaluation of every registered subscription, under random sequences of inserts, removals, and disconnects.
+- **Stores (layer 1 and layer 3):** the same random event sets and filters run through the reference matcher, the LMDB engine, and the SQL engine (on rusqlite). Ordered results, limits, ties, replaceable resolution, and deletions must match exactly. This is the counterpart of strfry's dumb-filter fuzzing.
+- **Exactly-once:** concurrent writers while subscriptions scan in time slices; every subscriber must receive each matching event once.
+
+## End-to-end tests
+
+Black-box WebSocket tests drive a real `nkr` process and assert frames: publish and `OK`, durability across restart, `REQ`, `EOSE`, live delivery, `CLOSE` races, limits, and malformed input. The same suite runs against `wrangler dev` (workerd) for the Workers edition.
+
+## Fuzzing
+
+cargo-fuzz targets cover the client message parser, the filter parser, the event parser, and the packed-record reader. Short smoke runs happen in CI through the organization's fuzz workflow. Long runs happen before releases.
+
+## Benchmarks
+
+- **Micro:** criterion benches for parse and verify, filter matching, live-index matching, and frame assembly.
+- **Relay versus strfry:** same machine, same corpus, both with durable writes and signature verification. Measured with amethyst relayBench and nostr-bench: time from receipt to queryable, `OK` latency, ingest throughput, `REQ` time-to-first-event and time-to-`EOSE` percentiles, aggregate query throughput, memory per idle connection, and fan-out CPU. Results are recorded per release.
+- **Soak:** 72 hours of mixed load. Checks: flat memory, bounded LMDB file growth, no slow-consumer leaks, and clean recovery from `kill -9` in the middle of a commit.
+
+## CI gates
+
+- `cargo fmt --check` and `cargo clippy -D warnings` with the workspace lint set.
+- `cargo test` for the workspace, with all features.
+- `cargo doc` with `-D warnings`.
+- `cargo deny check`.
+- `cargo check -p nkr --target wasm32-unknown-unknown`.
+- Docs tree validation.

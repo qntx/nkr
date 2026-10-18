@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: qntx/workflows/.github/workflows/ci-rust.yml@v2
+    permissions:
+      contents: read
+    with:
+      deny: true
+      doc: true
+
+  wasm:
+    name: wasm32 check
+    uses: qntx/workflows/.github/workflows/ci-rust-cross.yml@v2
+    permissions:
+      contents: read
+    with:
+      targets: wasm32-unknown-unknown
+      packages: nkr
+      features: --all-features

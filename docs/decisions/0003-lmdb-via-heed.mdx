@@ -1,0 +1,24 @@
+---
+title: 0003 LMDB via heed
+description: Why native storage is LMDB through heed with a bespoke index layout and query engine.
+---
+
+## Context
+
+strfry's performance rests on LMDB: memory-mapped, lock-free readers that scale with cores; a single writer whose commits can be batched; and zero-copy access to records. The nostr query language is narrow enough that every filter can be served by a known index plan.
+
+## Decision
+
+Use LMDB through heed, the binding maintained by Meilisearch and used in production at scale. Build nkr's own key layout and query engine on top of it ([Storage](/architecture/storage)). Read transactions are opened without thread-local storage, so a transaction can be handed to a reader thread. The one `unsafe` call heed requires, opening the environment, is isolated behind a single documented function.
+
+## Alternatives
+
+- **redb** (pure Rust, no C, no unsafe in the caller). Rejected for the native relay: its read path does not match LMDB's zero-copy page-cache reads for this workload, and parity with strfry is a stated goal.
+- **RocksDB.** An LSM tree trades read latency and predictability for write throughput. Compaction stalls and tuning surface work against the stability goal.
+- **SQLite** (as in nostr-rs-relay). A general SQL engine on the hot path, measurably slower for this workload. It remains the right choice on Workers, where it is the platform's storage ([ADR 0006](/decisions/0006-durable-object-sqlite)).
+
+## Consequences
+
+- One C dependency (liblmdb, vendored by heed) and one audited `unsafe` site.
+- Upgrading the database format goes through export and import. There is no migration code.
+- Operational knowledge from strfry applies directly: map size, readers, read-ahead, and compaction by copy.

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1b0f2bd2c19e73aaf287550e9f701c40287d5776a74024d292e6bfb3b66813d6 # shrinks to specs = [EventSpec { key: 0, kind: 1, created_at: 0, tags: [], content: "a" }], batches = [1], filter_specs = [Mixed(Tag(101, [T("a")]), Any)], max_limit = 3
+cc 7e61a9985860539296be992fecde7f75b5bb4510e68f9af8a23cc86ed6291ece # shrinks to specs = [EventSpec { key: 0, kind: 1, created_at: 0, tags: [P(1), P(2)], content: "a" }], batches = [1], filter_specs = [Mixed(TagP([2, 1]), Any)], max_limit = 3
+cc 358bbec8c1814fdde43ac53be0935c79bc21b72b8e0c2b280d94a9e8d30d88c5 # shrinks to specs = [EventSpec { key: 0, kind: 30001, created_at: 10, tags: [], content: "a" }, EventSpec { key: 0, kind: 3, created_at: 0, tags: [], content: "a" }, EventSpec { key: 1, kind: 1, created_at: 0, tags: [], content: "a" }, EventSpec { key: 0, kind: 1, created_at: 0, tags: [], content: "a" }], batches = [1], filter_specs = [Mixed(Any, Any), Mixed(Any, Limit(1))], max_limit = 3

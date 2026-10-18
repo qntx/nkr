@@ -1,0 +1,123 @@
+//! Criterion bench: 1000-event write batches and a limited kind scan
+//! over `100_000` stored events.
+
+#![allow(
+    unsafe_code,
+    unused_crate_dependencies,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    missing_docs,
+    reason = "bench fixtures may panic; deps cover every bench binary"
+)]
+
+#[path = "../tests/common/mod.rs"]
+mod common;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+use nkr::event::Event;
+use nkr::filter::Filter;
+use nkr_lmdb::{Progress, Scan, Store, StoreOptions};
+use serde_json::json;
+
+fn open() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+    (dir, store)
+}
+
+fn events(key: &secp256k1::Keypair, from: u64, n: u64) -> Vec<Arc<Event>> {
+    // p tags cycle a pool of 20 pubkeys so multi-value `#p` filters match.
+    let keys: Vec<secp256k1::Keypair> = (1..=20u8).map(common::key).collect();
+    (from..from + n)
+        .map(|i| {
+            let pk = keys[usize::try_from(i).unwrap_or_default() % 20]
+                .x_only_public_key()
+                .0;
+            common::event(key, 1, i, &json!([["p", format!("{pk}")]]), "bench")
+        })
+        .collect()
+}
+
+fn bench_store(c: &mut Criterion) {
+    let mut group = c.benchmark_group("nkr_lmdb");
+    group.sample_size(10);
+
+    // Write batches of 1000 unique events; event generation is untimed.
+    let (_dir, store) = open();
+    let key = common::key(7);
+    let counter = AtomicU64::new(0);
+    group.bench_function("write_batch_1000", |b| {
+        b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iters {
+                let base = counter.fetch_add(1_000, Ordering::Relaxed);
+                let batch = events(&key, 10_000_000 + base, 1_000);
+                let started = std::time::Instant::now();
+                store.write(&batch).unwrap();
+                elapsed += started.elapsed();
+            }
+            elapsed
+        });
+    });
+
+    // Scan kinds:[1] limit 500 over 100k stored events.
+    let (_dir2, store2) = open();
+    for chunk in events(&key, 0, 100_000).chunks(10_000) {
+        store2.write(chunk).unwrap();
+    }
+    let filters: Arc<[Filter]> =
+        Arc::from([Filter::parse("{\"kinds\":[1],\"limit\":500}").unwrap()]);
+    group.bench_function("scan_kinds1_limit500_100k", |b| {
+        b.iter(|| {
+            let snapshot = store2.snapshot().unwrap();
+            let mut scan = Scan::new(Arc::clone(&filters), snapshot, 500);
+            let mut emitted = 0usize;
+            while scan
+                .step(&store2, Duration::from_secs(3_600), &mut |_| {
+                    emitted += 1;
+                })
+                .unwrap()
+                == Progress::Pending
+            {}
+            emitted
+        });
+    });
+
+    // Scan a 20-value `#p` filter over the same 100k corpus.
+    let pks: Vec<String> = (1..=20u8)
+        .map(|n| format!("{}", common::key(n).x_only_public_key().0))
+        .collect();
+    let p_json = format!(
+        "{{\"#p\":[{}],\"limit\":500}}",
+        pks.iter()
+            .map(|pk| format!("\"{pk}\""))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let p_filters: Arc<[Filter]> = Arc::from([Filter::parse(&p_json).unwrap()]);
+    group.bench_function("scan_tagp20_limit500_100k", |b| {
+        b.iter(|| {
+            let snapshot = store2.snapshot().unwrap();
+            let mut scan = Scan::new(Arc::clone(&p_filters), snapshot, 500);
+            let mut emitted = 0usize;
+            while scan
+                .step(&store2, Duration::from_secs(3_600), &mut |_| {
+                    emitted += 1;
+                })
+                .unwrap()
+                == Progress::Pending
+            {}
+            emitted
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_store);
+criterion_main!(benches);

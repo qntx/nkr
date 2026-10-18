@@ -1,0 +1,83 @@
+---
+title: Workers deployment
+description: Running nkr on Cloudflare Workers — platform constraints, the single Durable Object design, SQLite schema, hibernation, and the scale-out path.
+---
+
+## Platform facts
+
+Verified against Cloudflare documentation and workers-rs 0.8.7 in October 2026.
+
+| Constraint                | Value                                                              | Consequence                                     |
+| ------------------------- | ------------------------------------------------------------------ | ----------------------------------------------- |
+| Durable Object threading  | single thread, soft limit about 1000 requests per second           | one object is the throughput ceiling of layer 3 |
+| Memory per isolate        | 128 MB, including wasm linear memory, which never shrinks          | cap connections and subscriptions per object    |
+| SQLite per object         | 10 GB; writes fail with `SQLITE_FULL` beyond it                    | retention policy and a clean `error:` rejection |
+| SQL bound parameters      | 100 per statement; statements up to 100 KB                         | lists are bound as one JSON parameter           |
+| SQL API                   | synchronous, same thread, microseconds                             | no async store abstraction is needed            |
+| Output gates              | outgoing messages wait until storage writes are confirmed          | `OK` after durable commit comes for free        |
+| Hibernation attachment    | 16 KB per WebSocket                                                | holds connection metadata only                  |
+| WebSocket compression     | negotiated by the runtime (compatibility date 2023-08-15 or later) | nothing to implement                            |
+| Processes, files, threads | none                                                               | no subprocess plugins, no inotify, no tokio     |
+| Deploys                   | restart objects and drop their WebSockets                          | clients reconnect; this cannot be avoided       |
+
+## Layer 3: one relay object
+
+- **Worker entry (stateless):** answers NIP-11 requests directly without waking the object. It forwards WebSocket upgrades to a single `RelayObject`, whose region is pinned with a location hint.
+- **Relay object:**
+  - accepts hibernatable WebSockets, with an attachment holding the connection id, authenticated pubkeys, and challenge;
+  - runs the same `Session` and `Monitors` code as the native server;
+  - executes store commands through `nkr-sql` on the object's SQLite.
+- **Writes:** a publish runs its SQL synchronously in the current turn and then sends `OK`. Output gates hold the `OK` until the write is durable. Writes in the same turn coalesce into one implicit transaction, which is the platform's version of group commit.
+- **Subscriptions survive hibernation:** a subscription still open at `EOSE` is persisted to a `subs` table (connection id, subscription id, filters JSON), and deleted on `CLOSE` or disconnect. Short request-then-close fetches never write. On wake, the live index is rebuilt lazily, the first time an event has to be matched.
+- **Fan-out:** each event's JSON becomes a JavaScript string once, and every recipient reuses it. This avoids re-crossing the wasm boundary for each socket.
+- **Maintenance:** an alarm expires events (layer 2 semantics) and applies retention.
+- **Write policy:** a service binding to a separate Worker that speaks the strfry plugin JSON. The message shape is the same as the native plugin protocol.
+
+### Schema
+
+```sql
+CREATE TABLE events (
+  seq INTEGER PRIMARY KEY,
+  id BLOB NOT NULL UNIQUE,
+  pubkey BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  kind INTEGER NOT NULL,
+  address BLOB UNIQUE,
+  expiration INTEGER,
+  json TEXT NOT NULL
+);
+CREATE INDEX ix_time ON events (created_at DESC, id);
+CREATE INDEX ix_pubkey ON events (pubkey, created_at DESC);
+CREATE INDEX ix_kind ON events (kind, created_at DESC);
+CREATE INDEX ix_pubkey_kind ON events (pubkey, kind, created_at DESC);
+CREATE INDEX ix_expiration ON events (expiration) WHERE expiration IS NOT NULL;
+CREATE TABLE tags (
+  name TEXT NOT NULL,
+  value BLOB NOT NULL,
+  created_at INTEGER NOT NULL,
+  seq INTEGER NOT NULL,
+  PRIMARY KEY (name, value, created_at, seq)
+) WITHOUT ROWID;
+```
+
+`address` is the same address hash as the LMDB `ix_replace`; its unique constraint enforces one row per replaceable address. Queries pin their index with `INDEXED BY`, so plans are fixed in code as they are in strfry, and tests assert them with `EXPLAIN QUERY PLAN`. A list is bound as a single parameter and expanded with `json_each`, which stays under the 100-parameter limit. Multiple tag conditions become multiple `EXISTS` clauses, so SQL results are exact and need no post-filtering.
+
+### Defaults that differ from native
+
+A single thread cannot time-slice scans, so cost is bounded by limits instead. `max_filter_limit_count` and the negentropy event cap are lowered (configurable), because counting a million rows blocks the object and is billed per row read.
+
+## Layer 5: scale-out
+
+When one object saturates:
+
+- K session objects hold the sockets. They parse, verify, authenticate, and match live subscriptions.
+- One store object performs writes and historical queries, and fans committed batches out to the session objects.
+
+The protocol core does not change. Beyond one store object's 10 GB or its write rate, the store has to be sharded with scatter-gather queries. That is documented as the boundary of the Workers edition, not designed ahead of need.
+
+## Open items for the layer 3 spike
+
+1. Confirm that the Durable Object SQLite authorizer allows `json_each` and `unhex`.
+2. Measure secp256k1 (libsecp256k1 compiled with clang for wasm32) in worker-build: bundle size and verification cost.
+3. Measure one object's sustained events per second, sockets, fan-out rate, and subscription capacity within 128 MB.
+4. Check the query plans for large `authors` lists with `ORDER BY created_at LIMIT`. If they degrade, fall back to per-author queries merged in Rust.

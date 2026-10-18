@@ -1,0 +1,71 @@
+---
+title: Roadmap
+description: The layered implementation plan — scope and exit criteria for each layer, from the strict core to the scaled-out Workers edition.
+---
+
+## Principles
+
+Each layer ends with a relay that works end to end and passes its exit criteria. A later layer adds capability on top of it and never replaces it. A layer is done when its gates pass, not when its code compiles.
+
+## Layer 1: NIP-01 relay, native
+
+Scope:
+
+- `nkr` core: event ingest, packed records, strict filters, messages, session, and the live index, with the vendored vectors.
+- `nkr-lmdb`: schema, sequence counter, group-commit writer, replaceable and addressable semantics, time-sliced snapshot scans.
+- `nkr-server`: axum and yawc, reader pool, monitor shards, backpressure, NIP-11, TOML configuration, graceful shutdown.
+
+Exit criteria:
+
+- every vector passes, or its divergence is recorded;
+- the differential store tests and the exactly-once tests pass;
+- the end-to-end suite passes;
+- a first relayBench comparison with strfry is recorded.
+
+## Layer 2: strfry feature parity
+
+Scope:
+
+- NIP-09, NIP-40, NIP-42 (with restricted read kinds), NIP-45 (with HyperLogLog), NIP-70, and NIP-77 with per-session vector storage;
+- the write-policy plugin, Prometheus metrics, and configuration hot reload;
+- per-connection rate limits;
+- the CLI verbs `import`, `export`, `scan`, `delete`, and `compact`.
+
+Exit criteria:
+
+- strfry plugins run unchanged;
+- negentropy sync against strfry converges in both directions;
+- metrics dashboards built for strfry work unchanged.
+
+## Layer 3: Workers edition
+
+Scope:
+
+- the spike items in [Workers deployment](/architecture/workers);
+- `nkr-sql` with rusqlite-backed tests;
+- `nkr-worker` with a single relay object, hibernation, subscription persistence, alarms, and the service-binding write policy.
+
+Exit criteria:
+
+- the same end-to-end suite passes against workerd;
+- the differential suite passes for the SQL engine;
+- the measured capacity of one object is published.
+
+## Layer 4: performance and operations
+
+Scope:
+
+- optimization driven by the strfry comparison;
+- the persistent negentropy tree;
+- zstd dictionary compression for payloads;
+- zero-downtime restarts (SO_REUSEPORT, drain, sequence tailing);
+- `sync` and `router`.
+
+Exit criteria:
+
+- throughput and p99 latency equal to or better than strfry on the published benchmark;
+- the 72-hour soak test is clean.
+
+## Layer 5: extensions
+
+Scope: NIP-62, NIP-86, and the Workers scale-out (session objects plus a store object), each started only when there is a concrete need.

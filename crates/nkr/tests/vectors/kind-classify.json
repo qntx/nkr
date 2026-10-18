@@ -1,0 +1,156 @@
+{
+  "schema": 1,
+  "capability": "core.kind.classify",
+  "source": {
+    "kind": "generated",
+    "generator": "@qntx/nostr",
+    "version": "0.12.1",
+    "cross_check": "nostr-tools 2.24.1 @7fa1ef4: is*Kind booleans agree (both use `<10000 except 0/3`); 40000+ classifyKind still differ by definition (nostr-tools reports `unknown`/`parameterized`)"
+  },
+  "cases": [
+    {
+      "kind": 0,
+      "regular": false,
+      "replaceable": true,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "replaceable"
+    },
+    {
+      "kind": 1,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 2,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 3,
+      "regular": false,
+      "replaceable": true,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "replaceable"
+    },
+    {
+      "kind": 4,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 44,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 45,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 999,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 1000,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 9999,
+      "regular": true,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 10000,
+      "regular": false,
+      "replaceable": true,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "replaceable"
+    },
+    {
+      "kind": 19999,
+      "regular": false,
+      "replaceable": true,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "replaceable"
+    },
+    {
+      "kind": 20000,
+      "regular": false,
+      "replaceable": false,
+      "ephemeral": true,
+      "addressable": false,
+      "class": "ephemeral"
+    },
+    {
+      "kind": 29999,
+      "regular": false,
+      "replaceable": false,
+      "ephemeral": true,
+      "addressable": false,
+      "class": "ephemeral"
+    },
+    {
+      "kind": 30000,
+      "regular": false,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": true,
+      "class": "addressable"
+    },
+    {
+      "kind": 39999,
+      "regular": false,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": true,
+      "class": "addressable"
+    },
+    {
+      "kind": 40000,
+      "regular": false,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    },
+    {
+      "kind": 65535,
+      "regular": false,
+      "replaceable": false,
+      "ephemeral": false,
+      "addressable": false,
+      "class": "regular"
+    }
+  ]
+}

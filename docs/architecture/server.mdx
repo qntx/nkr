@@ -1,0 +1,96 @@
+---
+title: Native server
+description: The nkr-server runtime — thread topology, connection lifecycle, backpressure, HTTP surface, configuration, and shutdown.
+---
+
+## Topology
+
+| strfry               | nkr                                                 | Notes                                                                              |
+| -------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| 1 Websocket thread   | tokio multi-thread runtime, one task per connection | axum routing with yawc WebSockets (permessage-deflate)                             |
+| 3 Ingester threads   | inside the connection task                          | parse and verify cost about 40 µs; work stealing spreads it across all cores       |
+| 1 Writer thread      | 1 writer OS thread                                  | group commit, see [Storage](/architecture/storage)                                 |
+| 3 ReqWorker threads  | reader pool of OS threads (default 3)               | a connection always maps to the same reader, so its scans and cancels stay ordered |
+| 3 ReqMonitor threads | monitor shards on OS threads (default 3)            | a connection always maps to the same shard                                         |
+| 2 Negentropy threads | reader pool (layer 2)                               | negentropy scans are ordinary scans                                                |
+| Cron thread          | maintenance task (layer 2)                          | expiration and retention                                                           |
+
+Threads exchange messages over bounded channels and share no mutable state. LMDB access stays on the writer and reader threads.
+
+## Connection lifecycle
+
+1. axum accepts the request on the root path. A WebSocket upgrade goes to yawc, with compression negotiated as configured. A request whose `Accept` header contains `application/nostr+json` gets the NIP-11 document with the CORS headers NIP-11 requires. Anything else gets a short plain-text landing response.
+2. The connection task owns its session, an outbound queue, and an atomic counter of pending outbound bytes.
+3. The task applies each command:
+   - publish goes to the writer queue, or to the monitor shards for ephemeral kinds; the reply becomes an `OK` frame;
+   - subscribe registers the subscription with the shard at snapshot S and submits the scan to the connection's reader;
+   - unsubscribe cancels both;
+   - send queues the frame.
+4. Before writing any `EVENT` or `EOSE` frame, the task checks that the subscription generation is still current.
+5. WebSocket pings go out every 55 seconds, below common proxy idle timeouts.
+6. On disconnect, the task tells its reader and its shard to drop everything belonging to the connection.
+
+## Backpressure
+
+- **Inbound:** frames larger than the maximum WebSocket payload (128 KiB) close the connection. The writer queue is bounded; a connection whose publish cannot be queued waits, which throttles that client and nobody else.
+- **Outbound:** a connection whose pending outbound bytes exceed 32 MiB is closed. Above a lower high-water mark, its scans pause. This bounds the memory a slow or stalled client can hold.
+- **Live fan-out:** a shard sends one shared copy of each event's JSON per matching connection. The frame is assembled in the connection task.
+
+## Configuration
+
+TOML, one file, sections mirroring strfry's configuration tree. Defaults are strfry's defaults. Unknown keys are rejected at startup.
+
+```toml
+[db]
+path = "./nkr-db"
+map_size = 10995116277760
+max_readers = 256
+no_read_ahead = false
+
+[events]
+max_event_size = 65536
+reject_events_newer_than_seconds = 900
+reject_events_older_than_seconds = 94608000
+reject_ephemeral_events_older_than_seconds = 60
+max_num_tags = 2000
+max_tag_val_size = 1024
+
+[relay]
+bind = "127.0.0.1"
+port = 7777
+real_ip_header = ""
+max_websocket_payload_size = 131072
+auto_ping_seconds = 55
+max_pending_outbound_bytes = 33554432
+query_timeslice_budget_microseconds = 10000
+
+[relay.limits]
+max_req_filter_size = 200
+max_subs_per_connection = 200
+max_filter_limit = 500
+max_tags_per_filter = 3
+
+[relay.threads]
+readers = 3
+monitors = 3
+
+[relay.compression]
+enabled = true
+sliding_window = true
+
+[relay.info]
+name = "nkr"
+description = ""
+pubkey = ""
+contact = ""
+icon = ""
+```
+
+Layer 2 adds hot reload of the keys that do not need a restart, the write-policy plugin, metrics, and the auth section.
+
+## Process
+
+- The global allocator is mimalloc. Logging uses tracing, with JSON output available.
+- On SIGTERM or Ctrl-C, the server stops accepting connections, closes open connections with status 1001, lets the writer finish and commit its queue, and exits.
+- Layer 4 adds zero-downtime restarts in the strfry style: SO_REUSEPORT plus a graceful drain on SIGUSR1. While draining, the old process tails the sequence index, so its remaining subscribers keep receiving events written by the new process.
+- TLS is terminated by a reverse proxy, as strfry recommends.

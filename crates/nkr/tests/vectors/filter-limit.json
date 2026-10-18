@@ -1,0 +1,188 @@
+{
+  "schema": 1,
+  "capability": "core.filter.limit",
+  "source": {
+    "kind": "generated",
+    "generator": "@qntx/nostr",
+    "version": "0.12.1",
+    "cross_check": null
+  },
+  "cases": [
+    {
+      "filter": {},
+      "limit": null
+    },
+    {
+      "filter": {
+        "ids": []
+      },
+      "limit": 0
+    },
+    {
+      "filter": {
+        "kinds": []
+      },
+      "limit": 0
+    },
+    {
+      "filter": {
+        "authors": []
+      },
+      "limit": 0
+    },
+    {
+      "filter": {
+        "ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        ]
+      },
+      "limit": 2
+    },
+    {
+      "filter": {
+        "limit": 10
+      },
+      "limit": 10
+    },
+    {
+      "filter": {
+        "ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "limit": 10
+      },
+      "limit": 1
+    },
+    {
+      "filter": {
+        "kinds": [
+          0,
+          3
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "limit": 2
+    },
+    {
+      "filter": {
+        "kinds": [
+          0,
+          3
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+          "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ]
+      },
+      "limit": 4
+    },
+    {
+      "filter": {
+        "kinds": [
+          30023
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ],
+        "#d": [
+          "a",
+          "b"
+        ]
+      },
+      "limit": 2
+    },
+    {
+      "filter": {
+        "kinds": [
+          30023,
+          1
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "limit": null
+    },
+    {
+      "filter": {
+        "kinds": [
+          1
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "limit": null
+    },
+    {
+      "filter": {
+        "limit": 5,
+        "kinds": [
+          0,
+          3
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "limit": 2
+    },
+    {
+      "filter": {
+        "#d": []
+      },
+      "limit": null
+    },
+    {
+      "filter": {
+        "ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ]
+      },
+      "limit": 1
+    },
+    {
+      "filter": {
+        "kinds": [
+          0,
+          0,
+          3
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+          "90A80DB6EB294B9EAB0B4E8DDFA3EFE7263458CE2D07566DF4E6C58868FEEF23"
+        ]
+      },
+      "limit": 2
+    },
+    {
+      "filter": {
+        "kinds": [
+          30023
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ],
+        "#d": [
+          "a",
+          "a"
+        ]
+      },
+      "limit": 1
+    },
+    {
+      "filter": {
+        "ids": [
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ],
+        "limit": 10
+      },
+      "limit": 1
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+# cargo-deny configuration.
+#
+# Hooked into CI via the shared `qntx/workflows/ci-rust.yml` runner. Run
+# locally with:
+#
+#   cargo install cargo-deny --locked
+#   cargo deny check
+#
+
+[graph]
+all-features = true
+
+[advisories]
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+unused-allowed-license = "warn"
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "Zlib",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.93
+
+[[licenses.exceptions]]
+# `ring` ships under a custom permissive licence bundle that confuses
+# pure SPDX matching; trust the upstream attestation.
+allow = ["OpenSSL", "ISC", "MIT"]
+crate = "ring"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

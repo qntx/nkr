@@ -1,0 +1,60 @@
+---
+title: Compatibility
+description: NIP support by layer, strfry default alignment, and every deliberate deviation from strfry with its reason.
+---
+
+## NIP support
+
+| NIP | Scope                                                    | Layer                           | Native | Workers                  |
+| --- | -------------------------------------------------------- | ------------------------------- | ------ | ------------------------ |
+| 01  | Protocol, filters, replaceable and addressable semantics | 1                               | yes    | layer 3                  |
+| 11  | Relay information document                               | 1                               | yes    | layer 3                  |
+| 09  | Deletion requests, re-publication blocking               | 2                               | yes    | layer 3                  |
+| 40  | Expiration                                               | 2                               | yes    | layer 3                  |
+| 42  | Authentication, restricted read kinds                    | 2                               | yes    | layer 3                  |
+| 45  | `COUNT`, with HyperLogLog for eligible filters           | 2                               | yes    | layer 3, lower cap       |
+| 70  | Protected events                                         | 2                               | yes    | layer 3                  |
+| 77  | Negentropy sync                                          | 2 (vector), 4 (persistent tree) | yes    | layer 3, lower cap       |
+| 62  | Request to vanish                                        | 5                               | yes    | yes                      |
+| 86  | Relay management API                                     | 5                               | yes    | yes                      |
+| 50  | Search                                                   | not planned natively            | —      | possible later with FTS5 |
+
+## strfry defaults
+
+| Setting                                        | strfry             | nkr native | nkr Workers     |
+| ---------------------------------------------- | ------------------ | ---------- | --------------- |
+| max event size                                 | 65536              | same       | same            |
+| max WebSocket payload                          | 131072             | same       | same            |
+| reject newer than / older than                 | 900 s / 94608000 s | same       | same            |
+| reject ephemeral older than                    | 60 s               | same       | same            |
+| max tags / max tag value size                  | 2000 / 1024        | same       | same            |
+| filters per REQ / subscriptions per connection | 200 / 200          | same       | same            |
+| max filter limit / tag filters per filter      | 500 / 3            | same       | same            |
+| max COUNT scan                                 | 1000000            | same       | lowered         |
+| query time slice                               | 10 ms              | same       | not applicable  |
+| max pending outbound bytes                     | 32 MiB             | same       | runtime-managed |
+| negentropy max sync events                     | 1000000            | same       | lowered         |
+| auto ping                                      | 55 s               | same       | runtime-managed |
+| restricted read kinds (NIP-42)                 | 4, 1059            | same       | same            |
+
+## Behavior kept identical
+
+- No `OK` until the event is durably committed.
+- Tag indexing: single-letter names, first value, values up to 255 bytes. `e` and `p` values must be 64 lowercase hex.
+- Replaceable and addressable resolution: newer `created_at` wins, and on a tie the lower id wins.
+- Write-policy plugin protocol: line-delimited JSON on stdin and stdout, the same input fields, and `accept`, `reject`, and `shadowReject` actions. Existing strfry plugins work unchanged.
+- Prometheus metric names: `nostr_client_messages_total`, `nostr_relay_messages_total`, `nostr_events_total`.
+- CLI verbs: `relay`, `import`, `export`, `scan`, `delete`, `compact`, `sync`.
+
+## Deliberate deviations
+
+| Topic                       | strfry                                      | nkr                                        | Reason                                                                                                                                          |
+| --------------------------- | ------------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Ephemeral events            | stored for 5 minutes, then deleted          | never stored, broadcast directly           | NIP-01 says they are not stored; strfry stores them only because of its inotify design ([ADR 0005](/decisions/0005-sequence-snapshot-delivery)) |
+| Superseded replaceable `OK` | `false`, `replaced: have newer event`       | `false`, `duplicate: have a newer version` | `replaced` is not one of the standard NIP-01 prefixes                                                                                           |
+| Deleted event re-published  | `false`, `deleted: user requested deletion` | `false`, `blocked: deleted by its author`  | `deleted` is not a standard prefix                                                                                                              |
+| Empty filter lists          | depends on version                          | match nothing                              | NIP-01 MUST                                                                                                                                     |
+| Hex prefix filters          | older versions accepted them                | rejected                                   | removed from NIP-01                                                                                                                             |
+| Unknown filter keys         | ignored                                     | `CLOSED` with `unsupported:`               | NIP-01 example behavior; silently widening a query is worse than refusing it                                                                    |
+| Configuration format        | taocpp config                               | TOML, same tree and defaults               | idiomatic for Rust tooling; conversion is mechanical                                                                                            |
+| Database format             | LMDB with golpe schema                      | nkr's own schema                           | migrate with `strfry export` piped into `nkr import`                                                                                            |
