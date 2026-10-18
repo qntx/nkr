@@ -74,6 +74,10 @@ The format is based on [Keep a Changelog]; this project follows
     defaults, `nkr.example.toml`), tracing-subscriber, mimalloc,
     graceful SIGTERM/Ctrl-C shutdown (close code 1001, writer drains
     and commits, threads joined).
+- Benchmarks — reproducible harnesses under `bench/` (standalone
+  `nkrbench` crate, Linux container recipe with CPU pinning, macOS
+  driver, `aggregate.py`); methodology and results in
+  `docs/benchmarks.mdx`.
 
 ### Fixed
 
