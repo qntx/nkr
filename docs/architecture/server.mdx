@@ -19,16 +19,16 @@ Threads exchange messages over bounded channels and share no mutable state. LMDB
 
 ## Connection lifecycle
 
-1. axum accepts the request on the root path. A WebSocket upgrade goes to yawc, with compression negotiated as configured. A request whose `Accept` header contains `application/nostr+json` gets the NIP-11 document with the CORS headers NIP-11 requires. Anything else gets a short plain-text landing response.
+1. axum accepts the request on the root path. A WebSocket upgrade goes to yawc, with compression negotiated as configured. Deflate runs at level 1, as in strfry's uWS: the default level 6 dominated large query responses. A request whose `Accept` header contains `application/nostr+json` gets the NIP-11 document with the CORS headers NIP-11 requires. Anything else gets a short plain-text landing response.
 2. The connection task owns its session, an outbound queue, and an atomic counter of pending outbound bytes.
 3. The task applies each command:
-   - publish goes to the writer queue, or to the monitor shards for ephemeral kinds; the reply becomes an `OK` frame;
-   - subscribe registers the subscription with the shard at snapshot S and submits the scan to the connection's reader;
-   - unsubscribe cancels both;
+   - publish goes to the writer queue, or to the monitor shards for ephemeral kinds. The writer pushes the `OK` frame straight onto the connection's outbound queue after the commit;
+   - subscribe registers the subscription with the connection's shard. The shard records it at snapshot S and forwards the scan to the reader itself, so the request takes connection, shard, reader;
+   - unsubscribe goes to the shard, which drops the monitor and forwards the cancel. Start and cancel for a subscription therefore reach the reader in order;
    - send queues the frame.
 4. Before writing any `EVENT` or `EOSE` frame, the task checks that the subscription generation is still current.
 5. WebSocket pings go out every 55 seconds, below common proxy idle timeouts.
-6. On disconnect, the task tells its reader and its shard to drop everything belonging to the connection.
+6. On disconnect, the task tells its shard to drop everything belonging to the connection; the shard forwards the cancel to the reader.
 
 ## Backpressure
 

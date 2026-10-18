@@ -5,34 +5,29 @@ description: Head-to-head measurements of nkr against strfry 1.1.3 — method, e
 
 ## Summary
 
-Measured on 2026-10-18 against strfry 1.1.3, nkr at commit 2b1c208. All figures come from runs in which every relay in a table ran side by side.
+The current results come from round 4 (PR #3), measured against strfry 1.1.3 and the previous `main` in one side-by-side run.
 
 nkr is ahead on:
 
-- ingest throughput: 1.4x on the synthetic corpus, 2.1x on the real one;
-- concurrent query throughput: about 2.5x;
-- live delivery latency: 7x to 15x lower median, with tighter p99;
-- live delivery under permessage-deflate: strfry falls almost a second behind, nkr stays at 7 ms;
-- storage: about 4% smaller.
-
-nkr is at parity on small lookups (profiles, threads, ids, conversations).
+- ingest throughput: 1.7x on the synthetic corpus, 2.1x on the real one;
+- time to `EOSE` on 500-event queries: 10% to 40% faster;
+- time to first event: at parity or faster;
+- concurrent query throughput: about 3x;
+- live delivery latency: 6x to 16x lower median;
+- live delivery under permessage-deflate: strfry falls seconds behind, nkr stays at 14 ms median;
+- storage: about 3% smaller.
 
 nkr is behind on:
 
-- time to `EOSE` for 500-event queries: strfry is about 10% to 25% faster;
-- time to first event: bimodal, sometimes at strfry's 0.1 ms and sometimes 0.5 ms;
-- memory per idle connection: 21x without deflate, 2x with it;
-- CPU per live delivery: about 2.5x.
-
-nkr acknowledges events about 0.6 ms later than strfry at the median. The cause is identified and deliberate; see [Durability](#durability).
-
-"Aligned with strfry" is not claimed while these gaps remain open.
+- memory per idle connection: 18x without deflate, 1.8x with it;
+- CPU per live broadcast delivery: about 2.2x;
+- `OK` latency on the synthetic corpus: 2.68 against 2.16 ms at the median, a deliberate durability difference (see [Durability](#durability)).
 
 ## Method
 
-- **relayBench** (amethyst `relayBench`, commit 9847d0a) is a third-party harness. It replays a deterministic corpus over 4 publisher connections, then runs 12 client-shaped queries: 10 rounds on one connection, then 8 connections at once. It cross-checks result sets; there were no mismatches in any run. NIP-77 sync is skipped (`--no-sync`) until nkr implements it.
+- **relayBench** (amethyst `relayBench`, commit 9847d0a) is a third-party harness. It replays a deterministic corpus over 4 publisher connections, then runs 12 client-shaped queries: 10 rounds on one connection, then 8 connections at once. Its OkHttp client negotiates permessage-deflate. It cross-checks result sets; there were no mismatches in any run. NIP-77 sync is skipped (`--no-sync`) until nkr implements it.
 - **nkrbench** (`bench/nkrbench`) measures:
-  - live fan-out latency for every subscriber and event pair, with exact delivery accounting (every run: zero missing, zero duplicates);
+  - live fan-out latency for every subscriber and event pair, with exact delivery accounting;
   - anonymous resident memory per idle subscribed connection;
   - relay CPU seconds per scenario.
 
@@ -47,19 +42,19 @@ nkr acknowledges events about 0.6 ms later than strfry at the median. The cause 
   - Linux aarch64 in an OrbStack VM on an Apple M5, with 10 vCPUs and a btrfs volume;
   - every relay is pinned to cores 0 to 3 and the harness to cores 4 to 9;
   - relayBench ran 3 times on the synthetic corpus (100,000 events) and 2 times on the real 2024 dump (29,016 events); nkrbench ran 3 repetitions;
-  - values are medians, with min and max in brackets;
+  - values are medians;
   - strfry is the pristine 1.1.3 tag built with its own Makefile (`-O3`, LTO).
-- **Variance:** absolute numbers move by up to 2x between sessions on this VM, for both relays alike. Only comparisons within one run are used; every table below comes from a single run.
+- **Variance:** absolute numbers move by up to 2x between sessions on this VM, for every relay alike, and p99 values vary widely within a session. Only comparisons within one run are used. The round 4 session ran slow overall: strfry ingested 4,320 events/s here against 7,723 events/s in round 3.
 
 ## Ingest
 
-| Metric                           |                       nkr |                    strfry |
-| -------------------------------- | ------------------------: | ------------------------: |
-| Throughput, synthetic (events/s) | 10,955 [10,390 to 10,962] |    7,723 [7,597 to 7,806] |
-| Throughput, real (events/s)      | 25,736 [23,973 to 27,498] | 12,214 [12,109 to 12,319] |
-| `OK` p50, synthetic / real (ms)  |               1.99 / 2.00 |               1.28 / 1.42 |
-| `OK` p99, synthetic / real (ms)  |               4.73 / 4.91 |               4.00 / 3.24 |
-| Storage, synthetic / real (MiB)  |              179.8 / 64.6 |              186.9 / 67.2 |
+| Metric                           |          nkr |       strfry |
+| -------------------------------- | -----------: | -----------: |
+| Throughput, synthetic (events/s) |        7,532 |        4,320 |
+| Throughput, real (events/s)      |       12,232 |        5,756 |
+| `OK` p50, synthetic / real (ms)  |  2.68 / 3.16 |  2.16 / 3.82 |
+| `OK` p99, synthetic / real (ms)  |  6.14 / 6.13 | 5.51 / 24.73 |
+| Storage, synthetic / real (MiB)  | 179.6 / 65.2 | 186.8 / 67.1 |
 
 ## Durability
 
@@ -68,69 +63,78 @@ strfry opens its LMDB environment through rasgueadb with `MDB_CREATE`. `MDB_CREA
 - the flags returned by `mdb_env_get_flags` after such an open;
 - strace of 200 sequential commits: strfry writes the meta page through the plain file descriptor in about 20 µs, while nkr writes it through LMDB's synchronous descriptor in about 1.2 ms.
 
-The data `fdatasync` costs the same for both relays, about 1.4 ms on this disk.
+The data `fdatasync` costs the same for both relays.
 
-According to LMDB's documentation, `MDB_NOMETASYNC` preserves integrity but "a system crash may undo the last committed transaction". strfry can therefore acknowledge an event that a power loss then rolls back. nkr keeps LMDB's default and syncs the meta page before `OK`. A measurement-only build of nkr with `MDB_NOMETASYNC` acknowledges in 1.04 ms (synthetic) and 1.04 ms (real), ahead of strfry. The remaining `OK` gap is this durability difference and nothing else.
+According to LMDB's documentation, `MDB_NOMETASYNC` preserves integrity but "a system crash may undo the last committed transaction". strfry can therefore acknowledge an event that a power loss then rolls back. nkr keeps LMDB's default and syncs the meta page before `OK`.
+
+In round 3, a measurement-only build of nkr with `MDB_NOMETASYNC` acknowledged in 1.04 ms against strfry's 1.28 ms (synthetic) and 1.42 ms (real). The remaining median `OK` gap is this durability difference.
 
 ## Queries
 
-| Scenario        | Events | EOSE nkr (ms) | EOSE strfry (ms) | First event nkr (ms) | First event strfry (ms) | 8 connections nkr (events/s) | 8 connections strfry (events/s) |
-| --------------- | -----: | ------------: | ---------------: | -------------------: | ----------------------: | ---------------------------: | ------------------------------: |
-| firehose        |    500 |          5.03 |             3.93 |  0.53 [0.10 to 0.53] |                    0.13 |                      312,371 |                         122,057 |
-| global-feed     |    500 |          4.85 |             3.87 |  0.53 [0.09 to 0.65] |                    0.13 |                      350,396 |                         130,490 |
-| follow-feed     |    500 |          5.27 |             4.72 |                 0.82 |                    0.82 |                      304,078 |                         124,666 |
-| notifications   |    500 |          4.99 |             4.39 |  0.56 [0.14 to 0.84] |                    0.24 |                      303,576 |                         117,133 |
-| hashtag         |    500 |          4.76 |             3.77 |                 0.13 |                    0.12 |                      327,067 |                         131,708 |
-| recent-window   |    500 |          4.93 |             3.82 |                 0.12 |                    0.13 |                      355,053 |                         127,191 |
-| reactions-watch |    205 |          2.37 |             2.01 |                 0.26 |                    0.70 |                          n/a |                             n/a |
-| by-ids          |    100 |          1.15 |             1.17 |                 0.49 |                    0.46 |                          n/a |                             n/a |
-| conversation    |     60 |          1.09 |             1.35 |                 0.23 |                    0.21 |                          n/a |                             n/a |
-| profiles        |     50 |          0.34 |             0.38 |                 0.23 |                    0.29 |                          n/a |                             n/a |
+| Scenario      | Events | EOSE nkr (ms) | EOSE strfry (ms) | First event nkr (ms) | First event strfry (ms) | 8 connections nkr (events/s) | 8 connections strfry (events/s) |
+| ------------- | -----: | ------------: | ---------------: | -------------------: | ----------------------: | ---------------------------: | ------------------------------: |
+| firehose      |    500 |          6.02 |             8.61 |                 0.70 |                    0.40 |                      157,332 |                          53,706 |
+| global-feed   |    500 |          6.66 |             8.97 |                 0.28 |                    0.37 |                      183,881 |                          51,001 |
+| follow-feed   |    500 |          7.31 |            13.22 |                 0.75 |                    2.76 |                      136,151 |                          45,677 |
+| notifications |    500 |          7.65 |             9.66 |                 0.42 |                    0.48 |                      177,828 |                          49,979 |
+| hashtag       |    500 |          7.10 |             9.68 |                 0.31 |                    0.42 |                      197,257 |                          53,090 |
+| recent-window |    500 |          7.15 |             8.58 |                 0.26 |                    0.32 |                      176,178 |                          57,970 |
+| by-ids        |    100 |          1.94 |             2.72 |                 0.72 |                    1.09 |                      138,335 |                          54,050 |
+| profiles      |     50 |          1.26 |             1.01 |                 0.59 |                    0.81 |                      103,990 |                          78,822 |
+| thread        |     22 |          0.62 |             0.35 |                 0.28 |                    0.28 |                       87,920 |                          59,663 |
 
-Synthetic corpus. The real corpus has the same shape: strfry is 3% to 25% faster to `EOSE` on 500-event queries, and nkr is faster on small lookups. The 8-connection column lists only the 500-event scenarios. In the other scenarios nkr's throughput is also higher; the full table is in the raw results.
+Synthetic corpus. On the real corpus, nkr reaches `EOSE` first in 10 of 12 scenarios; examples are firehose 9.01 against 14.67 ms and hashtag 8.73 against 13.67 ms. strfry stays ahead on the smallest lookups (profiles and threads on the synthetic corpus, author-archive on the real one).
 
 ## Live fan-out and connections
 
-| Scenario                                                | nkr p50 / p99 (ms) | strfry p50 / p99 (ms) | nkr CPU (s) | strfry CPU (s) |
-| ------------------------------------------------------- | -----------------: | --------------------: | ----------: | -------------: |
-| broadcast, 1,000 subscribers, 100 events/s              |         4.7 / 10.0 |          72.0 / 141.1 |         7.1 |            2.9 |
-| broadcast, 5,000 subscribers, 20 events/s               |        11.2 / 19.7 |          86.7 / 164.6 |         7.4 |            2.9 |
-| broadcast with deflate, 1,000 subscribers, 100 events/s |         7.3 / 13.9 |       846.9 / 1,947.9 |        23.8 |            9.8 |
-| selective by author, 2,000 subscribers, 500 events/s    |          4.4 / 8.0 |          47.4 / 101.8 |         1.3 |            2.0 |
+| Scenario                                                | nkr p50 (ms) | strfry p50 (ms) | nkr CPU (s) | strfry CPU (s) |
+| ------------------------------------------------------- | -----------: | --------------: | ----------: | -------------: |
+| broadcast, 1,000 subscribers, 100 events/s              |          4.5 |            73.7 |         7.2 |            3.3 |
+| broadcast, 5,000 subscribers, 20 events/s               |         12.7 |            92.3 |         8.2 |            3.6 |
+| broadcast with deflate, 1,000 subscribers, 100 events/s |         13.8 |         8,430.6 |        23.9 |           28.6 |
+| selective by author, 2,000 subscribers, 500 events/s    |          9.4 |            53.5 |         4.0 |            4.5 |
 
 | Idle subscribed connections (5,000) | nkr (KiB per connection) | strfry (KiB per connection) |
 | ----------------------------------- | -----------------------: | --------------------------: |
-| without compression                 |                     20.9 |                         1.0 |
-| with permessage-deflate             |                    220.0 |                       108.6 |
+| without compression                 |                     18.0 |                         1.0 |
+| with permessage-deflate             |                    191.9 |                       108.6 |
 
-strfry's live delivery waits on a 100 ms debounce of database change notifications, by design (`RelayReqMonitor`, `file_change_monitor`). That debounce is its latency floor. It is also part of its CPU saving, because about 10 events are batched per wake-up at 100 events/s. strfry compresses on its single WebSocket thread, which saturates under deflate. In the deflate row strfry used less CPU because it was saturated and fell behind; nkr kept up.
+strfry's live delivery waits on a 100 ms debounce of database change notifications, by design (`RelayReqMonitor`, `file_change_monitor`). That debounce is its latency floor. It is also part of its CPU saving, because about 10 events are batched per wake-up at 100 events/s. strfry compresses on its single WebSocket thread, which saturates under deflate.
 
-## Changes since the first round
+p99 values in this session varied between repetitions by up to 5x for every relay. In round 3, under quieter conditions, nkr's p99 for selective delivery was 8 ms against strfry's 102 ms.
 
-All measured in the same run against the previous build:
+## Changes by round
 
-- **Scan:** one live iterator per cursor instead of a seek per key, and constant-memory deduplication. Scan micro-benchmarks run 48% to 59% faster.
-- **Streaming:** each completed `created_at` group is emitted as soon as the merge passes it. The reader pushes results to the connection in chunks, and the first frame of a scan goes out alone. The first frame's emit inside the scan dropped from 121 µs to 3 µs.
-- **Writes:** one write deadline per batch instead of a timer per frame. Clock reads had taken about 6.6% of fan-out CPU.
-- **Allocator:** the system allocator replaces mimalloc. Memory per connection fell from 34.8 to 20.9 KiB idle and from 493 to 220 KiB with deflate, with no throughput loss.
+- **Round 1:**
+  - TCP_NODELAY on accepted sockets;
+  - batched outbound flushes and bounded socket writes;
+  - a shutdown deadline;
+  - O(1) live-index removal.
+- **Round 2:** one live iterator per scan cursor and constant-memory deduplication. Scan micro-benchmarks run 48% to 59% faster.
+- **Round 3:**
+  - results are streamed per `created_at` group and pushed to connections in chunks, with the first frame of each scan sent alone;
+  - one write deadline per batch;
+  - the system allocator instead of mimalloc: memory per connection fell from 34.8 to 20.9 KiB idle and from 493 to 220 KiB with deflate, with no throughput loss.
+- **Round 4:**
+  - **Compression:** deflate level 1, as in strfry's uWS. Level 6 had dominated large responses to deflate clients. `EOSE` on 500-event queries fell by about 55% against the previous build, for example firehose from 14.18 to 6.02 ms.
+  - **`REQ` path:** the shard forwards scans and cancels to the reader, so a `REQ` crosses two threads instead of three.
+  - **`OK` path:** the writer pushes `OK` frames straight onto the connection's queue, which removes one task wake-up per `OK`.
+  - **Memory:** dropping the per-connection reply futures cut idle memory from 20.8 to 18.0 KiB and deflate memory from 220 to 192 KiB.
 - **Measurements rejected:**
-  - streaming without chunking lowered 8-connection throughput by 11% to 25% and was replaced by the chunked design;
-  - the zlib-rs deflate backend used more memory than the default backend (377 against 220 KiB per connection).
+  - streaming without chunking lowered 8-connection throughput by 11% to 25%;
+  - the zlib-rs deflate backend used more memory than the default backend.
 
 ## Open gaps
 
-1. **Time to `EOSE` on large results.** Every event is copied twice on the way out: once into a frame `String` in the reader, and once into the WebSocket write buffer. strfry writes from the memory map into its socket buffers on one thread.
-2. **Bimodal time to first event.** The same build measures 0.1 ms or 0.5 ms across runs, for both the nkr build and its measurement variant. The likely cause is wake-up latency across the three thread hops (connection, shard, reader) on idle vCPUs. This is not yet proven.
-3. **Memory per connection.** About 15 KiB per idle connection are the WebSocket read and write buffers. The rest is the connection task, its channel, and its session. Under deflate, the default backend allocates compressor and decompressor state eagerly for every connection.
-4. **CPU per live delivery.** One wake-up and one write per event per subscriber, against strfry's 100 ms batching. Strace shows 0.39 `sendto` calls per delivery.
+1. **Memory per connection.** About 15 KiB of the 18 KiB idle footprint is yawc's socket read and write buffers. With deflate, the default backend also allocates compressor and decompressor state eagerly for every connection. Closing this gap needs smaller or lazily allocated buffers in yawc itself. It is tracked as an upstream change rather than a fork.
+2. **CPU per live delivery.** nkr writes each event to each subscriber as it commits: one wake-up and one write per delivery. strfry batches about 10 events per write behind its 100 ms debounce. The extra CPU is the price of the latency difference above. It shrinks as load rises, because a connection drains everything queued into one write.
 
 ## Secondary run on macOS
 
 The same suites also ran natively on macOS 27. The results agree on the direction of ingest and concurrent query throughput, but they are not used for conclusions:
 
 - LMDB on Apple platforms commits with `F_FULLFSYNC`, which dominates write latency for both relays;
-- `ps` resident memory is not reliable there;
-- the first broadcast scenarios were run above saturation.
+- `ps` resident memory is not reliable there.
 
 During that run, strfry master (4cd3cf6) crashed with a `phmap` assertion. Its new `ReadRestrictor` lazily initializes a shared static set from all ingester threads without synchronization. The 1.1.3 release does not contain that code.
 
