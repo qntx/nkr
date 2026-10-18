@@ -70,14 +70,20 @@ cp /src/nkr/bench/linux/* /bench/         # driver + wrapper scripts
 Runs:
 
 ```bash
-docker exec nkr-bench bash -lc '/bench/run-relaybench.sh'
+docker exec nkr-bench bash -lc '/bench/run-relaybench.sh nkr-fixed nkr-next nkr-meta'
 docker exec nkr-bench bash -lc '/bench/run-nkrbench.sh /bench/results/nkrbench 3 \
     2>&1 | tee /bench/results/nkrbench.log'
 ```
 
-`run-relaybench.sh` runs relayBench 5 times (3× synthetic 100k seed 1, 2× the
-real corpus), alternating relay order between `nkr-fixed`/`nkr-next` with
-strfry always present via `--strfry-bin`. `run-nkrbench.sh <out> <reps>`
+`run-relaybench.sh <nkr-binary-name>...` runs relayBench 5 times (3× synthetic
+100k seed 1, 2× the real corpus) with every named binary from `/bench/bin`
+side by side with strfry (always present via `--strfry-bin`), rotating the
+order of the nkr binaries between runs. The published durability comparison
+(docs/benchmarks.mdx, "Durability") adds `nkr-meta`: HEAD with one
+measurement-only change in `Store::open`,
+`unsafe { options.flags(EnvFlags::NO_META_SYNC) };`, which reproduces the
+`MDB_NOMETASYNC` that strfry gets from passing `MDB_CREATE` to
+`mdb_env_open`. That build is never shipped. `run-nkrbench.sh <out> <reps>`
 rotates the relay order `strfry, nkr-fixed, nkr-next` each rep and runs
 fanout-broadcast-1k, fanout-broadcast-1k-deflate, fanout-broadcast-5k,
 fanout-selective-2k, conns-5k, conns-5k-deflate, each against a fresh relay

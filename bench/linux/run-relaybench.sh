@@ -1,24 +1,35 @@
 #!/usr/bin/env bash
 # relayBench (third-party harness) on Linux: the JVM harness runs on cores
 # 4-9; the relay wrappers re-pin every relay to cores 0-3.
+# Usage: run-relaybench.sh <nkr-binary-name>...
+#   Each name is a binary under /bench/bin, compared side by side with
+#   pristine strfry in every run. The order of the nkr binaries rotates
+#   between runs; strfry always runs first (a relayBench limitation).
 set -euo pipefail
 OUT=/bench/results
 RB=/bench/relaybench/bin/relaybench
 W=/bench/nkr-relay.sh
 CORPUS=/bench/corpus/nostr_vitor_startup_data.json.gz
-mkdir -p "$OUT" /bench/work/rb
+mkdir -p "$OUT"
 ulimit -n 65536
 
+NAMES=("$@")
+[ "${#NAMES[@]}" -gt 0 ] || { echo "usage: $0 <nkr-binary-name>..." >&2; exit 1; }
+
 run() {
-    local name="$1" first="$2" second="$3"; shift 3
-    taskset -c 4-9 "$RB" --strfry-bin /bench/strfry-pinned.sh \
-        --relay "$first=$W /bench/bin/$first {port} {dir}" \
-        --relay "$second=$W /bench/bin/$second {port} {dir}" \
-        --no-sync --no-color --work /bench/work/rb --out "$OUT/$name" "$@" 2>&1 | tee "$OUT/$name.log"
+    local name="$1" shift_by="$2"; shift 2
+    local order=("${NAMES[@]:shift_by}" "${NAMES[@]:0:shift_by}")
+    local args=()
+    for relay in "${order[@]}"; do
+        args+=(--relay "$relay=$W /bench/bin/$relay {port} {dir}")
+    done
+    taskset -c 4-9 "$RB" --strfry-bin /bench/strfry-pinned.sh "${args[@]}" \
+        --no-sync --no-color --work "/bench/work/rb-$name" --out "$OUT/$name" "$@" 2>&1 | tee "$OUT/$name.log"
 }
 
-run rb-synthetic-100k-r1 nkr-fixed nkr-next --events 100000 --seed 1
-run rb-synthetic-100k-r2 nkr-next nkr-fixed --events 100000 --seed 1
-run rb-synthetic-100k-r3 nkr-fixed nkr-next --events 100000 --seed 1
-run rb-real-r1 nkr-next nkr-fixed --corpus "$CORPUS"
-run rb-real-r2 nkr-fixed nkr-next --corpus "$CORPUS"
+for rep in 1 2 3; do
+    run "rb-synthetic-100k-r$rep" $(( (rep - 1) % ${#NAMES[@]} )) --events 100000 --seed 1
+done
+for rep in 1 2; do
+    run "rb-real-r$rep" $(( (rep - 1) % ${#NAMES[@]} )) --corpus "$CORPUS"
+done
