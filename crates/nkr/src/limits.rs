@@ -4,17 +4,11 @@ use serde::Deserialize;
 
 use crate::event::EventLimits;
 
-/// Per-connection and ingest limits. All fields carry strfry's defaults and
-/// unknown keys are rejected.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// REQ-side limits: filter shape and subscription count. All fields
+/// carry strfry's defaults and unknown keys are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Limits {
-    /// Reject events whose `created_at` is more than this far in the future.
-    pub reject_events_newer_than_seconds: u64,
-    /// Reject events older than this many seconds.
-    pub reject_events_older_than_seconds: u64,
-    /// Reject ephemeral events older than this many seconds.
-    pub reject_ephemeral_events_older_than_seconds: u64,
+pub struct ReqLimits {
     /// Maximum number of filters in a single REQ.
     pub max_req_filter_size: usize,
     /// Maximum concurrently open subscriptions per connection.
@@ -23,21 +17,25 @@ pub struct Limits {
     pub max_filter_limit: u64,
     /// Maximum number of `#x` tag conditions allowed per filter.
     pub max_tags_per_filter: usize,
-    /// Structural event limits enforced at ingest.
-    pub event: EventLimits,
 }
 
-impl Default for Limits {
+impl Default for ReqLimits {
     fn default() -> Self {
         Self {
-            reject_events_newer_than_seconds: 900,
-            reject_events_older_than_seconds: 94_608_000,
-            reject_ephemeral_events_older_than_seconds: 60,
             max_req_filter_size: 200,
             max_subs_per_connection: 200,
             max_filter_limit: 500,
             max_tags_per_filter: 3,
-            event: EventLimits::default(),
         }
     }
+}
+
+/// The limits a session enforces: ingest ([`EventLimits`]) plus REQ-side
+/// ([`ReqLimits`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Limits {
+    /// Event acceptance limits (structure plus `created_at` windows).
+    pub event: EventLimits,
+    /// REQ limits.
+    pub req: ReqLimits,
 }

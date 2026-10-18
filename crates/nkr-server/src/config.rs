@@ -3,26 +3,27 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use nkr::limits::Limits;
+use nkr::event::EventLimits;
+use nkr::limits::{Limits, ReqLimits};
 use nkr_lmdb::StoreOptions;
 use serde::Deserialize;
 
 use crate::ServerError;
 
 /// The whole `nkr.toml` document.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Database environment section.
     pub db: Db,
-    /// Event acceptance limits.
-    pub events: Events,
+    /// Event acceptance limits (`nkr::event::EventLimits` verbatim).
+    pub events: EventLimits,
     /// Relay behaviour section.
     pub relay: Relay,
 }
 
 /// `[db]` — LMDB environment.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Db {
     /// Environment directory.
@@ -35,26 +36,8 @@ pub struct Db {
     pub no_read_ahead: bool,
 }
 
-/// `[events]` — event acceptance limits.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Events {
-    /// Maximum canonical event size in bytes.
-    pub max_event_size: usize,
-    /// Reject events this many seconds in the future.
-    pub reject_events_newer_than_seconds: u64,
-    /// Reject events this many seconds in the past.
-    pub reject_events_older_than_seconds: u64,
-    /// Reject ephemeral events this many seconds in the past.
-    pub reject_ephemeral_events_older_than_seconds: u64,
-    /// Maximum tags per event.
-    pub max_num_tags: usize,
-    /// Maximum tag value size in bytes.
-    pub max_tag_val_size: usize,
-}
-
 /// `[relay]` — network and runtime behaviour.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Relay {
     /// Bind address.
@@ -71,8 +54,8 @@ pub struct Relay {
     pub max_pending_outbound_bytes: usize,
     /// Per-slice scan budget in microseconds.
     pub query_timeslice_budget_microseconds: u64,
-    /// Subscription limits.
-    pub limits: RelayLimits,
+    /// REQ limits (`nkr::limits::ReqLimits` verbatim).
+    pub limits: ReqLimits,
     /// Thread pool sizes.
     pub threads: Threads,
     /// WebSocket compression.
@@ -81,22 +64,8 @@ pub struct Relay {
     pub info: Info,
 }
 
-/// `[relay.limits]` — subscription limits.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RelayLimits {
-    /// Maximum filters per REQ.
-    pub max_req_filter_size: usize,
-    /// Maximum open subscriptions per connection.
-    pub max_subs_per_connection: usize,
-    /// Per-filter limit cap for stored scans.
-    pub max_filter_limit: u64,
-    /// Maximum `#` conditions per filter.
-    pub max_tags_per_filter: usize,
-}
-
 /// `[relay.threads]` — worker thread counts.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Threads {
     /// Scan reader threads.
@@ -106,7 +75,7 @@ pub struct Threads {
 }
 
 /// `[relay.compression]` — permessage-deflate settings.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Compression {
     /// Negotiate permessage-deflate.
@@ -116,7 +85,7 @@ pub struct Compression {
 }
 
 /// `[relay.info]` — NIP-11 document fields.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Info {
     /// Relay name.
@@ -142,19 +111,6 @@ impl Default for Db {
     }
 }
 
-impl Default for Events {
-    fn default() -> Self {
-        Self {
-            max_event_size: 65_536,
-            reject_events_newer_than_seconds: 900,
-            reject_events_older_than_seconds: 94_608_000,
-            reject_ephemeral_events_older_than_seconds: 60,
-            max_num_tags: 2_000,
-            max_tag_val_size: 1_024,
-        }
-    }
-}
-
 impl Default for Relay {
     fn default() -> Self {
         Self {
@@ -165,21 +121,10 @@ impl Default for Relay {
             auto_ping_seconds: 55,
             max_pending_outbound_bytes: 33_554_432,
             query_timeslice_budget_microseconds: 10_000,
-            limits: RelayLimits::default(),
+            limits: ReqLimits::default(),
             threads: Threads::default(),
             compression: Compression::default(),
             info: Info::default(),
-        }
-    }
-}
-
-impl Default for RelayLimits {
-    fn default() -> Self {
-        Self {
-            max_req_filter_size: 200,
-            max_subs_per_connection: 200,
-            max_filter_limit: 500,
-            max_tags_per_filter: 3,
         }
     }
 }
@@ -223,27 +168,15 @@ impl Config {
     /// TOML syntax errors or unknown keys.
     pub fn load(path: &Path) -> Result<Self, ServerError> {
         let text = std::fs::read_to_string(path)?;
-        toml::from_str(&text).map_err(|e| ServerError::Config(e.to_string()))
+        Ok(toml::from_str(&text)?)
     }
 
     /// `nkr::limits::Limits` assembled from `[events]` + `[relay.limits]`.
     #[must_use]
     pub const fn limits(&self) -> Limits {
         Limits {
-            event: nkr::event::EventLimits {
-                max_event_size: self.events.max_event_size,
-                max_num_tags: self.events.max_num_tags,
-                max_tag_val_size: self.events.max_tag_val_size,
-            },
-            reject_events_newer_than_seconds: self.events.reject_events_newer_than_seconds,
-            reject_events_older_than_seconds: self.events.reject_events_older_than_seconds,
-            reject_ephemeral_events_older_than_seconds: self
-                .events
-                .reject_ephemeral_events_older_than_seconds,
-            max_req_filter_size: self.relay.limits.max_req_filter_size,
-            max_subs_per_connection: self.relay.limits.max_subs_per_connection,
-            max_filter_limit: self.relay.limits.max_filter_limit,
-            max_tags_per_filter: self.relay.limits.max_tags_per_filter,
+            event: self.events,
+            req: self.relay.limits,
         }
     }
 
@@ -255,5 +188,19 @@ impl Config {
             max_readers: self.db.max_readers,
             no_read_ahead: self.db.no_read_ahead,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "unit tests may panic on failure")]
+mod tests {
+    use super::*;
+
+    /// The shipped `nkr.example.toml` parses to exactly `Config::default()`.
+    #[test]
+    fn example_toml_matches_defaults() {
+        let text = include_str!("../../../nkr.example.toml");
+        let parsed: Config = toml::from_str(text).unwrap();
+        assert_eq!(parsed, Config::default());
     }
 }

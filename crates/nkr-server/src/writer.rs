@@ -2,16 +2,29 @@
 
 use std::sync::Arc;
 
+use nkr::message::ok_frame;
 use nkr_lmdb::{Store, WriteOutcome};
 use tokio::sync::mpsc;
 
-use crate::channels::{Batch, ShardMsg, WriteRequest};
+use crate::channels::{Batch, Out, ShardMsg, WriteRequest};
 
 /// Maximum events applied per write transaction.
 const BATCH_CAP: usize = 1024;
 
+/// Map one write outcome to the `OK` reply's `(accepted, message)` —
+/// exhaustive so a new [`WriteOutcome`] variant cannot slip in
+/// silently.
+const fn ok_reply(outcome: WriteOutcome) -> (bool, &'static str) {
+    match outcome {
+        WriteOutcome::Stored { .. } | WriteOutcome::Ephemeral => (true, ""),
+        WriteOutcome::Duplicate => (true, "duplicate: have this event"),
+        WriteOutcome::Superseded => (false, "duplicate: have a newer version"),
+    }
+}
+
 /// Writer thread main loop: block for the first request, drain up to
-/// [`BATCH_CAP`], commit once, reply, broadcast the batch to every
+/// [`BATCH_CAP`], commit once, push each request's `OK` straight onto
+/// its connection's outbound queue, and broadcast the batch to every
 /// shard. Exits when every sender is dropped.
 pub(crate) fn run(
     store: &Store,
@@ -33,17 +46,24 @@ pub(crate) fn run(
             Err(err) => {
                 tracing::error!(%err, "store write failed");
                 for req in reqs {
-                    req.reply.send(Err(())).ok();
+                    req.out.push(Out::Frame {
+                        sub: None,
+                        text: ok_frame(&req.event.id(), false, "error: internal error"),
+                    });
                 }
                 continue;
             }
         };
         let mut batch: Batch = Vec::new();
         for (req, (outcome, event)) in reqs.into_iter().zip(outcomes.into_iter().zip(events)) {
+            let (accepted, message) = ok_reply(outcome);
+            req.out.push(Out::Frame {
+                sub: None,
+                text: ok_frame(&event.id(), accepted, message),
+            });
             if let WriteOutcome::Stored { seq } = outcome {
                 batch.push((seq, event));
             }
-            req.reply.send(Ok(outcome)).ok();
         }
         if !batch.is_empty() {
             let batch = Arc::new(batch);

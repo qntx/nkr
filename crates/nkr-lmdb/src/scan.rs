@@ -113,11 +113,9 @@ impl PartialOrd for Head {
     }
 }
 
-/// Per-filter scan state.
+/// Per-filter scan progress shared by both modes.
 #[derive(Debug)]
-struct Plan {
-    /// `None` for finished or impossible filters.
-    mode: Option<Mode>,
+struct PlanState {
     /// `(created_at, id, seq)` matches collected so far (`Ids` plans
     /// only; they are bounded by the id count).
     collected: Vec<Match>,
@@ -131,6 +129,14 @@ struct Plan {
     /// therefore pop consecutively.
     last_seq: Option<u64>,
     limit: u64,
+}
+
+/// Per-filter scan state: the mode machinery plus its progress.
+#[derive(Debug)]
+struct Plan {
+    /// `None` for finished or impossible filters.
+    mode: Option<Mode>,
+    state: PlanState,
     finished: bool,
 }
 
@@ -230,11 +236,13 @@ impl Scan {
                 let finished = filter.is_impossible() || limit == 0;
                 Plan {
                     mode: (!finished).then(|| plan(filter)),
-                    collected: Vec::new(),
-                    group: Vec::new(),
-                    taken: 0,
-                    last_seq: None,
-                    limit,
+                    state: PlanState {
+                        collected: Vec::new(),
+                        group: Vec::new(),
+                        taken: 0,
+                        last_seq: None,
+                        limit,
+                    },
                     finished,
                 }
             })
@@ -258,10 +266,6 @@ impl Scan {
     ///
     /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
     /// broken index invariant.
-    #[allow(
-        clippy::excessive_nesting,
-        reason = "the per-filter loop keeps cursor state readable"
-    )]
     pub fn step(
         &mut self,
         store: &Store,
@@ -273,38 +277,20 @@ impl Scan {
         }
         let start = Instant::now();
         let txn = store.read_txn()?;
-        let mut processed = 0usize;
-        let mut pending = false;
-        {
-            let Self {
-                filters,
-                plans,
-                emitted,
-                snapshot,
-                done: _,
-            } = self;
-            for (filter, plan) in filters.iter().zip(plans.iter_mut()) {
-                if plan.finished {
-                    continue;
-                }
-                run_plan(
-                    store,
-                    &txn,
-                    filter,
-                    plan,
-                    *snapshot,
-                    emitted,
-                    &mut processed,
-                    start,
-                    budget,
-                    emit,
-                )?;
-                if !plan.finished {
-                    pending = true;
-                    break;
-                }
-            }
-        }
+        let pending = {
+            let mut step = Step {
+                store,
+                txn: &txn,
+                snapshot: self.snapshot,
+                emitted: &mut self.emitted,
+                processed: 0,
+                start,
+                budget,
+                emit,
+            };
+            let Self { filters, plans, .. } = self;
+            run_filters(&mut step, filters, plans)?
+        };
         drop(txn);
         self.done = !pending && self.plans.iter().all(|plan| plan.finished);
         Ok(if self.done {
@@ -315,131 +301,176 @@ impl Scan {
     }
 }
 
-/// Drive one filter until it finishes or the budget fires.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::excessive_nesting,
-    reason = "cursor merge state is clearest inline"
-)]
-fn run_plan(
-    store: &Store,
-    txn: &Reader<'_>,
-    filter: &Filter,
-    plan: &mut Plan,
+/// Run one slice over every unfinished plan; `true` when a plan hit
+/// the budget mid-filter (its step resumes next call).
+fn run_filters(
+    step: &mut Step<'_>,
+    filters: &[Filter],
+    plans: &mut [Plan],
+) -> Result<bool, StoreError> {
+    for (filter, plan) in filters.iter().zip(plans.iter_mut()) {
+        if plan.finished {
+            continue;
+        }
+        run_plan(step, filter, plan)?;
+        if !plan.finished {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Per-step state shared by the plan helpers: the store and its read
+/// transaction, the scan snapshot, cross-filter dedup, the wall-clock
+/// budget, and the emit callback.
+struct Step<'a> {
+    store: &'a Store,
+    txn: &'a Reader<'a>,
+    /// Upper bound on seqs this scan may emit.
     snapshot: u64,
-    emitted: &mut HashSet<u64>,
-    processed: &mut usize,
+    /// seqs already emitted by an earlier filter.
+    emitted: &'a mut HashSet<u64>,
+    /// Candidates processed so far this step (budget check cadence).
+    processed: usize,
+    /// When the step began.
     start: Instant,
+    /// Wall-clock budget for this step.
     budget: Duration,
-    emit: &mut dyn FnMut(&str),
-) -> Result<(), StoreError> {
-    let collected = &mut plan.collected;
-    let group = &mut plan.group;
-    let taken = &mut plan.taken;
-    let limit = plan.limit;
-    let last_seq = &mut plan.last_seq;
-    let Some(mode) = &mut plan.mode else {
+    /// Where emitted payloads go.
+    emit: &'a mut dyn FnMut(&str),
+}
+
+/// Drive one filter until it finishes or the budget fires.
+fn run_plan(step: &mut Step<'_>, filter: &Filter, plan: &mut Plan) -> Result<(), StoreError> {
+    let Some(mode) = plan.mode.as_mut() else {
         plan.finished = true;
         return Ok(());
     };
     match mode {
         Mode::Ids { pending } => {
-            while let Some(id) = pending.pop_front() {
-                *processed += 1;
-                if let Some(bytes) = store.db(Index::Id).get(txn, &id)? {
-                    try_candidate(
-                        store,
-                        txn,
-                        filter,
-                        collected,
-                        last_seq,
-                        snapshot,
-                        decode_seq(bytes)?,
-                    )?;
-                }
-                if budget_elapsed(*processed, start, budget) {
-                    return Ok(());
-                }
-            }
-            finalize(store, txn, collected, limit, emitted, emit)?;
-            plan.finished = true;
+            scan_ids(step, filter, &mut plan.state, pending, &mut plan.finished)
         }
-        Mode::Ranges { db, cursors } => {
-            let db = store.db(*db);
-            // One live reverse iterator per cursor, seeded at the saved
-            // bounds; the bounds are only (re)derived when the step ends.
-            let mut iters: Vec<Option<RevIter<'_>>> = Vec::with_capacity(cursors.len());
-            for cursor in cursors.iter() {
-                iters.push(if cursor.exhausted {
-                    None
-                } else {
-                    Some(Box::new(db.rev_range(txn, &cursor.bounds())?))
-                });
-            }
-            let mut heap: BinaryHeap<Head> = BinaryHeap::new();
-            for (i, (iter, cursor)) in iters.iter_mut().zip(cursors.iter_mut()).enumerate() {
-                if let Some(key) = pull(iter, cursor)? {
-                    heap.push(Head {
-                        created_at: key_created_at(&key),
-                        seq: key_seq(&key),
-                        key,
-                        cursor: i,
-                    });
-                }
-            }
-            while let Some(head) = heap.pop() {
-                *processed += 1;
-                if let Some(cursor) = cursors.get_mut(head.cursor)
-                    && let Some(iter) = iters.get_mut(head.cursor)
-                    && let Some(next) = pull(iter, cursor)?
-                {
-                    heap.push(Head {
-                        created_at: key_created_at(&next),
-                        seq: key_seq(&next),
-                        key: next,
-                        cursor: head.cursor,
-                    });
-                }
-                // A lower created_at completes the current group; keys
-                // are popped in non-increasing order.
-                if group.first().is_some_and(|m| head.created_at < m.0) {
-                    flush_group(store, txn, group, taken, limit, emitted, emit)?;
-                    if *taken >= limit {
-                        plan.finished = true;
-                        return Ok(());
-                    }
-                }
-                try_candidate(store, txn, filter, group, last_seq, snapshot, head.seq)?;
-                if budget_elapsed(*processed, start, budget) {
-                    restore_heads(&mut heap, cursors);
-                    return Ok(());
-                }
-            }
-            flush_group(store, txn, group, taken, limit, emitted, emit)?;
-            plan.finished = true;
+        Mode::Ranges { db, cursors } => scan_ranges(
+            step,
+            filter,
+            &mut plan.state,
+            *db,
+            cursors,
+            &mut plan.finished,
+        ),
+    }
+}
+
+/// `ix_id` point lookups, then the sort/truncate/emit finalize pass.
+fn scan_ids(
+    step: &mut Step<'_>,
+    filter: &Filter,
+    state: &mut PlanState,
+    pending: &mut VecDeque<[u8; 32]>,
+    finished: &mut bool,
+) -> Result<(), StoreError> {
+    while let Some(id) = pending.pop_front() {
+        step.processed += 1;
+        if let Some(bytes) = step.store.db(Index::Id).get(step.txn, &id)? {
+            try_candidate(
+                step,
+                filter,
+                &mut state.collected,
+                &mut state.last_seq,
+                decode_seq(bytes)?,
+            )?;
+        }
+        if budget_elapsed(step) {
+            return Ok(());
         }
     }
+    finalize(step, &mut state.collected, state.limit)?;
+    *finished = true;
+    Ok(())
+}
+
+/// The k-way merge over a `Ranges` plan's live cursors: heap-pop the
+/// newest head, refill from its cursor, flush completed `created_at`
+/// groups, and park heads back into cursor bounds when the budget fires.
+fn scan_ranges(
+    step: &mut Step<'_>,
+    filter: &Filter,
+    state: &mut PlanState,
+    index: Index,
+    cursors: &mut [Cursor],
+    finished: &mut bool,
+) -> Result<(), StoreError> {
+    let db = step.store.db(index);
+    // One live reverse iterator per cursor, seeded at the saved
+    // bounds; the bounds are only (re)derived when the step ends.
+    let mut iters: Vec<Option<RevIter<'_>>> = Vec::with_capacity(cursors.len());
+    for cursor in cursors.iter() {
+        iters.push(if cursor.exhausted {
+            None
+        } else {
+            Some(Box::new(db.rev_range(step.txn, &cursor.bounds())?))
+        });
+    }
+    let mut heap: BinaryHeap<Head> = BinaryHeap::new();
+    for (i, (iter, cursor)) in iters.iter_mut().zip(cursors.iter_mut()).enumerate() {
+        if let Some(key) = pull(iter, cursor)? {
+            heap.push(Head {
+                created_at: key_created_at(&key),
+                seq: key_seq(&key),
+                key,
+                cursor: i,
+            });
+        }
+    }
+    while let Some(head) = heap.pop() {
+        step.processed += 1;
+        if let Some(cursor) = cursors.get_mut(head.cursor)
+            && let Some(iter) = iters.get_mut(head.cursor)
+            && let Some(next) = pull(iter, cursor)?
+        {
+            heap.push(Head {
+                created_at: key_created_at(&next),
+                seq: key_seq(&next),
+                key: next,
+                cursor: head.cursor,
+            });
+        }
+        // A lower created_at completes the current group; keys
+        // are popped in non-increasing order.
+        if state.group.first().is_some_and(|m| head.created_at < m.0) {
+            flush_group(step, state)?;
+            if state.taken >= state.limit {
+                *finished = true;
+                return Ok(());
+            }
+        }
+        try_candidate(
+            step,
+            filter,
+            &mut state.group,
+            &mut state.last_seq,
+            head.seq,
+        )?;
+        if budget_elapsed(step) {
+            restore_heads(&mut heap, cursors);
+            return Ok(());
+        }
+    }
+    flush_group(step, state)?;
+    *finished = true;
     Ok(())
 }
 
 /// Emit one complete `created_at` group: id-ascending, at most
 /// `limit - taken` entries, each counted toward `taken` whether or not
 /// it is re-sent (limit-then-dedup across filters).
-fn flush_group(
-    store: &Store,
-    txn: &Reader<'_>,
-    group: &mut Vec<Match>,
-    taken: &mut u64,
-    limit: u64,
-    emitted: &mut HashSet<u64>,
-    emit: &mut dyn FnMut(&str),
-) -> Result<(), StoreError> {
-    group.sort_by_key(|m| m.1);
-    let remaining = usize::try_from(limit.saturating_sub(*taken)).unwrap_or(usize::MAX);
-    for (_, _, seq) in group.drain(..).take(remaining) {
-        *taken += 1;
-        if emitted.insert(seq) {
-            emit_payload(store, txn, seq, emit)?;
+fn flush_group(step: &mut Step<'_>, state: &mut PlanState) -> Result<(), StoreError> {
+    state.group.sort_by_key(|m| m.1);
+    let remaining = usize::try_from(state.limit.saturating_sub(state.taken)).unwrap_or(usize::MAX);
+    for (_, _, seq) in state.group.drain(..).take(remaining) {
+        state.taken += 1;
+        if step.emitted.insert(seq) {
+            emit_payload(step, seq)?;
         }
     }
     Ok(())
@@ -447,14 +478,11 @@ fn flush_group(
 
 /// Fetch and emit one payload; an entry deleted between slices is
 /// skipped but still counts toward the limit.
-fn emit_payload(
-    store: &Store,
-    txn: &Reader<'_>,
-    seq: u64,
-    emit: &mut dyn FnMut(&str),
-) -> Result<(), StoreError> {
-    if let Some(bytes) = store.payloads.get(txn, &seq.to_be_bytes())? {
-        emit(std::str::from_utf8(bytes).map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?);
+fn emit_payload(step: &mut Step<'_>, seq: u64) -> Result<(), StoreError> {
+    if let Some(bytes) = step.store.payloads.get(step.txn, &seq.to_be_bytes())? {
+        (step.emit)(
+            std::str::from_utf8(bytes).map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?,
+        );
     }
     Ok(())
 }
@@ -472,21 +500,18 @@ fn restore_heads(heap: &mut BinaryHeap<Head>, cursors: &mut [Cursor]) {
 }
 
 /// seq/snapshot/dup checks, packed load, `Filter::matches`, collect.
-#[allow(clippy::too_many_arguments, reason = "every input is needed")]
 fn try_candidate(
-    store: &Store,
-    txn: &Reader<'_>,
+    step: &Step<'_>,
     filter: &Filter,
     collected: &mut Vec<Match>,
     last_seq: &mut Option<u64>,
-    snapshot: u64,
     seq: u64,
 ) -> Result<(), StoreError> {
-    if seq > snapshot || *last_seq == Some(seq) {
+    if seq > step.snapshot || *last_seq == Some(seq) {
         return Ok(());
     }
     *last_seq = Some(seq);
-    let Some(bytes) = store.events.get(txn, &seq.to_be_bytes())? else {
+    let Some(bytes) = step.store.events.get(step.txn, &seq.to_be_bytes())? else {
         return Ok(()); // deleted between slices
     };
     let packed = PackedRef::new(bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
@@ -498,24 +523,17 @@ fn try_candidate(
 
 /// Sort collected matches newest-first, truncate to the limit, emit the
 /// payloads, and record the seqs so later filters skip them.
-fn finalize(
-    store: &Store,
-    txn: &Reader<'_>,
-    collected: &mut Vec<Match>,
-    limit: u64,
-    emitted: &mut HashSet<u64>,
-    emit: &mut dyn FnMut(&str),
-) -> Result<(), StoreError> {
+fn finalize(step: &mut Step<'_>, collected: &mut Vec<Match>, limit: u64) -> Result<(), StoreError> {
     collected.sort_by(|a, b| cmp_newest_first((a.0, &a.1), (b.0, &b.1)));
     collected.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     for (_, _, seq) in collected.drain(..) {
         // An earlier filter may already have emitted this seq: it still
         // counts toward this filter's limit boundary, but is not sent
         // twice.
-        if !emitted.insert(seq) {
+        if !step.emitted.insert(seq) {
             continue;
         }
-        emit_payload(store, txn, seq, emit)?;
+        emit_payload(step, seq)?;
     }
     Ok(())
 }
@@ -543,6 +561,8 @@ fn decode_seq(bytes: &[u8]) -> Result<u64, StoreError> {
     Ok(u64::from_be_bytes(*arr))
 }
 
-fn budget_elapsed(processed: usize, start: Instant, budget: Duration) -> bool {
-    processed.is_multiple_of(BUDGET_CHECK_EVERY) && start.elapsed() >= budget
+/// The step's wall-clock budget, checked every `BUDGET_CHECK_EVERY`
+/// candidates.
+fn budget_elapsed(step: &Step<'_>) -> bool {
+    step.processed.is_multiple_of(BUDGET_CHECK_EVERY) && step.start.elapsed() >= step.budget
 }

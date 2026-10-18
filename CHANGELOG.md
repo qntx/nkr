@@ -83,6 +83,23 @@ The format is based on [Keep a Changelog]; this project follows
 
 - `nkr-server`: use the system allocator; mimalloc raised memory per
   connection by 40-55% with no throughput gain in the Linux benchmark.
+- `nkr-server`: permessage-deflate runs at compression level 1
+  (`CompressionLevel::fast`), matching strfry's `deflateInit2` level;
+  query responses no longer pay level-6 compression.
+- `nkr`: `Limits` is now `{ event: EventLimits, req: ReqLimits }` —
+  `EventLimits` gained the three rejection time-window fields and the
+  new `ReqLimits` holds the REQ limits, so `nkr-server` config maps
+  `[events]` and `[relay.limits]` onto them verbatim with no
+  duplicated defaults.
+- `nkr-lmdb`: `WriteOutcome` is no longer `#[non_exhaustive]` and the
+  writer reply is `Option<WriteOutcome>` (`None` = the commit failed);
+  `OK` mapping is an exhaustive match.
+- `nkr-server`: `ServerError` carries source errors
+  (`toml::de::Error`, `std::io::Error`) instead of strings.
+- `nkr-server`: the writer pushes each `OK` straight onto the
+  connection's outbound queue — one fewer task wake-up than the old
+  writer → oneshot → connection task hop; outcome→message mapping is
+  an exhaustive match in the writer itself.
 
 ### Fixed
 
@@ -115,6 +132,11 @@ The format is based on [Keep a Changelog]; this project follows
   entry — each `FilterSlot` stores its position in its index list and
   removal `swap_remove`s it (10k-sub churn on `kinds:[1]`: ~324 ms ->
   ~7 ms per 10k removes+inserts).
+- `nkr-server`: the REQ path lost a hop — connections register only
+  with their monitor shard, which forwards `Start`/`Cancel`/
+  `CancelConn` to the reader over one FIFO channel; `Start` carries
+  the shard's authoritative `last_seq`, and a REQ followed by CLOSE
+  can no longer start a wasted scan after its cancel.
 
 ### Removed
 

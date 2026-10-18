@@ -54,13 +54,13 @@ pub enum ServerError {
     Store(#[from] nkr_lmdb::StoreError),
     /// TOML parse failure.
     #[error("config: {0}")]
-    Config(String),
+    Config(#[from] toml::de::Error),
     /// The HTTP listener failed.
     #[error("serve: {0}")]
-    Serve(String),
+    Serve(#[source] std::io::Error),
     /// A worker thread failed to start.
-    #[error("thread spawn failed")]
-    Spawn,
+    #[error("thread spawn failed: {0}")]
+    Spawn(#[source] std::io::Error),
 }
 
 /// A running server: router state plus the worker threads.
@@ -70,7 +70,7 @@ pub struct Server {
     stop_tx: watch::Sender<bool>,
     writer_tx: mpsc::Sender<WriteRequest>,
     shard_txs: Vec<mpsc::Sender<ShardMsg>>,
-    reader_txs: Vec<std::sync::mpsc::Sender<ReaderMsg>>,
+    reader_txs: Arc<[std::sync::mpsc::Sender<ReaderMsg>]>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -91,28 +91,43 @@ impl Server {
         let max_filter_limit = config.relay.limits.max_filter_limit;
 
         let mut threads = Vec::with_capacity(monitors + readers + 1);
+        let (stop_tx, stop_rx) = watch::channel(false);
 
-        // Monitor shards.
+        // All channels first: shards forward scan control into reader
+        // inboxes, readers reply through shard inboxes.
+        let mut shard_rxs = Vec::with_capacity(monitors);
         let mut shard_txs = Vec::with_capacity(monitors);
         for _ in 0..monitors {
             let (tx, rx) = mpsc::channel::<ShardMsg>(SHARD_QUEUE);
             shard_txs.push(tx);
-            let shard_store = Arc::clone(&store);
-            threads.push(
-                std::thread::Builder::new()
-                    .name("nkr-monitor".into())
-                    .spawn(move || shard::run(&shard_store, rx))
-                    .map_err(|_| ServerError::Spawn)?,
-            );
+            shard_rxs.push(rx);
         }
-
-        // Readers.
+        let mut reader_rxs = Vec::with_capacity(readers);
         let mut reader_txs = Vec::with_capacity(readers);
         for _ in 0..readers {
             let (tx, rx) = std::sync::mpsc::channel::<ReaderMsg>();
             reader_txs.push(tx);
+            reader_rxs.push(rx);
+        }
+        let reader_txs: Arc<[_]> = reader_txs.into();
+
+        // Monitor shards.
+        for rx in shard_rxs {
+            let shard_store = Arc::clone(&store);
+            let shard_readers = Arc::clone(&reader_txs);
+            threads.push(
+                std::thread::Builder::new()
+                    .name("nkr-monitor".into())
+                    .spawn(move || shard::run(&shard_store, rx, shard_readers))
+                    .map_err(ServerError::Spawn)?,
+            );
+        }
+
+        // Readers.
+        for rx in reader_rxs {
             let reader_store = Arc::clone(&store);
             let reader_shards = shard_txs.clone();
+            let reader_shutdown = stop_rx.clone();
             threads.push(
                 std::thread::Builder::new()
                     .name("nkr-reader".into())
@@ -121,13 +136,13 @@ impl Server {
                             &reader_store,
                             &rx,
                             &reader_shards,
-                            monitors,
                             budget,
                             high_water,
                             max_filter_limit,
+                            &reader_shutdown,
                         );
                     })
-                    .map_err(|_| ServerError::Spawn)?,
+                    .map_err(ServerError::Spawn)?,
             );
         }
 
@@ -138,14 +153,11 @@ impl Server {
             std::thread::Builder::new()
                 .name("nkr-writer".into())
                 .spawn(move || writer::run(&store, writer_rx, &writer_shards))
-                .map_err(|_| ServerError::Spawn)?,
+                .map_err(ServerError::Spawn)?,
         );
-
-        let (stop_tx, stop_rx) = watch::channel(false);
         let conn = connection::Handle {
             writer: writer_tx.clone(),
             shards: Arc::from(shard_txs.as_slice()),
-            readers: Arc::from(reader_txs.as_slice()),
             limits: Arc::new(config.limits()),
             ping_interval: Duration::from_secs(config.relay.auto_ping_seconds),
             max_pending_outbound: config.relay.max_pending_outbound_bytes,
@@ -215,7 +227,7 @@ pub async fn serve(
         stop.send_replace(true);
     })
     .await
-    .map_err(|e| ServerError::Serve(e.to_string()))?;
+    .map_err(ServerError::Serve)?;
     // Stop accepting new connection tasks, then give live ones a
     // deadline to close (the watch signal already went out).
     tracker.close();
@@ -231,6 +243,6 @@ pub async fn serve(
     // Joining worker threads blocks; keep it off the runtime.
     tokio::task::spawn_blocking(move || server.stop())
         .await
-        .map_err(|e| ServerError::Serve(format!("stop join: {e}")))?;
+        .map_err(|e| ServerError::Serve(std::io::Error::other(e)))?;
     Ok(())
 }

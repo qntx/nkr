@@ -8,11 +8,22 @@ use nkr::event::Event;
 use nkr::filter::Filter;
 use nkr::message::SubId;
 use nkr::session::SubKey;
-use nkr_lmdb::WriteOutcome;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 /// Connection identifier; also the shard/reader routing key.
 pub type ConnId = u64;
+
+/// Route `conn` to `conn % slots.len()`.
+///
+/// Every routing table is built from a `.max(1)` thread count at
+/// server startup, so `slots` is never empty and `index` is in bounds.
+pub(crate) fn route<T>(slots: &[T], conn: ConnId) -> &T {
+    let index = usize::try_from(conn).unwrap_or(usize::MAX) % slots.len().max(1);
+    let Some(slot) = slots.get(index) else {
+        unreachable!("routing tables are never empty")
+    };
+    slot
+}
 
 /// One committed write batch: `(seq, event)` for `Stored` events only.
 pub type Batch = Vec<(u64, Arc<Event>)>;
@@ -22,15 +33,19 @@ pub type Batch = Vec<(u64, Arc<Event>)>;
 pub struct WriteRequest {
     /// The verified event.
     pub event: Arc<Event>,
-    /// Where the outcome goes.
-    pub reply: oneshot::Sender<Result<WriteOutcome, ()>>,
+    /// The connection's outbound queue; the writer pushes the `OK`
+    /// frame onto it directly (one fewer task wake-up than a reply
+    /// channel bouncing through the connection's `select!`).
+    pub out: Outbound,
 }
 
 /// Inbox item for a monitor shard thread.
 #[derive(Debug)]
 pub enum ShardMsg {
-    /// Register a subscription as pending and reply with the snapshot S —
-    /// the highest seq the shard has already received.
+    /// Register a subscription as pending; the shard forwards a
+    /// [`ReaderMsg::Start`] carrying the current snapshot — the highest
+    /// seq the shard has already received — so a `Cancel` it forwards
+    /// later can never be overtaken by the `Start`.
     Register {
         /// Owning connection.
         conn: ConnId,
@@ -38,10 +53,8 @@ pub enum ShardMsg {
         sub: SubKey,
         /// Compiled filters.
         filters: Arc<[Filter]>,
-        /// Where matches go.
+        /// Where matches and scan results go.
         out: Outbound,
-        /// Receives the snapshot.
-        reply: oneshot::Sender<u64>,
     },
     /// The historical scan finished: flush the pending buffer and mark
     /// the subscription active.
