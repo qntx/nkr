@@ -93,8 +93,6 @@ pub struct RelayLimits {
     pub max_filter_limit: u64,
     /// Maximum `#` conditions per filter.
     pub max_tags_per_filter: usize,
-    /// Limit cap for COUNT responses.
-    pub max_filter_limit_count: u64,
 }
 
 /// `[relay.threads]` — worker thread counts.
@@ -182,7 +180,6 @@ impl Default for RelayLimits {
             max_subs_per_connection: 200,
             max_filter_limit: 500,
             max_tags_per_filter: 3,
-            max_filter_limit_count: 1_000_000,
         }
     }
 }
@@ -247,7 +244,6 @@ impl Config {
             max_subs_per_connection: self.relay.limits.max_subs_per_connection,
             max_filter_limit: self.relay.limits.max_filter_limit,
             max_tags_per_filter: self.relay.limits.max_tags_per_filter,
-            max_filter_limit_count: self.relay.limits.max_filter_limit_count,
         }
     }
 

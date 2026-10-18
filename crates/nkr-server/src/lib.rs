@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
 use clap as _;
 use mimalloc as _;
 use nkr_lmdb::Store;
@@ -150,6 +151,7 @@ impl Server {
             ping_interval: Duration::from_secs(config.relay.auto_ping_seconds),
             max_pending_outbound: config.relay.max_pending_outbound_bytes,
             shutdown: stop_rx,
+            tracker: tokio_util::task::TaskTracker::new(),
         };
         Ok(Self {
             state: http::AppState { config, conn },
@@ -198,8 +200,13 @@ pub async fn serve(
 ) -> Result<(), ServerError> {
     let server = Server::new(config)?;
     let stop = server.stop_tx.clone();
+    let tracker = server.state.conn.tracker.clone();
     axum::serve(
-        listener,
+        listener.tap_io(|tcp: &mut tokio::net::TcpStream| {
+            if let Err(err) = tcp.set_nodelay(true) {
+                tracing::warn!(%err, "failed to set TCP_NODELAY");
+            }
+        }),
         server
             .router()
             .into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -210,6 +217,21 @@ pub async fn serve(
     })
     .await
     .map_err(|e| ServerError::Serve(e.to_string()))?;
-    server.stop();
+    // Stop accepting new connection tasks, then give live ones a
+    // deadline to close (the watch signal already went out).
+    tracker.close();
+    if tokio::time::timeout(Duration::from_secs(10), tracker.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            remaining = tracker.len(),
+            "shutdown deadline hit with open connections"
+        );
+    }
+    // Joining worker threads blocks; keep it off the runtime.
+    tokio::task::spawn_blocking(move || server.stop())
+        .await
+        .map_err(|e| ServerError::Serve(format!("stop join: {e}")))?;
     Ok(())
 }

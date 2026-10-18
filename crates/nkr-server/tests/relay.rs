@@ -589,3 +589,32 @@ async fn half_open_connection_times_out() {
     assert_eq!(close_code, Some(1001));
     relay.stop().await;
 }
+
+#[tokio::test]
+async fn shutdown_with_stuck_client_returns() {
+    let mut config = nkr_server::config::Config::default();
+    config.relay.auto_ping_seconds = 1;
+    let relay = Relay::start_with(config).await;
+    // Fill the store so the REQ produces a large outbound backlog.
+    {
+        let mut ws = relay.connect().await;
+        for i in 0..200u64 {
+            let ev = common::event(&key(40), 1, now(), &json!([]), &format!("e{i:03}"));
+            send_text(&mut ws, &event_wire(&ev)).await;
+            let _ok = recv_text(&mut ws, T).await;
+        }
+    }
+    // This client issues the REQ and never reads another frame.
+    let ws = relay.connect().await;
+    {
+        let mut ws = ws;
+        ws.send(yawc::Frame::text(req_wire("s", "{\"kinds\":[1]}")))
+            .await
+            .unwrap();
+    }
+    // `serve` must return even though the client never drains its
+    // socket: write timeouts and the tracker deadline bound it.
+    tokio::time::timeout(Duration::from_secs(15), relay.stop())
+        .await
+        .expect("serve did not return with a stuck client");
+}

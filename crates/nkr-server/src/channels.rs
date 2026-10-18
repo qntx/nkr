@@ -133,18 +133,12 @@ impl Out {
     /// `Frame`, the serialized frame's size for `Event` (payload plus
     /// `["EVENT",<sub>,` overhead) and `Closed`.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn accounted_bytes(&self) -> usize {
         match self {
             Self::Frame { text, .. } => text.len(),
             Self::Event { sub, event } => event.json().len() + sub.id.json().len() + 12,
             Self::Closed { sub, reason } => sub.id.json().len() + reason.len() + 14,
         }
-    }
-
-    /// Whether the accounted size is zero.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     /// The subscription tag for the `is_current` gate.
@@ -186,7 +180,7 @@ impl Outbound {
     /// Queue a frame. Pushing pending bytes above `max_pending` marks
     /// the connection dead and drops the frame instead.
     pub fn push(&self, out: Out) {
-        let len = out.len();
+        let len = out.accounted_bytes();
         let prev = self.pending.fetch_add(len, Ordering::Relaxed);
         if prev + len > self.max_pending {
             self.pending.fetch_sub(len, Ordering::Relaxed);

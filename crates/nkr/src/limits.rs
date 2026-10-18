@@ -23,8 +23,6 @@ pub struct Limits {
     pub max_filter_limit: u64,
     /// Maximum number of `#x` tag conditions allowed per filter.
     pub max_tags_per_filter: usize,
-    /// Cap applied to a filter's `limit` for COUNT responses.
-    pub max_filter_limit_count: u64,
     /// Structural event limits enforced at ingest.
     pub event: EventLimits,
 }
@@ -39,7 +37,6 @@ impl Default for Limits {
             max_subs_per_connection: 200,
             max_filter_limit: 500,
             max_tags_per_filter: 3,
-            max_filter_limit_count: 1_000_000,
             event: EventLimits::default(),
         }
     }

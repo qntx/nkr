@@ -50,7 +50,6 @@ max_filter_limit = 500
 # Maximum `#x` conditions per filter.
 max_tags_per_filter = 3
 # Limit cap for COUNT responses.
-max_filter_limit_count = 1000000
 
 [relay.threads]
 # Stored-scan reader threads.
