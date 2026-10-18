@@ -58,22 +58,6 @@ fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Feed one frame into the socket buffer; `false` when the write
-/// failed or stalled past `timeout`.
-async fn feed_timed(ws: &mut HttpWebSocket, frame: Frame, timeout: Duration, conn: ConnId) -> bool {
-    match tokio::time::timeout(timeout, ws.feed(frame)).await {
-        Ok(Ok(())) => true,
-        Ok(Err(err)) => {
-            tracing::debug!(%err, conn, "websocket send failed");
-            false
-        }
-        Err(_) => {
-            tracing::debug!(conn, "websocket write stalled");
-            false
-        }
-    }
-}
-
 /// Run one WebSocket connection until close, error, or shutdown.
 #[allow(
     clippy::too_many_lines,
@@ -150,69 +134,64 @@ pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle) {
                         Err(_) => break,
                     }
                 }
-                let mut dead = false;
-                #[allow(
-                    clippy::iter_with_drain,
-                    reason = "the Vec keeps its capacity for the next batch"
-                )]
-                for msg in batch.drain(..) {
+                // Account every drained frame up front: a timeout
+                // mid-batch drops the rest, and their bytes must not
+                // stay charged to the outbound queue.
+                for msg in &batch {
                     out.written(msg.accounted_bytes());
-                    match msg {
-                        Out::Frame { sub, text } => {
-                            if sub.as_ref().is_some_and(|s| !session.is_current(s)) {
-                                continue;
+                }
+                // One deadline covers every surviving feed plus the
+                // flush for this drained batch.
+                let write_result = tokio::time::timeout(handle.ping_interval, async {
+                    #[allow(
+                        clippy::iter_with_drain,
+                        reason = "the Vec keeps its capacity for the next batch"
+                    )]
+                    for msg in batch.drain(..) {
+                        match msg {
+                            Out::Frame { sub, text } => {
+                                if sub.as_ref().is_some_and(|s| !session.is_current(s)) {
+                                    continue;
+                                }
+                                ws.feed(Frame::text(text.into_bytes())).await
                             }
-                            dead = !feed_timed(
-                                ws, Frame::text(text.into_bytes()),
-                                handle.ping_interval, conn,
-                            ).await;
-                        }
-                        Out::Event { sub, event } => {
-                            if !session.is_current(&sub) {
-                                continue;
+                            Out::Event { sub, event } => {
+                                if !session.is_current(&sub) {
+                                    continue;
+                                }
+                                let text = event_frame(&sub.id, event.json());
+                                ws.feed(Frame::text(text.into_bytes())).await
                             }
-                            let text = event_frame(&sub.id, event.json());
-                            dead = !feed_timed(
-                                ws, Frame::text(text.into_bytes()),
-                                handle.ping_interval, conn,
-                            ).await;
-                        }
-                        Out::Closed { sub, reason } => {
-                            if !session.close_by_relay(&sub) {
-                                continue;
-                            }
-                            drop(reader.send(ReaderMsg::Cancel {
-                                conn,
-                                sub_id: sub.id.clone(),
-                            }));
-                            drop(shard
-                                .send(ShardMsg::Remove {
+                            Out::Closed { sub, reason } => {
+                                if !session.close_by_relay(&sub) {
+                                    continue;
+                                }
+                                drop(reader.send(ReaderMsg::Cancel {
                                     conn,
                                     sub_id: sub.id.clone(),
-                                })
-                                .await);
-                            let text = closed_frame(&sub.id, &reason);
-                            dead = !feed_timed(
-                                ws, Frame::text(text.into_bytes()),
-                                handle.ping_interval, conn,
-                            ).await;
+                                }));
+                                drop(shard
+                                    .send(ShardMsg::Remove {
+                                        conn,
+                                        sub_id: sub.id.clone(),
+                                    })
+                                    .await);
+                                let text = closed_frame(&sub.id, &reason);
+                                ws.feed(Frame::text(text.into_bytes())).await
+                            }
                         }
+                        .map_err(|err| err.to_string())?;
                     }
-                    if dead {
-                        break;
-                    }
-                }
-                if dead {
-                    break;
-                }
-                match tokio::time::timeout(handle.ping_interval, ws.flush()).await {
+                    ws.flush().await.map_err(|err| err.to_string())
+                }).await;
+                match write_result {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
-                        tracing::debug!(%err, conn, "websocket flush failed");
+                        tracing::debug!(%err, conn, "websocket write failed");
                         break;
                     }
                     Err(_) => {
-                        tracing::debug!(conn, "websocket flush stalled");
+                        tracing::debug!(conn, "websocket write stalled");
                         break;
                     }
                 }

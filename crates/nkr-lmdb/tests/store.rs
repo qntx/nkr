@@ -413,3 +413,27 @@ fn id_lookup_by_ids_filter() {
     );
     assert_eq!(got, vec![a.json().to_owned()]);
 }
+
+#[test]
+fn scan_emits_first_group_before_step_ends() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let events: Vec<_> = (0..1_000u64)
+        .map(|i| event(&k, 1, 1_000 + i, &json!([]), &format!("e{i}")))
+        .collect();
+    store.write(&events).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    let filters: Arc<[Filter]> =
+        Arc::from([Filter::parse("{\"kinds\":[1],\"limit\":500}").unwrap()]);
+    let mut scan = Scan::new(filters, snapshot, 500);
+    let mut emitted = 0usize;
+    // A zero-budget step stops after BUDGET_CHECK_EVERY candidates; a
+    // streaming scan has already flushed completed created_at groups.
+    let progress = scan
+        .step(&store, Duration::ZERO, &mut |_| {
+            emitted += 1;
+        })
+        .unwrap();
+    assert_eq!(progress, Progress::Pending);
+    assert!(emitted > 0, "first step emitted nothing");
+}

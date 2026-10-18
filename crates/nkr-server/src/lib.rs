@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use axum::serve::ListenerExt;
 use clap as _;
-use mimalloc as _;
 use nkr_lmdb::Store;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};

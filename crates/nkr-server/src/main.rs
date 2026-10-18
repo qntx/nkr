@@ -8,11 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use mimalloc::MiMalloc;
 use nkr_server::config::Config;
-
-#[global_allocator]
-static ALLOC: MiMalloc = MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "nkr", version, about = "a Nostr relay")]

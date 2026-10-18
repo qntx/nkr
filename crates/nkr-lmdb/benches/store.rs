@@ -44,6 +44,65 @@ fn events(key: &secp256k1::Keypair, from: u64, n: u64) -> Vec<Arc<Event>> {
         .collect()
 }
 
+fn emitted_count(store: &Store, filters: &Arc<[Filter]>) -> usize {
+    let snapshot = store.snapshot().unwrap();
+    let mut scan = Scan::new(Arc::clone(filters), snapshot, 500);
+    let mut emitted = 0usize;
+    while scan
+        .step(store, Duration::from_secs(3_600), &mut |_| {
+            emitted += 1;
+        })
+        .unwrap()
+        == Progress::Pending
+    {}
+    emitted
+}
+
+fn first_emit(store: &Store, filters: &Arc<[Filter]>) -> Duration {
+    let snapshot = store.snapshot().unwrap();
+    let mut scan = Scan::new(Arc::clone(filters), snapshot, 500);
+    let started = std::time::Instant::now();
+    let mut first = None;
+    scan.step(store, Duration::from_secs(3_600), &mut |_| {
+        if first.is_none() {
+            first = Some(started.elapsed());
+        }
+    })
+    .unwrap();
+    first.unwrap_or_default()
+}
+
+fn author_setup() -> (tempfile::TempDir, Store, Arc<[Filter]>) {
+    let (dir, store) = open();
+    let keys: Vec<secp256k1::Keypair> = (1..=50u8).map(common::key).collect();
+    let events: Vec<Arc<Event>> = (0..100_000u64)
+        .map(|i| {
+            common::event(
+                &keys[usize::try_from(i).unwrap_or_default() % 50],
+                1,
+                i,
+                &json!([]),
+                "bench",
+            )
+        })
+        .collect();
+    for chunk in events.chunks(10_000) {
+        store.write(chunk).unwrap();
+    }
+    let authors_json = format!(
+        "{{\"authors\":[{}],\"limit\":500}}",
+        keys.iter()
+            .map(|k| format!("\"{}\"", k.x_only_public_key().0))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    (
+        dir,
+        store,
+        Arc::from([Filter::parse(&authors_json).unwrap()]),
+    )
+}
+
 fn bench_store(c: &mut Criterion) {
     let mut group = c.benchmark_group("nkr_lmdb");
     group.sample_size(10);
@@ -74,19 +133,7 @@ fn bench_store(c: &mut Criterion) {
     let filters: Arc<[Filter]> =
         Arc::from([Filter::parse("{\"kinds\":[1],\"limit\":500}").unwrap()]);
     group.bench_function("scan_kinds1_limit500_100k", |b| {
-        b.iter(|| {
-            let snapshot = store2.snapshot().unwrap();
-            let mut scan = Scan::new(Arc::clone(&filters), snapshot, 500);
-            let mut emitted = 0usize;
-            while scan
-                .step(&store2, Duration::from_secs(3_600), &mut |_| {
-                    emitted += 1;
-                })
-                .unwrap()
-                == Progress::Pending
-            {}
-            emitted
-        });
+        b.iter(|| emitted_count(&store2, &filters));
     });
 
     // Scan a 20-value `#p` filter over the same 100k corpus.
@@ -102,61 +149,23 @@ fn bench_store(c: &mut Criterion) {
     );
     let p_filters: Arc<[Filter]> = Arc::from([Filter::parse(&p_json).unwrap()]);
     group.bench_function("scan_tagp20_limit500_100k", |b| {
-        b.iter(|| {
-            let snapshot = store2.snapshot().unwrap();
-            let mut scan = Scan::new(Arc::clone(&p_filters), snapshot, 500);
-            let mut emitted = 0usize;
-            while scan
-                .step(&store2, Duration::from_secs(3_600), &mut |_| {
-                    emitted += 1;
-                })
-                .unwrap()
-                == Progress::Pending
-            {}
-            emitted
-        });
+        b.iter(|| emitted_count(&store2, &p_filters));
     });
 
     // Scan a 50-value `authors` filter over 100k events spread across
     // those authors.
-    let (_dir3, store3) = open();
-    let author_keys: Vec<secp256k1::Keypair> = (1..=50u8).map(common::key).collect();
-    let author_events: Vec<Arc<Event>> = (0..100_000u64)
-        .map(|i| {
-            common::event(
-                &author_keys[usize::try_from(i).unwrap_or_default() % 50],
-                1,
-                i,
-                &json!([]),
-                "bench",
-            )
-        })
-        .collect();
-    for chunk in author_events.chunks(10_000) {
-        store3.write(chunk).unwrap();
-    }
-    let authors_json = format!(
-        "{{\"authors\":[{}],\"limit\":500}}",
-        author_keys
-            .iter()
-            .map(|k| format!("\"{}\"", k.x_only_public_key().0))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let author_filters: Arc<[Filter]> = Arc::from([Filter::parse(&authors_json).unwrap()]);
+    let (_dir3, store3, author_filters) = author_setup();
     group.bench_function("scan_authors50_limit500_100k", |b| {
-        b.iter(|| {
-            let snapshot = store3.snapshot().unwrap();
-            let mut scan = Scan::new(Arc::clone(&author_filters), snapshot, 500);
-            let mut emitted = 0usize;
-            while scan
-                .step(&store3, Duration::from_secs(3_600), &mut |_| {
-                    emitted += 1;
-                })
-                .unwrap()
-                == Progress::Pending
-            {}
-            emitted
+        b.iter(|| emitted_count(&store3, &author_filters));
+    });
+    // Time from step start until the emit callback first fires.
+    group.bench_function("scan_first_emit_kinds1_limit500_100k", |b| {
+        b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iters {
+                elapsed += first_emit(&store2, &filters);
+            }
+            elapsed
         });
     });
     group.finish();
