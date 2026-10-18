@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate relayBench results.json files and nkrbench results.jsonl.
+"""Aggregate relayBench results.json files and nosfry-bench results.jsonl.
 
 Usage: aggregate.py <results-root>
 Prints the median and [min, max] across repeated runs for every metric.
@@ -72,8 +72,8 @@ def relaybench(prefix):
             print(f"| {scenario} | {events} | " + " | ".join(cells) + " |")
 
 
-def nkrbench():
-    files = sorted(glob.glob(f"{root}/nkrbench*/results.jsonl"))
+def nosfry_bench():
+    files = sorted(glob.glob(f"{root}/nosfry-bench*/results.jsonl"))
     rows = [json.loads(line) for f in files for line in open(f) if line.strip()]
     if not rows:
         return
@@ -85,7 +85,7 @@ def nkrbench():
         else:
             key += f"-{row['requested']}"
         groups[(key, row["label"])].append(row)
-    print(f"\n## nkrbench: {len(rows)} rows")
+    print(f"\n## nosfry-bench: {len(rows)} rows")
     for key in sorted({k for k, _ in groups}):
         print(f"\n### {key}")
         labels = sorted(label for k, label in groups if k == key)
@@ -109,4 +109,4 @@ def nkrbench():
 
 relaybench("rb-synthetic-100k")
 relaybench("rb-real")
-nkrbench()
+nosfry_bench()

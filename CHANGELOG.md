@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `nkr` are documented in this file.
+All notable changes to `nosfry` are documented in this file.
 
 The format is based on [Keep a Changelog]; this project follows
 [Semantic Versioning].
@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
-- `nkr` — sans-IO protocol core (no async, no I/O, no clock, no
+- `nosfry` — sans-IO protocol core (no async, no I/O, no clock, no
   randomness, `forbid(unsafe_code)`, `wasm32-unknown-unknown` clean):
   - `kind`: `Kind`/`KindClass` with NIP-01 range predicates.
   - `event`: strict borrowed `UnverifiedEvent::parse` /
@@ -40,11 +40,11 @@ The format is based on [Keep a Changelog]; this project follows
     still matches.
   - `monitor`: live-subscription inverted index (`Monitors`) with
     single-field-per-filter indexing and stamp-deduped `matches`.
-- Vendored `qntx/nostr` test vectors under `crates/nkr/tests/vectors`
+- Vendored `qntx/nostr` test vectors under `crates/nosfry/tests/vectors`
   with explicit `DIVERGENCES` lists; proptest differential suites
   (filter matching, packed round trip, monitor vs brute force);
   criterion bench `benches/event.rs`.
-- `nkr-lmdb` — synchronous LMDB event store (native only; no async, no
+- `nosfry-lmdb` — synchronous LMDB event store (native only; no async, no
   internal threads; the server owns the writer thread and reader pool):
   - `Store::open` (format-versioned `meta`, persistent `next_seq`),
     `Store::write` (single transaction, arrival order; `Stored` /
@@ -58,8 +58,8 @@ The format is based on [Keep a Changelog]; this project follows
     deduplication.
   - Differential proptest against a naive model, snapshot/persistence/
     replaceable/duplicate tests, criterion bench `benches/store.rs`.
-- `nkr-server` — the `nkr` relay executable (package `nkr-server`,
-  `[[bin]] nkr`, `publish = false`):
+- `nosfry-server` — the `nosfry` relay executable (package `nosfry-server`,
+  `[[bin]] nosfry`, `publish = false`):
   - Shared-nothing threads: one writer (group commits + batch
     broadcast), M monitor shards (live-subscription `Monitors` index,
     snapshot authority, pending buffers), N reader threads
@@ -69,70 +69,71 @@ The format is based on [Keep a Changelog]; this project follows
     budget; slow consumers are closed with 1008.
   - axum HTTP: yawc WebSocket upgrade (permessage-deflate per config),
     NIP-11 document, CORS preflight, `real_ip_header`.
-  - `nkr relay --config <path>` CLI (also `NKR_CONFIG`), TOML config
+  - `nosfry relay --config <path>` CLI (also `NOSFRY_CONFIG`), TOML config
     (`[db]`/`[events]`/`[relay]`, `deny_unknown_fields`, strfry
-    defaults, `nkr.example.toml`), tracing-subscriber,
+    defaults, `nosfry.example.toml`), tracing-subscriber,
     graceful SIGTERM/Ctrl-C shutdown (close code 1001, writer drains
     and commits, threads joined).
 - Benchmarks — reproducible harnesses under `bench/` (standalone
-  `nkrbench` crate, Linux container recipe with CPU pinning, macOS
-  driver, `aggregate.py`); methodology and results in
-  `docs/benchmarks.mdx`.
+  `nosfry-bench` crate, Linux container recipe with CPU pinning,
+  `aggregate.py`).
 
 ### Changed
 
-- `nkr-server`: use the system allocator; mimalloc raised memory per
+- Renamed the project to nosfry (crates nosfry, nosfry-lmdb,
+  nosfry-server; binary nosfry; NOSFRY_CONFIG; nosfry.toml)
+- `nosfry-server`: use the system allocator; mimalloc raised memory per
   connection by 40-55% with no throughput gain in the Linux benchmark.
-- `nkr-server`: permessage-deflate runs at compression level 1
+- `nosfry-server`: permessage-deflate runs at compression level 1
   (`CompressionLevel::fast`), matching strfry's `deflateInit2` level;
   query responses no longer pay level-6 compression.
-- `nkr`: `Limits` is now `{ event: EventLimits, req: ReqLimits }` —
+- `nosfry`: `Limits` is now `{ event: EventLimits, req: ReqLimits }` —
   `EventLimits` gained the three rejection time-window fields and the
-  new `ReqLimits` holds the REQ limits, so `nkr-server` config maps
+  new `ReqLimits` holds the REQ limits, so `nosfry-server` config maps
   `[events]` and `[relay.limits]` onto them verbatim with no
   duplicated defaults.
-- `nkr-lmdb`: `WriteOutcome` is no longer `#[non_exhaustive]` and the
+- `nosfry-lmdb`: `WriteOutcome` is no longer `#[non_exhaustive]` and the
   writer reply is `Option<WriteOutcome>` (`None` = the commit failed);
   `OK` mapping is an exhaustive match.
-- `nkr-server`: `ServerError` carries source errors
+- `nosfry-server`: `ServerError` carries source errors
   (`toml::de::Error`, `std::io::Error`) instead of strings.
-- `nkr-server`: the writer pushes each `OK` straight onto the
+- `nosfry-server`: the writer pushes each `OK` straight onto the
   connection's outbound queue — one fewer task wake-up than the old
   writer → oneshot → connection task hop; outcome→message mapping is
   an exhaustive match in the writer itself.
 
 ### Fixed
 
-- `nkr-server`: a stale `Activate` from a superseded subscription
+- `nosfry-server`: a stale `Activate` from a superseded subscription
   generation no longer flushes/activates the re-registered generation
   before its scan's EOSE — pending state is keyed by generation and
   mismatched activations are ignored.
-- `nkr-server`: relay-initiated subscription closes (pending-buffer
+- `nosfry-server`: relay-initiated subscription closes (pending-buffer
   overflow, scan errors) now emit a real `CLOSED` frame and tear the
   subscription down in the session, reader, and shard via the new
   `Out::Closed` / `Session::close_by_relay` path.
-- `nkr-server`: reader threads no longer busy-spin when every queued
+- `nosfry-server`: reader threads no longer busy-spin when every queued
   scan is paused above the outbound high-water mark — an all-paused
   pass blocks on `recv_timeout`.
-- `nkr-server`: live fan-out now carries one shared `Arc<Event>` per
+- `nosfry-server`: live fan-out now carries one shared `Arc<Event>` per
   match (`Out::Event`) instead of a per-subscription `String`; the
   connection assembles the `EVENT` frame at write time.
-- `nkr-server`: half-open connections are closed with 1001 after two
+- `nosfry-server`: half-open connections are closed with 1001 after two
   ping intervals without any inbound frame (pings and pongs count).
-- `nkr-server`: OK replies map `WriteOutcome` variants explicitly; an
+- `nosfry-server`: OK replies map `WriteOutcome` variants explicitly; an
   unknown future variant is rejected with `error: internal error`
   instead of being silently accepted.
-- `nkr-server`: accepted sockets now get `TCP_NODELAY`; outbound
+- `nosfry-server`: accepted sockets now get `TCP_NODELAY`; outbound
   frames are batched (up to 64 frames or 256 KiB) into a single socket
   flush; every socket write carries a timeout (the ping interval, or
   1 s for close frames); connection tasks are tracked in a
   `tokio_util::task::TaskTracker` and shutdown waits on them with a
   10 s deadline before joining worker threads off the runtime.
-- `nkr`: `Monitors::remove`/`remove_connection` are O(1) per index
+- `nosfry`: `Monitors::remove`/`remove_connection` are O(1) per index
   entry — each `FilterSlot` stores its position in its index list and
   removal `swap_remove`s it (10k-sub churn on `kinds:[1]`: ~324 ms ->
   ~7 ms per 10k removes+inserts).
-- `nkr-server`: the REQ path lost a hop — connections register only
+- `nosfry-server`: the REQ path lost a hop — connections register only
   with their monitor shard, which forwards `Start`/`Cancel`/
   `CancelConn` to the reader over one FIFO channel; `Start` carries
   the shard's authoritative `last_seq`, and a REQ followed by CLOSE
@@ -140,7 +141,7 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Removed
 
-- `nkr`: `Limits::max_filter_limit_count` (no consumer until COUNT
+- `nosfry`: `Limits::max_filter_limit_count` (no consumer until COUNT
   exists) and `cmp_oldest_first` (unused outside tests).
-- `nkr-server`: the non-standard `max_filters` field of the NIP-11
+- `nosfry-server`: the non-standard `max_filters` field of the NIP-11
   `limitation` object; `default_limit` was added instead.

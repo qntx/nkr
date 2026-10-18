@@ -1,25 +1,25 @@
 <!-- markdownlint-disable MD033 MD041 -->
 
-# nkr
+# nosfry
 
 High-performance Nostr relay in Rust, for bare-metal servers and Cloudflare Workers.
 
 Status: pre-alpha.
 
-- `nkr` — sans-IO protocol core (`wasm32-unknown-unknown` clean)
-- `nkr-lmdb` — synchronous LMDB event store (native only)
-- `nkr-server` — the `nkr` relay binary: WebSocket NIP-01 + NIP-11 over
+- `nosfry` — sans-IO protocol core (`wasm32-unknown-unknown` clean)
+- `nosfry-lmdb` — synchronous LMDB event store (native only)
+- `nosfry-server` — the `nosfry` relay binary: WebSocket NIP-01 + NIP-11 over
   the store, on a writer/shard/reader thread topology (native only)
 
 ## Quick start
 
 ```bash
-cp nkr.example.toml nkr.toml
-cargo run --release -p nkr-server -- relay --config nkr.toml
+cp nosfry.example.toml nosfry.toml
+cargo run --release -p nosfry-server -- relay --config nosfry.toml
 ```
 
 The relay listens on `127.0.0.1:7777` by default; every key in
-`nkr.example.toml` carries its default and a comment. `NKR_CONFIG`
+`nosfry.example.toml` carries its default and a comment. `NOSFRY_CONFIG`
 points at the config file too. `RUST_LOG` controls tracing;
 `RUST_LOG_JSON=1` selects JSON logs. SIGINT/SIGTERM shut down
 gracefully.

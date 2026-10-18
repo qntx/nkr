@@ -1186,7 +1186,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "nkr"
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
+name = "nosfry"
 version = "0.1.0"
 dependencies = [
  "criterion",
@@ -1202,13 +1211,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "nkr-lmdb"
+name = "nosfry-lmdb"
 version = "0.1.0"
 dependencies = [
  "criterion",
  "faster-hex",
  "heed",
- "nkr",
+ "nosfry",
  "proptest",
  "secp256k1",
  "serde_json",
@@ -1218,15 +1227,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "nkr-server"
+name = "nosfry-server"
 version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
  "faster-hex",
  "futures-util",
- "nkr",
- "nkr-lmdb",
+ "nosfry",
+ "nosfry-lmdb",
  "proptest",
  "secp256k1",
  "serde",
@@ -1240,15 +1249,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yawc",
-]
-
-[[package]]
-name = "nom"
-version = "8.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
-dependencies = [
- "memchr",
 ]
 
 [[package]]

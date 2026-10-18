@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # relayBench (third-party harness) on Linux: the JVM harness runs on cores
 # 4-9; the relay wrappers re-pin every relay to cores 0-3.
-# Usage: run-relaybench.sh <nkr-binary-name>...
+# Usage: run-relaybench.sh <nosfry-binary-name>...
 #   Each name is a binary under /bench/bin, compared side by side with
-#   pristine strfry in every run. The order of the nkr binaries rotates
+#   pristine strfry in every run. The order of the nosfry binaries rotates
 #   between runs; strfry always runs first (a relayBench limitation).
 set -euo pipefail
 OUT=/bench/results
 RB=/bench/relaybench/bin/relaybench
-W=/bench/nkr-relay.sh
+W=/bench/nosfry-relay.sh
 CORPUS=/bench/corpus/nostr_vitor_startup_data.json.gz
 mkdir -p "$OUT"
 ulimit -n 65536
 
 NAMES=("$@")
-[ "${#NAMES[@]}" -gt 0 ] || { echo "usage: $0 <nkr-binary-name>..." >&2; exit 1; }
+[ "${#NAMES[@]}" -gt 0 ] || { echo "usage: $0 <nosfry-binary-name>..." >&2; exit 1; }
 
 run() {
     local name="$1" shift_by="$2"; shift 2

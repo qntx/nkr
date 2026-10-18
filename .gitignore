@@ -26,3 +26,6 @@ plan/
 crates/.DS_Store
 bench/**/target/
 bench/**/results/
+
+# Local-only Fumadocs tree (never pushed)
+docs/

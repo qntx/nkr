@@ -25,5 +25,5 @@ jobs:
       contents: read
     with:
       targets: wasm32-unknown-unknown
-      packages: nkr
+      packages: nosfry
       features: --all-features
