@@ -16,6 +16,13 @@
 //! | ix_pubkey_kind | pubkey ‖ kind ‖ created_at ‖ seq | — |
 //! | ix_tag | name ‖ len ‖ packed value ‖ created_at ‖ seq | — |
 //! | ix_replace | `Event::address` | seq |
+#![cfg_attr(
+    test,
+    allow(
+        unused_crate_dependencies,
+        reason = "dev-deps are exercised by integration tests and benches"
+    )
+)]
 
 use std::path::Path;
 use std::sync::Arc;
