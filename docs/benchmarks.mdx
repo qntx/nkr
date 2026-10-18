@@ -1,0 +1,114 @@
+---
+title: Benchmarks
+description: Head-to-head measurements of nkr against strfry 1.1.3 — method, environment, results, and the gaps that remain open.
+---
+
+## Summary
+
+Measured on 2026-10-18 against strfry 1.1.3, nkr at commit 22be2f1.
+
+nkr is ahead on:
+
+- ingest throughput: 1.7x on the synthetic corpus, 3.1x on the real one;
+- concurrent query throughput: roughly 1.5x to 3x in most scenarios;
+- live delivery latency: about 10x lower median;
+- tail latency of `OK`;
+- live delivery under permessage-deflate. strfry falls seconds behind there, while nkr stays within hundreds of milliseconds.
+
+nkr is behind on:
+
+- single-query latency to `EOSE`: strfry is faster by roughly 10% to 40% on 500-event queries;
+- time to the first event: strfry is 2x to 4x faster;
+- memory per connection: 34x more when idle, 4.5x more with deflate;
+- CPU per live delivery: about 1.6x to 2x more;
+- the p99 of indexed live delivery.
+
+These gaps are the work items in [Open gaps](#open-gaps). "Aligned with strfry" is not claimed until they close.
+
+## Method
+
+- **relayBench** (amethyst `relayBench`, commit 9847d0a) is a third-party harness. It replays a deterministic corpus over 4 publisher connections, then runs 12 client-shaped queries: 10 rounds on one connection, then 8 connections at once. It also cross-checks result sets; there were no mismatches in any run. NIP-77 sync was skipped (`--no-sync`) because nkr does not implement it yet.
+- **nkrbench** (`bench/nkrbench` in this repository) measures what relayBench does not:
+  - live fan-out latency for every subscriber and event pair, with exact delivery accounting (all runs: zero missing, zero duplicates);
+  - anonymous resident memory per idle subscribed connection;
+  - relay CPU seconds per scenario.
+
+  Rates were chosen to stay below saturation of both relays and of the harness.
+
+- **Fairness:**
+  - both relays use LMDB with the same synchronous commit;
+  - both verify signatures and run their stock defaults, with the same event size, tag, and age limits;
+  - every scenario starts from a fresh database;
+  - relay order rotates between repetitions. Within relayBench, strfry always runs first; that is a limitation of the harness.
+- **Environment (primary):**
+  - Linux aarch64 in an OrbStack VM on an Apple M5, with 10 vCPUs and a btrfs volume;
+  - every relay is pinned to cores 0 to 3 and the harness to cores 4 to 9, so client and relay never compete for CPU;
+  - relayBench ran 3 times on the synthetic corpus and 2 times on the real dump; nkrbench ran 3 repetitions;
+  - values are medians, with min and max in brackets;
+  - strfry is the pristine 1.1.3 tag built with its own Makefile (`-O3`, LTO).
+
+## Ingest
+
+| Metric                                          |                       nkr |                 strfry |
+| ----------------------------------------------- | ------------------------: | ---------------------: |
+| Throughput, synthetic 100k (events/s)           |    6,303 [5,688 to 6,585] | 3,661 [2,926 to 4,075] |
+| Throughput, real 29k (events/s)                 | 13,829 [12,527 to 15,130] | 4,523 [2,873 to 6,173] |
+| `OK` p50, synthetic / real (ms)                 |               3.37 / 3.49 |            2.74 / 4.01 |
+| `OK` p99, synthetic / real (ms)                 |               13.8 / 15.1 |            39.5 / 45.3 |
+| Receipt to queryable p50, synthetic / real (ms) |               3.58 / 3.67 |            2.91 / 4.40 |
+| Storage after ingest, synthetic / real (MiB)    |              179.5 / 65.0 |           185.0 / 67.4 |
+
+## Queries (synthetic corpus)
+
+| Scenario        | Events | EOSE p50 nkr (ms) | EOSE p50 strfry (ms) | First event p50 nkr (ms) | First event p50 strfry (ms) | 8 connections nkr (events/s) | 8 connections strfry (events/s) |
+| --------------- | -----: | ----------------: | -------------------: | -----------------------: | --------------------------: | ---------------------------: | ------------------------------: |
+| firehose        |    500 |              12.1 |                  9.7 |                     1.22 |                        0.78 |                      127,741 |                          51,032 |
+| global-feed     |    500 |              12.6 |                  9.5 |                     1.49 |                        0.40 |                       95,255 |                          52,532 |
+| follow-feed     |    500 |              17.0 |                 13.5 |                     2.40 |                        2.64 |                      108,065 |                          30,983 |
+| notifications   |    500 |              14.1 |                 11.8 |                     1.96 |                        0.51 |                       88,244 |                          34,862 |
+| hashtag         |    500 |              12.9 |                 11.3 |                     1.81 |                        1.06 |                       96,998 |                          51,085 |
+| recent-window   |    500 |              16.4 |                  9.4 |                     1.85 |                        0.42 |                       86,923 |                          51,975 |
+| reactions-watch |    205 |               8.0 |                  6.0 |                     3.87 |                        2.19 |                       63,342 |                          45,134 |
+| by-ids          |    100 |               4.6 |                  3.1 |                     1.99 |                        1.32 |                       63,712 |                          42,855 |
+| conversation    |     60 |               5.1 |                  6.3 |                     3.38 |                        0.87 |                       37,908 |                          24,855 |
+| profiles        |     50 |               1.2 |                  0.8 |                     0.90 |                        0.69 |                       87,086 |                          84,925 |
+| thread          |     22 |               0.6 |                  0.5 |                     0.47 |                        0.37 |                       68,724 |                          37,431 |
+
+The real corpus shows the same shape: strfry is ahead on single-query latency for large result sets, and nkr is ahead on small lookups (profiles, conversation) and on concurrent throughput.
+
+## Live fan-out and connections
+
+| Scenario                                                | nkr p50 / p99 (ms) | strfry p50 / p99 (ms) | nkr CPU (s) | strfry CPU (s) |
+| ------------------------------------------------------- | -----------------: | --------------------: | ----------: | -------------: |
+| broadcast, 1,000 subscribers, 100 events/s              |         7.8 / 47.6 |          90.2 / 317.1 |         7.4 |            4.8 |
+| broadcast, 5,000 subscribers, 20 events/s               |       12.3 / 180.3 |         108.6 / 430.0 |         8.6 |            4.2 |
+| broadcast with deflate, 1,000 subscribers, 100 events/s |    123.1 / 1,237.6 |    8,415.7 / 18,752.8 |        38.4 |           26.0 |
+| selective by author, 2,000 subscribers, 500 events/s    |        7.4 / 411.5 |          56.0 / 115.5 |         2.9 |            4.4 |
+
+| Idle subscribed connections (5,000) | nkr (KiB per connection) | strfry (KiB per connection) |
+| ----------------------------------- | -----------------------: | --------------------------: |
+| without compression                 |                     35.2 |                         1.0 |
+| with permessage-deflate             |                    493.2 |                       108.7 |
+
+strfry's live delivery waits on a 100 ms debounce of database change notifications, by design (`RelayReqMonitor`, `file_change_monitor`). That is the source of its latency floor and of part of its CPU saving: it batches about 10 events per wake-up at 100 events/s. strfry compresses on its single WebSocket thread, which saturates under deflate.
+
+## Open gaps
+
+1. **Time to first event and to EOSE.** Confirmed in code: a filter's matches are collected, sorted, and emitted only when its scan completes. The merge already produces descending `created_at` order, so each completed `created_at` group can be streamed as soon as the merge moves past it. Ordering and limit semantics stay unchanged.
+2. **Memory per connection.** Measured, cause not yet profiled. The deflate share follows from default zlib state for both directions per connection (window 15, memory level 8). Next step: a heap profile of an idle connection, followed by sizing the read buffer, the deflate memory level and window, and the per-connection allocations.
+3. **CPU per live delivery.** Hypothesis: one task wake-up and one write syscall per event per subscriber, against strfry's batched writes. Next step: a CPU profile of the broadcast scenario.
+4. **p99 of indexed live delivery and of `OK`.** Unexplained. Next step: instrument writer commit times and runtime stalls under the selective scenario.
+
+## Secondary run on macOS
+
+The same suites also ran natively on macOS 27. The results agree on the direction of ingest throughput (2x to 3.4x) and concurrent query throughput, but they are not used for conclusions:
+
+- LMDB on Apple platforms commits with `F_FULLFSYNC`, which dominates write latency for both relays;
+- `ps` resident memory is not reliable there;
+- the first broadcast scenarios were run above saturation, so the client and the relay competed for the same cores.
+
+During that run, strfry master (4cd3cf6) crashed with a `phmap` assertion. Its new `ReadRestrictor` lazily initializes a shared static set from all ingester threads without synchronization. The 1.1.3 release does not contain that code.
+
+## Reproducing
+
+`bench/README.md` lists the exact commands: the container image, relay builds, the pinned relay wrappers, and both drivers. `bench/aggregate.py` turns the raw results into the medians above.

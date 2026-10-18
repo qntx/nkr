@@ -24,3 +24,5 @@ target
 audit/
 plan/
 crates/.DS_Store
+bench/**/target/
+bench/**/results/

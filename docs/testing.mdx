@@ -27,7 +27,7 @@ cargo-fuzz targets cover the client message parser, the filter parser, the event
 ## Benchmarks
 
 - **Micro:** criterion benches for parse and verify, filter matching, live-index matching, and frame assembly.
-- **Relay versus strfry:** same machine, same corpus, both with durable writes and signature verification. Measured with amethyst relayBench and nostr-bench: time from receipt to queryable, `OK` latency, ingest throughput, `REQ` time-to-first-event and time-to-`EOSE` percentiles, aggregate query throughput, memory per idle connection, and fan-out CPU. Results are recorded per release.
+- **Relay versus strfry:** same machine, same corpus, both with durable writes and signature verification, with the relay and the client pinned to separate cores on Linux. amethyst relayBench measures ingest (throughput, `OK` latency, receipt to queryable) and client-shaped queries (time to first event, time to `EOSE`, concurrent throughput). `bench/nkrbench` measures live fan-out latency with exact delivery accounting, memory per idle connection, and relay CPU per scenario. Method, environment, and current results are in [Benchmarks](/benchmarks); results are recorded per release.
 - **Soak:** 72 hours of mixed load. Checks: flat memory, bounded LMDB file growth, no slow-consumer leaks, and clean recovery from `kill -9` in the middle of a commit.
 
 ## CI gates

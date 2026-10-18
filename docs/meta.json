@@ -1,5 +1,13 @@
 {
   "title": "nkr",
   "description": "High-performance Nostr relay in Rust, for bare-metal servers and Cloudflare Workers.",
-  "pages": ["index", "architecture", "compatibility", "testing", "roadmap", "decisions"]
+  "pages": [
+    "index",
+    "architecture",
+    "compatibility",
+    "testing",
+    "benchmarks",
+    "roadmap",
+    "decisions"
+  ]
 }
