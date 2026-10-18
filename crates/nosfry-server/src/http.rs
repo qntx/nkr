@@ -3,14 +3,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::Json;
+use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, get};
-use axum::{Router, body::Body};
-use serde_json::{Value, json};
+use serde_json::json;
 use yawc::{IncomingUpgrade, Options};
 
 use crate::config::Config;
@@ -18,15 +18,17 @@ use crate::connection;
 
 /// Everything a connection handler needs.
 #[derive(Debug, Clone)]
-pub struct AppState {
+pub(crate) struct AppState {
     /// Server configuration.
-    pub config: Arc<Config>,
+    pub(crate) config: Arc<Config>,
     /// Connection dispatch.
-    pub conn: connection::Handle,
+    pub(crate) conn: connection::Handle,
+    /// Pre-serialized NIP-11 document; static for the process lifetime.
+    pub(crate) nip11: Bytes,
 }
 
 /// Build the application router.
-pub fn router(state: AppState) -> Router {
+pub(crate) fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(root).on(MethodFilter::OPTIONS, preflight))
         .with_state(state)
@@ -38,8 +40,8 @@ const CORS_HEADERS: [(&str, &str); 3] = [
     ("access-control-allow-methods", "GET, OPTIONS"),
 ];
 
-async fn preflight() -> Response {
-    let mut response = StatusCode::NO_CONTENT.into_response();
+/// Apply the CORS headers shared by the preflight and NIP-11 responses.
+fn with_cors(mut response: Response) -> Response {
     for (name, value) in CORS_HEADERS {
         response.headers_mut().insert(
             header::HeaderName::from_static(name),
@@ -47,6 +49,10 @@ async fn preflight() -> Response {
         );
     }
     response
+}
+
+async fn preflight() -> Response {
+    with_cors(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn root(State(state): State<AppState>, request: Request) -> Response {
@@ -69,14 +75,13 @@ async fn root(State(state): State<AppState>, request: Request) -> Response {
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains("application/nostr+json"));
     if accepts_nostr {
-        let mut response = Json(nip11(&state.config)).into_response();
-        for (name, value) in CORS_HEADERS {
-            response.headers_mut().insert(
-                header::HeaderName::from_static(name),
-                header::HeaderValue::from_static(value),
-            );
-        }
-        return response;
+        return with_cors(
+            (
+                [(header::CONTENT_TYPE, "application/nostr+json")],
+                state.nip11.clone(),
+            )
+                .into_response(),
+        );
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -145,15 +150,14 @@ fn client_ip(state: &AppState, headers: &header::HeaderMap, peer: Option<SocketA
     peer.map_or_else(|| "-".to_owned(), |p| p.ip().to_string())
 }
 
-/// The NIP-11 relay information document.
-fn nip11(config: &Config) -> Value {
+/// The NIP-11 relay information document, serialized once at startup
+/// (it is static for the process lifetime). `description`, `pubkey`,
+/// `contact`, and `icon` are optional and omitted when empty; `name`
+/// stays unconditionally.
+pub(crate) fn nip11(config: &Config) -> String {
     let relay = &config.relay;
-    json!({
+    let mut doc = json!({
         "name": relay.info.name,
-        "description": relay.info.description,
-        "pubkey": relay.info.pubkey,
-        "contact": relay.info.contact,
-        "icon": relay.info.icon,
         "supported_nips": [1, 11],
         "software": "https://github.com/qntx/nosfry",
         "version": env!("CARGO_PKG_VERSION"),
@@ -162,7 +166,7 @@ fn nip11(config: &Config) -> Value {
             "max_subscriptions": relay.limits.max_subs_per_connection,
             "max_limit": relay.limits.max_filter_limit,
             "default_limit": relay.limits.max_filter_limit,
-            "max_subid_length": 64,
+            "max_subid_length": nosfry::message::SUB_ID_MAX_CHARS,
             "max_event_tags": config.events.max_num_tags,
             "created_at_lower_limit": config.events.reject_events_older_than_seconds,
             "created_at_upper_limit": config.events.reject_events_newer_than_seconds,
@@ -170,5 +174,18 @@ fn nip11(config: &Config) -> Value {
             "restricted_writes": false,
             "payment_required": false,
         },
-    })
+    });
+    if let Some(map) = doc.as_object_mut() {
+        for (key, value) in [
+            ("description", &relay.info.description),
+            ("pubkey", &relay.info.pubkey),
+            ("contact", &relay.info.contact),
+            ("icon", &relay.info.icon),
+        ] {
+            if !value.is_empty() {
+                map.insert(key.to_owned(), json!(value));
+            }
+        }
+    }
+    doc.to_string()
 }

@@ -500,10 +500,9 @@ async fn oversized_frame_closes_connection() {
     relay.stop().await;
 }
 
-#[tokio::test]
-async fn nip11_document() {
-    let relay = Relay::start().await;
-    let mut tcp = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+/// One HTTP GET returning the raw response text.
+async fn http_get(addr: std::net::SocketAddr) -> String {
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     tcp.write_all(
         b"GET / HTTP/1.1\r\nHost: x\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n",
     )
@@ -511,11 +510,47 @@ async fn nip11_document() {
     .unwrap();
     let mut buf = Vec::new();
     tcp.read_to_end(&mut buf).await.unwrap();
-    let text = String::from_utf8_lossy(&buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn nip11_body(text: &str) -> Value {
+    let (_, body) = text.split_once("\r\n\r\n").expect("http head/body split");
+    serde_json::from_str(body).expect("nip11 json")
+}
+
+#[tokio::test]
+async fn nip11_document() {
+    // Empty info fields are omitted; `name` stays unconditionally.
+    let relay = Relay::start().await;
+    let text = http_get(relay.addr).await;
+    assert!(text.contains("content-type: application/nostr+json"));
     assert!(text.contains("access-control-allow-origin: *"));
-    assert!(text.contains("\"supported_nips\":[1,11]"));
-    assert!(text.contains("\"software\":\"https://github.com/qntx/nosfry\""));
-    assert!(text.contains("\"max_subscriptions\":200"));
+    let doc = nip11_body(&text);
+    assert_eq!(doc["name"], "nosfry");
+    for key in ["description", "pubkey", "contact", "icon"] {
+        assert!(doc.get(key).is_none(), "{key} must be omitted when empty");
+    }
+    assert_eq!(doc["supported_nips"], json!([1, 11]));
+    assert_eq!(doc["software"], "https://github.com/qntx/nosfry");
+    assert_eq!(doc["limitation"]["max_subscriptions"], 200);
+    assert_eq!(
+        doc["limitation"]["max_subid_length"],
+        nosfry::message::SUB_ID_MAX_CHARS as u64
+    );
+    relay.stop().await;
+
+    // Configured fields are emitted verbatim.
+    let mut config = nosfry_server::config::Config::default();
+    config.relay.info.description = "test relay".to_owned();
+    config.relay.info.pubkey = "ab".repeat(32);
+    config.relay.info.contact = "admin@example.com".to_owned();
+    config.relay.info.icon = "https://example.com/icon.png".to_owned();
+    let relay = Relay::start_with(config).await;
+    let doc = nip11_body(&http_get(relay.addr).await);
+    assert_eq!(doc["description"], "test relay");
+    assert_eq!(doc["pubkey"], "ab".repeat(32));
+    assert_eq!(doc["contact"], "admin@example.com");
+    assert_eq!(doc["icon"], "https://example.com/icon.png");
     relay.stop().await;
 }
 

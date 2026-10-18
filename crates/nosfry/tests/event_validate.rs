@@ -26,7 +26,7 @@
 
 mod common;
 
-use nosfry::event::{EventLimits, UnverifiedEvent};
+use nosfry::event::{EventError, EventLimits, UnverifiedEvent};
 use serde::Deserialize;
 
 /// `(reason, why)` — legitimate serde/JSON.parse divergences.
@@ -61,6 +61,36 @@ struct Case {
     error: Option<String>,
 }
 
+/// `parsed` vectors that are cryptographically invalid by design: their
+/// `id`/`sig` are placeholder hex, so `verify` must fail with the exact
+/// error listed here (a new case of this kind needs its own entry, never
+/// a tolerated error).
+const INVALID_ID: &[&str] = &[
+    "id escaped hex",
+    "created_at max safe",
+    "content emoji escape",
+];
+
+/// A verifiable event's canonical JSON must equal the expected object
+/// field-by-field; an [`INVALID_ID`] case must fail with `IdMismatch`.
+fn assert_wire(ev: UnverifiedEvent<'_>, expected: &serde_json::Value, reason: &str) {
+    if INVALID_ID.contains(&reason) {
+        assert!(
+            matches!(
+                ev.verify(&EventLimits::default()),
+                Err(EventError::IdMismatch)
+            ),
+            "{reason}: expected IdMismatch"
+        );
+        return;
+    }
+    let event = ev
+        .verify(&EventLimits::default())
+        .unwrap_or_else(|e| panic!("{reason}: verify failed: {e}"));
+    let wire: serde_json::Value = serde_json::from_str(event.json()).expect("canonical json");
+    assert_eq!(&wire, expected, "{reason}: canonical json");
+}
+
 #[test]
 fn event_validate() {
     let cases = common::cases::<Case>("event-validate.json");
@@ -73,53 +103,30 @@ fn event_validate() {
                 Ok(ev) => {
                     let expected: serde_json::Value =
                         serde_json::from_str(expected).expect("parsed is a JSON object");
-                    let parsed = expected.as_object().expect("parsed is an object");
                     assert_eq!(
-                        parsed.get("id").and_then(|v| v.as_str()),
+                        expected.get("id").and_then(|v| v.as_str()),
                         Some(ev.id().to_string().as_str()),
                         "{}: id",
                         case.reason
                     );
                     assert_eq!(
-                        parsed.get("pubkey").and_then(|v| v.as_str()),
-                        Some(ev.pubkey().to_string().as_str()),
-                        "{}: pubkey",
-                        case.reason
-                    );
-                    assert_eq!(
-                        parsed.get("created_at").and_then(serde_json::Value::as_u64),
+                        expected
+                            .get("created_at")
+                            .and_then(serde_json::Value::as_u64),
                         Some(ev.created_at()),
                         "{}: created_at",
                         case.reason
                     );
                     assert_eq!(
-                        parsed.get("kind").and_then(serde_json::Value::as_u64),
+                        expected.get("kind").and_then(serde_json::Value::as_u64),
                         Some(u64::from(ev.kind().0)),
                         "{}: kind",
                         case.reason
                     );
-                    assert_eq!(
-                        parsed.get("content").and_then(|v| v.as_str()),
-                        Some(ev.content()),
-                        "{}: content",
-                        case.reason
-                    );
-                    assert_eq!(
-                        parsed.get("sig").and_then(|v| v.as_str()).map(str::len),
-                        Some(128),
-                        "{}: sig",
-                        case.reason
-                    );
-                    let tags: Vec<Vec<String>> = ev
-                        .tags()
-                        .map(|tag| tag.iter().map(ToString::to_string).collect())
-                        .collect();
-                    assert_eq!(
-                        parsed.get("tags"),
-                        Some(&serde_json::json!(tags)),
-                        "{}: tags",
-                        case.reason
-                    );
+                    // The remaining fields through public behavior:
+                    // `assert_wire` verifies and compares the canonical
+                    // JSON against the expected object.
+                    assert_wire(ev, &expected, &case.reason);
                 }
                 Err(e) => {
                     assert!(

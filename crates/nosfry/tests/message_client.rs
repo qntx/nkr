@@ -28,7 +28,7 @@
 
 mod common;
 
-use nosfry::message::ClientMessage;
+use nosfry::message::{ClientMessage, SubId, closed_frame, eose_frame, event_frame};
 use serde::Deserialize;
 
 /// `(raw substring, why)` — each pattern identifies exactly one case.
@@ -103,7 +103,7 @@ fn message_client() {
                     outcome.is_err(),
                     "case {i} ({}): expected error, got {:?}",
                     case.raw,
-                    outcome.map(|m| common::message_wire(&m))
+                    outcome.map(common::message_wire)
                 );
             }
             continue;
@@ -116,7 +116,7 @@ fn message_client() {
                 );
                 if let Some(encoded) = &case.encoded {
                     assert_eq!(
-                        &common::message_wire(&message),
+                        &common::message_wire(message),
                         encoded,
                         "case {i}: {}",
                         case.raw
@@ -133,4 +133,38 @@ fn message_client() {
         }
     }
     assert_eq!(divergent, DIVERGENCES.len(), "divergence count drift");
+}
+
+/// Escaped JSON strings are legal subscription ids: they parse to the
+/// unescaped value, and every emitted frame re-escapes them correctly.
+#[test]
+fn escaped_subscription_ids() {
+    let message = ClientMessage::parse("[\"REQ\",\"a\\\"b\",{}]").expect("REQ parses");
+    let ClientMessage::Req { sub_id, .. } = message else {
+        panic!("expected REQ")
+    };
+    assert_eq!(sub_id.as_str(), "a\"b");
+
+    let message = ClientMessage::parse("[\"CLOSE\",\"\\u00e9\"]").expect("CLOSE parses");
+    let ClientMessage::Close { sub_id } = message else {
+        panic!("expected CLOSE")
+    };
+    assert_eq!(sub_id.as_str(), "é");
+
+    // The echoed frames carry the id as a properly escaped JSON string.
+    let quoted = SubId::parse("a\"b").expect("sub id");
+    for frame in [
+        eose_frame(&quoted),
+        closed_frame(&quoted, "closed: test"),
+        event_frame(&quoted, "{}"),
+    ] {
+        let items: Vec<serde_json::Value> =
+            serde_json::from_str(&frame).expect("frame is valid JSON");
+        assert_eq!(
+            items.get(1).and_then(|v| v.as_str()),
+            Some("a\"b"),
+            "frame {frame} re-escapes the id"
+        );
+    }
+    assert_eq!(eose_frame(&sub_id), "[\"EOSE\",\"é\"]");
 }

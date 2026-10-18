@@ -234,12 +234,6 @@ impl<'a> UnverifiedEvent<'a> {
         self.id
     }
 
-    /// The author public key.
-    #[must_use]
-    pub const fn pubkey(&self) -> PublicKey {
-        self.pubkey
-    }
-
     /// `created_at` seconds.
     #[must_use]
     pub const fn created_at(&self) -> u64 {
@@ -252,31 +246,16 @@ impl<'a> UnverifiedEvent<'a> {
         self.kind
     }
 
-    /// The event tags.
-    pub fn tags(&self) -> impl Iterator<Item = &[Cow<'a, str>]> {
-        self.tags.iter().map(Vec::as_slice)
-    }
-
-    /// Event content.
-    #[must_use]
-    pub fn content(&self) -> &str {
-        &self.content
-    }
-
-    /// The claimed 64-byte signature.
-    #[must_use]
-    pub const fn sig(&self) -> [u8; 64] {
-        self.sig
-    }
-
-    /// Verify the id hash and the BIP-340 signature, then build the
-    /// canonical JSON and the packed record. `limits` bounds the canonical
-    /// JSON size.
+    /// Verify the id hash, build the canonical JSON and check its size,
+    /// then verify the BIP-340 signature and build the packed record.
+    /// `limits` bounds the canonical JSON size. The size check runs
+    /// before the signature check so an oversized event does not pay
+    /// for a BIP-340 verification.
     ///
     /// # Errors
     ///
-    /// [`EventError::IdMismatch`], [`EventError::Sig`], or
-    /// [`EventError::EventTooLarge`].
+    /// [`EventError::IdMismatch`], [`EventError::EventTooLarge`], or
+    /// [`EventError::Sig`].
     pub fn verify(self, limits: &EventLimits) -> Result<Event, EventError> {
         let preimage = id_preimage(
             self.pubkey_hex.as_ref(),
@@ -289,9 +268,6 @@ impl<'a> UnverifiedEvent<'a> {
         if computed != self.id.0 {
             return Err(EventError::IdMismatch);
         }
-        let sig = Signature::from_byte_array(self.sig);
-        let pubkey = XOnlyPublicKey::from_byte_array(self.pubkey.0).map_err(|_| EventError::Sig)?;
-        schnorr::verify(&sig, &computed, &pubkey).map_err(|_| EventError::Sig)?;
 
         let id_hex = self.id.to_string();
         let json = serde_json::to_string(&CanonicalEvent {
@@ -307,10 +283,10 @@ impl<'a> UnverifiedEvent<'a> {
             return Err(EventError::EventTooLarge(json.len(), limits.max_event_size));
         }
 
-        let is_protected = self
-            .tags
-            .iter()
-            .any(|tag| tag.first().is_some_and(|name| name.as_ref() == "-"));
+        let sig = Signature::from_byte_array(self.sig);
+        let pubkey = XOnlyPublicKey::from_byte_array(self.pubkey.0).map_err(|_| EventError::Sig)?;
+        schnorr::verify(&sig, &computed, &pubkey).map_err(|_| EventError::Sig)?;
+
         let address = match self.kind.class() {
             KindClass::Regular | KindClass::Ephemeral => None,
             KindClass::Replaceable => Some(address_hash(self.kind, &self.pubkey, &[])),
@@ -334,7 +310,6 @@ impl<'a> UnverifiedEvent<'a> {
         Ok(Event {
             packed,
             json: json.into_boxed_str(),
-            is_protected,
             address,
         })
     }
@@ -357,7 +332,6 @@ struct CanonicalEvent<'a> {
 pub struct Event {
     packed: PackedEvent,
     json: Box<str>,
-    is_protected: bool,
     address: Option<[u8; 32]>,
 }
 
@@ -396,12 +370,6 @@ impl Event {
     #[must_use]
     pub fn packed(&self) -> PackedRef<'_> {
         self.packed.packed()
-    }
-
-    /// NIP-70: the event carries a `["-"]` tag.
-    #[must_use]
-    pub const fn is_protected(&self) -> bool {
-        self.is_protected
     }
 
     /// The fixed-size replaceable/addressable key:
@@ -479,23 +447,29 @@ mod tests {
 
     use super::*;
 
-    fn sign(kind: u16, created_at: u64, tags: &[Vec<String>], content: &str) -> Event {
+    fn sign_json(kind: u16, created_at: u64, tags: &[Vec<String>], content: &str) -> String {
         let keypair = Keypair::from_secret_bytes([7u8; 32]).expect("secret key");
         let pubkey = PublicKey(keypair.x_only_public_key().0.to_byte_array());
         let preimage = serialize_for_id(&pubkey, created_at, Kind(kind), tags, content);
         let id = event_id(preimage.as_bytes());
         let sig = schnorr::sign_no_aux_rand(&id.0, &keypair);
-        let json = format!(
+        format!(
             "{{\"id\":\"{id}\",\"pubkey\":\"{pubkey}\",\"created_at\":{created_at},\
              \"kind\":{kind},\"tags\":{},\"content\":{},\"sig\":\"{}\"}}",
             serde_json::to_string(tags).expect("tags"),
             serde_json::to_string(content).expect("content"),
             hex::encode(&sig.to_byte_array()),
-        );
-        UnverifiedEvent::parse(&json, &EventLimits::default())
-            .expect("parse")
-            .verify(&EventLimits::default())
-            .expect("verify")
+        )
+    }
+
+    fn sign(kind: u16, created_at: u64, tags: &[Vec<String>], content: &str) -> Event {
+        UnverifiedEvent::parse(
+            &sign_json(kind, created_at, tags, content),
+            &EventLimits::default(),
+        )
+        .expect("parse")
+        .verify(&EventLimits::default())
+        .expect("verify")
     }
 
     fn pubkey() -> PublicKey {
@@ -550,6 +524,25 @@ mod tests {
         assert_eq!(
             event.address(),
             Some(address_hash(Kind(30_023), &event.pubkey(), d.as_bytes()))
+        );
+    }
+
+    /// An oversized event must be rejected before the BIP-340 check:
+    /// the invalid signature would otherwise mask `EventTooLarge`.
+    #[test]
+    fn oversized_event_fails_size_before_signature() {
+        let signed = sign_json(1, 1000, &[], &"x".repeat(70_000));
+        let mut value: serde_json::Value = serde_json::from_str(&signed).expect("json");
+        *value.get_mut("sig").expect("sig field") = serde_json::json!("00".repeat(64));
+        let tampered = serde_json::to_string(&value).expect("json");
+        let unverified =
+            UnverifiedEvent::parse(&tampered, &EventLimits::default()).expect("structural parse");
+        let error = unverified
+            .verify(&EventLimits::default())
+            .expect_err("oversized");
+        assert!(
+            matches!(error, EventError::EventTooLarge(..)),
+            "expected EventTooLarge before the signature check, got {error}"
         );
     }
 

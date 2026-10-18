@@ -1,4 +1,6 @@
-//! strfry-compatible packed index record.
+//! strfry-style packed index record: same field order and tag encoding
+//! as strfry's `PackedEvent`, but not byte-compatible (strfry uses an
+//! 8-byte kind and an 88-byte header).
 //!
 //! Layout:
 //! `[0..32 id][32..64 pubkey][64..72 created_at u64 LE][72..74 kind u16 LE]
@@ -55,10 +57,6 @@ pub struct PackedEvent(Box<[u8]>);
 impl PackedEvent {
     /// Build the packed record for an event. Tags that cannot be packed are
     /// skipped; a valid `expiration` first value (NIP-40) fills the header.
-    ///
-    /// # Errors
-    ///
-    /// Infallible: unencodable tag values are skipped, never errors.
     pub fn build<I, T, S>(
         id: &EventId,
         pubkey: &PublicKey,

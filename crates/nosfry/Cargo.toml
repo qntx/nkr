@@ -30,3 +30,7 @@ workspace = true
 [[bench]]
 name = "event"
 harness = false
+
+[[bench]]
+name = "monitor"
+harness = false

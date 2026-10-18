@@ -2,6 +2,7 @@
 
 use core::fmt;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use serde_json::value::RawValue;
 
@@ -10,14 +11,19 @@ use crate::filter::{Filter, FilterError};
 use crate::hex;
 
 /// Maximum subscription id length in chars (NIP-01).
-const SUB_ID_MAX_CHARS: usize = 64;
+pub const SUB_ID_MAX_CHARS: usize = 64;
 
 /// A validated subscription id (1..=64 Unicode scalar values).
 ///
-/// Stores the original string plus its pre-escaped JSON form so frames are
-/// built without re-escaping. `Eq`/`Hash` compare the original only.
+/// Stores the original string plus its pre-escaped JSON form behind one
+/// `Arc`, so cloning — done per monitor hit, per reader chunk, and per
+/// outbound frame — is a refcount bump instead of two allocations.
+/// `Eq`/`Hash` compare the original only.
 #[derive(Debug, Clone)]
-pub struct SubId {
+pub struct SubId(Arc<SubIdInner>);
+
+#[derive(Debug)]
+struct SubIdInner {
     raw: Box<str>,
     json: Box<str>,
 }
@@ -36,29 +42,29 @@ impl SubId {
                 "subscription id must be 1..={SUB_ID_MAX_CHARS} chars"
             )));
         }
-        Ok(Self {
+        Ok(Self(Arc::new(SubIdInner {
             raw: raw.into(),
             json: json_escape(raw).into(),
-        })
+        })))
     }
 
     /// The original string.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.raw
+        &self.0.raw
     }
 
     /// The JSON string literal form (with quotes), inserted verbatim in
     /// frames.
     #[must_use]
     pub fn json(&self) -> &str {
-        &self.json
+        &self.0.json
     }
 }
 
 impl PartialEq for SubId {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw
+        self.0.raw == other.0.raw
     }
 }
 
@@ -66,7 +72,7 @@ impl Eq for SubId {}
 
 impl core::hash::Hash for SubId {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        self.raw.hash(state);
+        self.0.raw.hash(state);
     }
 }
 
@@ -304,11 +310,14 @@ fn expect_min_arity(items: &[&RawValue], arity: usize, verb: &str) -> Result<(),
 }
 
 fn parse_sub(items: &[&RawValue], index: usize, verb: &str) -> Result<SubId, MessageError> {
+    // `Cow` so escaped ids ("\u00e9", "a\"b") deserialize too; a borrowed
+    // `&str` fails on any escape sequence, although NIP-01 allows any
+    // string of 1..=64 chars.
     let raw = items
         .get(index)
-        .and_then(|raw| serde_json::from_str::<&str>(raw.get()).ok())
+        .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok())
         .ok_or_else(|| MessageError::Invalid(format!("{verb} subscription id must be a string")))?;
-    SubId::parse(raw)
+    SubId::parse(raw.as_ref())
 }
 
 fn parse_filters(

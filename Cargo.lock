@@ -1216,6 +1216,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "faster-hex",
+ "foldhash",
  "heed",
  "nosfry",
  "proptest",
@@ -1233,6 +1234,7 @@ dependencies = [
  "axum",
  "clap",
  "faster-hex",
+ "foldhash",
  "futures-util",
  "nosfry",
  "nosfry-lmdb",
