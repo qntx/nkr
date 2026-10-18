@@ -21,12 +21,16 @@
 )]
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use nkr::event::{EventLimits, PublicKey, UnverifiedEvent, event_id, serialize_for_id};
 use nkr::filter::Filter;
 use nkr::kind::Kind;
+use nkr::message::SubId;
+use nkr::monitor::Monitors;
 use nkr::packed::PackedEvent;
+use nkr::session::SubKey;
 use secp256k1::Keypair;
 use secp256k1::schnorr;
 
@@ -79,5 +83,33 @@ fn filter_match(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, parse_verify, filter_match);
+/// 10k live subscriptions on the popular `kinds:[1]` index list:
+/// churn every subscription once (remove + insert).
+fn monitor_churn(c: &mut Criterion) {
+    let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").expect("filter")]);
+    let sub_id = SubId::parse("s").expect("sub id");
+    let key = |generation: u64| SubKey {
+        id: sub_id.clone(),
+        generation,
+    };
+    let mut monitors: Monitors<u64> = Monitors::new();
+    for conn in 0..10_000u64 {
+        monitors.insert(conn, key(0), Arc::clone(&filters));
+    }
+    let mut group = c.benchmark_group("monitor");
+    group.sample_size(10);
+    group.bench_function("kinds1 10k churn", |b| {
+        let mut generation = 0u64;
+        b.iter(|| {
+            for conn in 0..10_000u64 {
+                monitors.remove(conn, &sub_id);
+                generation += 1;
+                monitors.insert(conn, key(generation), Arc::clone(&filters));
+            }
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, parse_verify, filter_match, monitor_churn);
 criterion_main!(benches);

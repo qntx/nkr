@@ -96,3 +96,20 @@ The format is based on [Keep a Changelog]; this project follows
 - `nkr-server`: OK replies map `WriteOutcome` variants explicitly; an
   unknown future variant is rejected with `error: internal error`
   instead of being silently accepted.
+- `nkr-server`: accepted sockets now get `TCP_NODELAY`; outbound
+  frames are batched (up to 64 frames or 256 KiB) into a single socket
+  flush; every socket write carries a timeout (the ping interval, or
+  1 s for close frames); connection tasks are tracked in a
+  `tokio_util::task::TaskTracker` and shutdown waits on them with a
+  10 s deadline before joining worker threads off the runtime.
+- `nkr`: `Monitors::remove`/`remove_connection` are O(1) per index
+  entry — each `FilterSlot` stores its position in its index list and
+  removal `swap_remove`s it (10k-sub churn on `kinds:[1]`: ~324 ms ->
+  ~7 ms per 10k removes+inserts).
+
+### Removed
+
+- `nkr`: `Limits::max_filter_limit_count` (no consumer until COUNT
+  exists) and `cmp_oldest_first` (unused outside tests).
+- `nkr-server`: the non-standard `max_filters` field of the NIP-11
+  `limitation` object; `default_limit` was added instead.

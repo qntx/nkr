@@ -38,15 +38,40 @@ pub struct Handle {
     pub max_pending_outbound: usize,
     /// Broadcast shutdown signal.
     pub shutdown: watch::Receiver<bool>,
+    /// Tracks every live connection task for the shutdown deadline.
+    pub tracker: tokio_util::task::TaskTracker,
 }
 
 /// Global connection counter.
 static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
+/// Frames batched into one socket flush after the first `Out` arrives.
+const BATCH_MAX_FRAMES: usize = 64;
+/// Byte cap for one batched flush.
+const BATCH_MAX_BYTES: usize = 256 * 1024;
+/// How long a best-effort close frame may block the shutdown path.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// Feed one frame into the socket buffer; `false` when the write
+/// failed or stalled past `timeout`.
+async fn feed_timed(ws: &mut HttpWebSocket, frame: Frame, timeout: Duration, conn: ConnId) -> bool {
+    match tokio::time::timeout(timeout, ws.feed(frame)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(err)) => {
+            tracing::debug!(%err, conn, "websocket send failed");
+            false
+        }
+        Err(_) => {
+            tracing::debug!(conn, "websocket write stalled");
+            false
+        }
+    }
 }
 
 /// Run one WebSocket connection until close, error, or shutdown.
@@ -65,6 +90,7 @@ pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle) {
     let mut ping = tokio::time::interval(handle.ping_interval);
     let mut last_inbound = Instant::now();
     let mut shutdown = handle.shutdown.clone();
+    let mut batch: Vec<Out> = Vec::with_capacity(BATCH_MAX_FRAMES);
     let shard_idx = usize::try_from(conn).unwrap_or(usize::MAX) % handle.shards.len().max(1);
     let reader_idx = usize::try_from(conn).unwrap_or(usize::MAX) % handle.readers.len().max(1);
     let (Some(shard), Some(reader)) =
@@ -109,47 +135,85 @@ pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle) {
                 }
             }
             out_msg = out_rx.recv() => {
-                let Some(msg) = out_msg else { break };
-                out.written(msg.len());
-                match msg {
-                    Out::Frame { sub, text } => {
-                        if sub.as_ref().is_some_and(|s| !session.is_current(s)) {
-                            continue;
+                let Some(first) = out_msg else { break };
+                // Batch: drain everything already queued so one socket
+                // flush covers a burst of frames (e.g. a large REQ).
+                batch.clear();
+                let mut bytes = first.accounted_bytes();
+                batch.push(first);
+                while batch.len() < BATCH_MAX_FRAMES && bytes < BATCH_MAX_BYTES {
+                    match out_rx.try_recv() {
+                        Ok(msg) => {
+                            bytes += msg.accounted_bytes();
+                            batch.push(msg);
                         }
-                        if let Err(err) = ws.send(Frame::text(text.into_bytes())).await {
-                            tracing::debug!(%err, conn, "websocket send failed");
-                            break;
-                        }
+                        Err(_) => break,
                     }
-                    Out::Event { sub, event } => {
-                        if !session.is_current(&sub) {
-                            continue;
+                }
+                let mut dead = false;
+                #[allow(
+                    clippy::iter_with_drain,
+                    reason = "the Vec keeps its capacity for the next batch"
+                )]
+                for msg in batch.drain(..) {
+                    out.written(msg.accounted_bytes());
+                    match msg {
+                        Out::Frame { sub, text } => {
+                            if sub.as_ref().is_some_and(|s| !session.is_current(s)) {
+                                continue;
+                            }
+                            dead = !feed_timed(
+                                ws, Frame::text(text.into_bytes()),
+                                handle.ping_interval, conn,
+                            ).await;
                         }
-                        let text = event_frame(&sub.id, event.json());
-                        if let Err(err) = ws.send(Frame::text(text.into_bytes())).await {
-                            tracing::debug!(%err, conn, "websocket send failed");
-                            break;
+                        Out::Event { sub, event } => {
+                            if !session.is_current(&sub) {
+                                continue;
+                            }
+                            let text = event_frame(&sub.id, event.json());
+                            dead = !feed_timed(
+                                ws, Frame::text(text.into_bytes()),
+                                handle.ping_interval, conn,
+                            ).await;
                         }
-                    }
-                    Out::Closed { sub, reason } => {
-                        if !session.close_by_relay(&sub) {
-                            continue;
-                        }
-                        drop(reader.send(ReaderMsg::Cancel {
-                            conn,
-                            sub_id: sub.id.clone(),
-                        }));
-                        drop(shard
-                            .send(ShardMsg::Remove {
+                        Out::Closed { sub, reason } => {
+                            if !session.close_by_relay(&sub) {
+                                continue;
+                            }
+                            drop(reader.send(ReaderMsg::Cancel {
                                 conn,
                                 sub_id: sub.id.clone(),
-                            })
-                            .await);
-                        let text = closed_frame(&sub.id, &reason);
-                        if let Err(err) = ws.send(Frame::text(text.into_bytes())).await {
-                            tracing::debug!(%err, conn, "websocket send failed");
-                            break;
+                            }));
+                            drop(shard
+                                .send(ShardMsg::Remove {
+                                    conn,
+                                    sub_id: sub.id.clone(),
+                                })
+                                .await);
+                            let text = closed_frame(&sub.id, &reason);
+                            dead = !feed_timed(
+                                ws, Frame::text(text.into_bytes()),
+                                handle.ping_interval, conn,
+                            ).await;
                         }
+                    }
+                    if dead {
+                        break;
+                    }
+                }
+                if dead {
+                    break;
+                }
+                match tokio::time::timeout(handle.ping_interval, ws.flush()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::debug!(%err, conn, "websocket flush failed");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!(conn, "websocket flush stalled");
+                        break;
                     }
                 }
             }
@@ -177,25 +241,44 @@ pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle) {
             }
             _ = ping.tick() => {
                 if last_inbound.elapsed() > handle.ping_interval.saturating_mul(2) {
-                    drop(ws.send(Frame::close(CloseCode::Away, &[][..])).await);
+                    drop(tokio::time::timeout(
+                        CLOSE_TIMEOUT,
+                        ws.send(Frame::close(CloseCode::Away, &[][..])),
+                    ).await);
                     break;
                 }
-                if let Err(err) = ws.send(Frame::ping(&[][..])).await {
-                    tracing::debug!(%err, conn, "ping failed");
-                    break;
+                match tokio::time::timeout(
+                    handle.ping_interval,
+                    ws.send(Frame::ping(&[][..])),
+                ).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        tracing::debug!(%err, conn, "ping failed");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::debug!(conn, "ping write stalled");
+                        break;
+                    }
                 }
             }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
-                    drop(ws.send(Frame::close(CloseCode::Away, &[][..])).await);
+                    drop(tokio::time::timeout(
+                        CLOSE_TIMEOUT,
+                        ws.send(Frame::close(CloseCode::Away, &[][..])),
+                    ).await);
                     break;
                 }
             }
         }
         if out.is_dead() {
             drop(
-                ws.send(Frame::close(CloseCode::Policy, &b"slow consumer"[..]))
-                    .await,
+                tokio::time::timeout(
+                    CLOSE_TIMEOUT,
+                    ws.send(Frame::close(CloseCode::Policy, &b"slow consumer"[..])),
+                )
+                .await,
             );
             break;
         }

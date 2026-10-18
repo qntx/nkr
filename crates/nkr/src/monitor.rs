@@ -38,6 +38,10 @@ struct FilterSlot {
     filter_index: usize,
     stamp: u64,
     key: SlotKey,
+    /// Position inside the index list `key` points at, so removal is
+    /// O(1) `swap_remove` instead of a linear scan. The moved slot's
+    /// `pos` is fixed up on every removal.
+    pos: usize,
 }
 
 /// A live subscription entry.
@@ -132,6 +136,7 @@ impl<C: Copy + Eq + std::hash::Hash> Monitors<C> {
                     filter_index,
                     stamp: 0,
                     key: key.clone(),
+                    pos: usize::MAX,
                 });
                 self.add_to_index(key, slot);
                 new_slots.push(slot);
@@ -222,46 +227,94 @@ impl<C: Copy + Eq + std::hash::Hash> Monitors<C> {
         };
         for slot in entry.slots {
             if let Some(removed) = self.slots.try_remove(slot) {
-                self.remove_from_index(slot, removed.key);
+                self.remove_from_index(removed.pos, removed.key);
             }
         }
     }
 
     fn add_to_index(&mut self, key: SlotKey, slot: usize) {
-        match key {
-            SlotKey::Id(id) => self.idx_id.entry(id).or_default().push(slot),
-            SlotKey::Author(pk) => self.idx_author.entry(pk).or_default().push(slot),
-            SlotKey::Kind(kind) => self.idx_kind.entry(kind).or_default().push(slot),
-            SlotKey::Tag(name, value) => self
-                .idx_tag
-                .entry(name)
-                .or_default()
-                .entry(value)
-                .or_default()
-                .push(slot),
-            SlotKey::All => self.idx_all.push(slot),
+        let pos = match key {
+            SlotKey::Id(id) => push_to(&mut self.idx_id, &id, slot),
+            SlotKey::Author(pk) => push_to(&mut self.idx_author, &pk, slot),
+            SlotKey::Kind(kind) => push_to(&mut self.idx_kind, &kind, slot),
+            SlotKey::Tag(name, value) => {
+                let list = self
+                    .idx_tag
+                    .entry(name)
+                    .or_default()
+                    .entry(value)
+                    .or_default();
+                list.push(slot);
+                list.len() - 1
+            }
+            SlotKey::All => {
+                self.idx_all.push(slot);
+                self.idx_all.len() - 1
+            }
+        };
+        if let Some(slot_ref) = self.slots.get_mut(slot) {
+            slot_ref.pos = pos;
         }
     }
 
-    fn remove_from_index(&mut self, slot: usize, key: SlotKey) {
+    fn remove_from_index(&mut self, pos: usize, key: SlotKey) {
         match key {
-            SlotKey::Id(id) => remove_from(&mut self.idx_id, &id, slot),
-            SlotKey::Author(pk) => remove_from(&mut self.idx_author, &pk, slot),
-            SlotKey::Kind(kind) => remove_from(&mut self.idx_kind, &kind, slot),
+            SlotKey::Id(id) => remove_from(&mut self.slots, &mut self.idx_id, &id, pos),
+            SlotKey::Author(pk) => {
+                remove_from(&mut self.slots, &mut self.idx_author, &pk, pos);
+            }
+            SlotKey::Kind(kind) => {
+                remove_from(&mut self.slots, &mut self.idx_kind, &kind, pos);
+            }
             SlotKey::Tag(name, value) => {
+                let slots = &mut self.slots;
                 let drop_name = self.idx_tag.get_mut(&name).is_some_and(|values| {
-                    remove_from(values, &value, slot);
+                    remove_from(slots, values, &value, pos);
                     values.is_empty()
                 });
                 if drop_name {
                     self.idx_tag.remove(&name);
                 }
             }
-            SlotKey::All => {
-                if let Some(pos) = self.idx_all.iter().position(|&s| s == slot) {
-                    self.idx_all.swap_remove(pos);
-                }
-            }
+            SlotKey::All => remove_at(&mut self.slots, &mut self.idx_all, pos),
+        }
+    }
+}
+
+fn push_to<K: Eq + std::hash::Hash + Clone>(
+    index: &mut Map<K, Vec<usize>>,
+    key: &K,
+    slot: usize,
+) -> usize {
+    let list = index.entry(key.clone()).or_default();
+    list.push(slot);
+    list.len() - 1
+}
+
+/// Remove list element `pos` via `swap_remove` and fix the moved
+/// slot's stored position.
+fn remove_at(slots: &mut slab::Slab<FilterSlot>, list: &mut Vec<usize>, pos: usize) {
+    if pos >= list.len() {
+        return;
+    }
+    list.swap_remove(pos);
+    if let Some(&moved) = list.get(pos)
+        && let Some(slot_ref) = slots.get_mut(moved)
+    {
+        slot_ref.pos = pos;
+    }
+}
+
+fn remove_from<K: Eq + std::hash::Hash>(
+    slots: &mut slab::Slab<FilterSlot>,
+    index: &mut Map<K, Vec<usize>>,
+    key: &K,
+    pos: usize,
+) {
+    if let Some(list) = index.get_mut(key) {
+        remove_at(slots, list, pos);
+        if list.is_empty() {
+            index.remove(key);
         }
     }
 }
@@ -290,13 +343,4 @@ fn index_keys(filter: &Filter) -> Vec<SlotKey> {
         return kinds.iter().map(|kind| SlotKey::Kind(*kind)).collect();
     }
     vec![SlotKey::All]
-}
-
-fn remove_from<K: Eq + std::hash::Hash>(index: &mut Map<K, Vec<usize>>, key: &K, slot: usize) {
-    if let Some(list) = index.get_mut(key) {
-        list.retain(|&s| s != slot);
-        if list.is_empty() {
-            index.remove(key);
-        }
-    }
 }

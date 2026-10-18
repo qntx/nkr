@@ -22,7 +22,7 @@
 
 mod common;
 
-use nkr::event::{EventId, cmp_newest_first, cmp_oldest_first, supersedes};
+use nkr::event::{EventId, cmp_newest_first, supersedes};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -75,7 +75,8 @@ fn event_order() {
             }
             Case::Item { events, order } => {
                 let mut keys: Vec<(u64, EventId)> = events.iter().map(WireEvent::key).collect();
-                keys.sort_by(|a, b| cmp_oldest_first((a.0, &a.1), (b.0, &b.1)));
+                // Negentropy item order: created_at ascending, id ascending.
+                keys.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
                 let actual: Vec<String> = keys.iter().map(|(_, id)| id.to_string()).collect();
                 assert_eq!(&actual, order, "case {i}: item order");
             }

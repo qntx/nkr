@@ -85,7 +85,8 @@ async fn root(State(state): State<AppState>, request: Request) -> Response {
         };
         let handle = state.conn.clone();
         let ip = client_ip(&state, &parts.headers, peer);
-        tokio::spawn(async move {
+        let tracker = handle.tracker.clone();
+        tracker.spawn(async move {
             match fut.await {
                 Ok(mut ws) => {
                     tracing::debug!(%ip, "connection open");
@@ -147,8 +148,8 @@ fn nip11(config: &Config) -> Value {
         "limitation": {
             "max_message_length": relay.max_websocket_payload_size,
             "max_subscriptions": relay.limits.max_subs_per_connection,
-            "max_filters": relay.limits.max_req_filter_size,
             "max_limit": relay.limits.max_filter_limit,
+            "default_limit": relay.limits.max_filter_limit,
             "max_subid_length": 64,
             "max_event_tags": config.events.max_num_tags,
             "created_at_lower_limit": config.events.reject_events_older_than_seconds,

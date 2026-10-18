@@ -77,7 +77,7 @@ impl Default for EventLimits {
 #[derive(Debug, thiserror::Error)]
 pub enum EventError {
     /// The input is not a well-formed event object.
-    #[error("invalid JSON: {0}")]
+    #[error("malformed JSON: {0}")]
     Json(#[from] serde_json::Error),
     /// A field has a wrong shape (wrong type or bad hex).
     #[error("field `{0}` must be {1}")]
@@ -268,14 +268,13 @@ impl<'a> UnverifiedEvent<'a> {
     /// [`EventError::IdMismatch`], [`EventError::Sig`], or
     /// [`EventError::EventTooLarge`].
     pub fn verify(self, limits: &EventLimits) -> Result<Event, EventError> {
-        let preimage = serde_json::to_string(&(
-            0u8,
+        let preimage = id_preimage(
             self.pubkey_hex.as_ref(),
             self.created_at,
             self.kind.0,
             &self.tags,
             self.content.as_ref(),
-        ))?;
+        );
         let computed: [u8; 32] = Sha256::digest(preimage.as_bytes()).into();
         if computed != self.id.0 {
             return Err(EventError::IdMismatch);
@@ -406,7 +405,18 @@ impl Event {
 
 /// The NIP-01 id preimage `[0, pubkey, created_at, kind, tags, content]`,
 /// serialized exactly like `JSON.stringify` (`vectors/event-serialize.json`
-/// is the oracle).
+/// is the oracle). `pubkey` is the lowercase hex string form.
+fn id_preimage<T: Serialize + ?Sized>(
+    pubkey: &str,
+    created_at: u64,
+    kind: u16,
+    tags: &T,
+    content: &str,
+) -> String {
+    serde_json::to_string(&(0u8, pubkey, created_at, kind, tags, content)).unwrap_or_default()
+}
+
+/// The NIP-01 id preimage, built for an unsigned event.
 #[must_use]
 pub fn serialize_for_id(
     pubkey: &PublicKey,
@@ -415,8 +425,7 @@ pub fn serialize_for_id(
     tags: &[Vec<String>],
     content: &str,
 ) -> String {
-    serde_json::to_string(&(0u8, pubkey.to_string(), created_at, kind.0, tags, content))
-        .unwrap_or_default()
+    id_preimage(&pubkey.to_string(), created_at, kind.0, tags, content)
 }
 
 /// The NIP-01 event id: `SHA-256` of the [`serialize_for_id`] preimage.
@@ -440,14 +449,6 @@ pub fn address_hash(kind: Kind, pubkey: &PublicKey, d: &[u8]) -> [u8; 32] {
 #[must_use]
 pub fn cmp_newest_first(a: (u64, &EventId), b: (u64, &EventId)) -> Ordering {
     b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1))
-}
-
-/// Negentropy item order: `created_at` ascending, then id ascending.
-/// The time axis is opposite to [`cmp_newest_first`]; the id tie-break
-/// has the same direction.
-#[must_use]
-pub fn cmp_oldest_first(a: (u64, &EventId), b: (u64, &EventId)) -> Ordering {
-    a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1))
 }
 
 /// Whether `new` supersedes `old` as the stored replaceable/addressable
