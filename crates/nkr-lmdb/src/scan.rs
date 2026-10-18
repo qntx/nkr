@@ -5,7 +5,6 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use heed::types::Bytes;
 use nkr::event::{EventId, cmp_newest_first};
 use nkr::filter::Filter;
 use nkr::packed::PackedRef;
@@ -18,6 +17,9 @@ const BUDGET_CHECK_EVERY: usize = 64;
 /// A `(created_at, id, seq)` match collected for one filter.
 type Match = (u64, EventId, u64);
 
+/// A live reverse-range iterator, borrowing the step's read txn.
+type RevIter<'a> = Box<dyn Iterator<Item = Result<(&'a [u8], &'a [u8]), heed::Error>> + 'a>;
+
 /// Whether a [`Scan::step`] has work left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progress {
@@ -28,7 +30,8 @@ pub enum Progress {
 }
 
 /// One descending range cursor: `lo` inclusive, `hi` starts inclusive on
-/// `prefix ‖ until ‖ u64::MAX` and becomes exclusive on the last popped key.
+/// `prefix ‖ until ‖ u64::MAX` and becomes exclusive on the last pulled
+/// key. The bounds seed one live iterator per [`Scan::step`].
 #[derive(Debug)]
 struct Cursor {
     lo: Vec<u8>,
@@ -66,28 +69,25 @@ impl Cursor {
             },
         )
     }
+}
 
-    /// Pop the newest key still in range; the returned key becomes the
-    /// exclusive upper bound for the next call.
-    fn pop_next(
-        &mut self,
-        db: &heed::Database<Bytes, Bytes>,
-        txn: &Reader<'_>,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
-        if self.exhausted {
-            return Ok(None);
-        }
-        let first = db
-            .rev_range(txn, &self.bounds())?
-            .next()
-            .transpose()?
-            .map(|(key, _)| key.to_vec());
-        if let Some(key) = first {
-            self.hi.clone_from(&key);
-            self.hi_inclusive = false;
-            return Ok(Some(key));
-        }
-        self.exhausted = true;
+/// Pull the newest key a live iterator still holds for `cursor`; the
+/// pulled key becomes the cursor's exclusive upper bound.
+fn pull(
+    iter: &mut Option<RevIter<'_>>,
+    cursor: &mut Cursor,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    let Some(it) = iter else {
+        return Ok(None);
+    };
+    if let Some((key, _)) = it.next().transpose()? {
+        cursor.hi.clear();
+        cursor.hi.extend_from_slice(key);
+        cursor.hi_inclusive = false;
+        Ok(Some(key.to_vec()))
+    } else {
+        cursor.exhausted = true;
+        *iter = None;
         Ok(None)
     }
 }
@@ -116,12 +116,14 @@ impl PartialOrd for Head {
 /// Per-filter scan state.
 #[derive(Debug)]
 struct Plan {
-    mode: Mode,
+    /// `None` for finished or impossible filters.
+    mode: Option<Mode>,
     /// `(created_at, id, seq)` matches collected so far.
     collected: Vec<Match>,
-    /// Candidate seqs already considered — an event may be reachable via
-    /// several cursors (e.g. two `#p` values on the same event).
-    seen: HashSet<u64>,
+    /// The last seq considered; duplicates of one event (several tag
+    /// values reaching it) share the `(created_at, seq)` suffix and
+    /// therefore pop consecutively.
+    last_seq: Option<u64>,
     limit: u64,
     finished: bool,
 }
@@ -221,15 +223,9 @@ impl Scan {
                 let limit = filter.effective_limit(max_filter_limit);
                 let finished = filter.is_impossible() || limit == 0;
                 Plan {
-                    mode: if finished {
-                        Mode::Ids {
-                            pending: VecDeque::new(),
-                        }
-                    } else {
-                        plan(filter)
-                    },
+                    mode: (!finished).then(|| plan(filter)),
                     collected: Vec::new(),
-                    seen: HashSet::new(),
+                    last_seq: None,
                     limit,
                     finished,
                 }
@@ -330,8 +326,12 @@ fn run_plan(
     emit: &mut dyn FnMut(&str),
 ) -> Result<(), StoreError> {
     let collected = &mut plan.collected;
-    let seen = &mut plan.seen;
-    match &mut plan.mode {
+    let last_seq = &mut plan.last_seq;
+    let Some(mode) = &mut plan.mode else {
+        plan.finished = true;
+        return Ok(());
+    };
+    match mode {
         Mode::Ids { pending } => {
             while let Some(id) = pending.pop_front() {
                 *processed += 1;
@@ -341,7 +341,7 @@ fn run_plan(
                         txn,
                         filter,
                         collected,
-                        seen,
+                        last_seq,
                         snapshot,
                         decode_seq(bytes)?,
                     )?;
@@ -355,9 +355,19 @@ fn run_plan(
         }
         Mode::Ranges { db, cursors } => {
             let db = store.db(*db);
+            // One live reverse iterator per cursor, seeded at the saved
+            // bounds; the bounds are only (re)derived when the step ends.
+            let mut iters: Vec<Option<RevIter<'_>>> = Vec::with_capacity(cursors.len());
+            for cursor in cursors.iter() {
+                iters.push(if cursor.exhausted {
+                    None
+                } else {
+                    Some(Box::new(db.rev_range(txn, &cursor.bounds())?))
+                });
+            }
             let mut heap: BinaryHeap<Head> = BinaryHeap::new();
-            for (i, cursor) in cursors.iter_mut().enumerate() {
-                if let Some(key) = cursor.pop_next(db, txn)? {
+            for (i, (iter, cursor)) in iters.iter_mut().zip(cursors.iter_mut()).enumerate() {
+                if let Some(key) = pull(iter, cursor)? {
                     heap.push(Head {
                         created_at: key_created_at(&key),
                         seq: key_seq(&key),
@@ -368,10 +378,10 @@ fn run_plan(
             }
             while let Some(head) = heap.pop() {
                 *processed += 1;
-                let cursor = cursors
-                    .get_mut(head.cursor)
-                    .ok_or(StoreError::Corrupt("missing cursor"))?;
-                if let Some(next) = cursor.pop_next(db, txn)? {
+                if let Some(cursor) = cursors.get_mut(head.cursor)
+                    && let Some(iter) = iters.get_mut(head.cursor)
+                    && let Some(next) = pull(iter, cursor)?
+                {
                     heap.push(Head {
                         created_at: key_created_at(&next),
                         seq: key_seq(&next),
@@ -379,7 +389,7 @@ fn run_plan(
                         cursor: head.cursor,
                     });
                 }
-                try_candidate(store, txn, filter, collected, seen, snapshot, head.seq)?;
+                try_candidate(store, txn, filter, collected, last_seq, snapshot, head.seq)?;
                 if collected.len() as u64 >= plan.limit {
                     let boundary = collected.last().map_or(0, |(created_at, _, _)| *created_at);
                     let ties_done = heap.peek().is_none_or(|next| next.created_at < boundary);
@@ -399,7 +409,7 @@ fn run_plan(
     Ok(())
 }
 
-/// Heads still in the heap were popped from their cursors (each became
+/// Heads still in the heap were pulled from their iterators (each became
 /// an exclusive `hi` bound) but not consumed; restore them so the next
 /// step sees them.
 fn restore_heads(heap: &mut BinaryHeap<Head>, cursors: &mut [Cursor]) {
@@ -411,20 +421,21 @@ fn restore_heads(heap: &mut BinaryHeap<Head>, cursors: &mut [Cursor]) {
     }
 }
 
-/// seq/snapshot/emitted checks, packed load, `Filter::matches`, collect.
+/// seq/snapshot/dup checks, packed load, `Filter::matches`, collect.
 #[allow(clippy::too_many_arguments, reason = "every input is needed")]
 fn try_candidate(
     store: &Store,
     txn: &Reader<'_>,
     filter: &Filter,
     collected: &mut Vec<Match>,
-    seen: &mut HashSet<u64>,
+    last_seq: &mut Option<u64>,
     snapshot: u64,
     seq: u64,
 ) -> Result<(), StoreError> {
-    if seq > snapshot || !seen.insert(seq) {
+    if seq > snapshot || *last_seq == Some(seq) {
         return Ok(());
     }
+    *last_seq = Some(seq);
     let Some(bytes) = store.events.get(txn, &seq.to_be_bytes())? else {
         return Ok(()); // deleted between slices
     };
