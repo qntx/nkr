@@ -20,22 +20,22 @@ use crate::channels::{ConnId, Out, Outbound, ShardMsg, WriteRequest, route};
 
 /// Per-connection state handed down from the server.
 #[derive(Debug, Clone)]
-pub struct Handle {
+pub(crate) struct Handle {
     /// Writer inbox.
-    pub writer: mpsc::Sender<WriteRequest>,
+    pub(crate) writer: mpsc::Sender<WriteRequest>,
     /// Monitor shard inboxes, indexed by `conn % shards.len()`; the
     /// shard owns the reader routing for scans.
-    pub shards: Arc<[mpsc::Sender<ShardMsg>]>,
+    pub(crate) shards: Arc<[mpsc::Sender<ShardMsg>]>,
     /// Session limits.
-    pub limits: Arc<nosfry::limits::Limits>,
+    pub(crate) limits: Arc<nosfry::limits::Limits>,
     /// Ping interval.
-    pub ping_interval: Duration,
+    pub(crate) ping_interval: Duration,
     /// Outbound byte budget.
-    pub max_pending_outbound: usize,
+    pub(crate) max_pending_outbound: usize,
     /// Broadcast shutdown signal.
-    pub shutdown: watch::Receiver<bool>,
+    pub(crate) shutdown: watch::Receiver<bool>,
     /// Tracks every live connection task for the shutdown deadline.
-    pub tracker: tokio_util::task::TaskTracker,
+    pub(crate) tracker: tokio_util::task::TaskTracker,
 }
 
 /// Global connection counter.

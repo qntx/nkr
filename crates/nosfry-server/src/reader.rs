@@ -183,17 +183,11 @@ fn apply(
     max_filter_limit: u64,
 ) {
     match msg {
-        ReaderMsg::Start {
-            conn,
-            sub,
-            filters,
-            snapshot,
-            out,
-        } => new_scans.push_back(ScanEntry {
-            conn,
-            sub,
-            scan: Scan::new(filters, snapshot, max_filter_limit),
-            out,
+        ReaderMsg::Start(start) => new_scans.push_back(ScanEntry {
+            conn: start.conn,
+            sub: start.sub,
+            scan: Scan::new(start.filters, start.snapshot, max_filter_limit),
+            out: start.out,
             first_pushed: false,
         }),
         ReaderMsg::Cancel { conn, sub_id } => {
@@ -226,6 +220,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
+    use crate::channels::ScanStart;
 
     /// A signed kind-1 event at a distinct `created_at`.
     fn event(i: u64) -> Arc<nosfry::event::Event> {
@@ -270,7 +265,7 @@ mod tests {
         let (shard_tx, _shard_rx) = mpsc::channel(8);
         let (out, mut out_rx) = Outbound::new(1 << 30);
         let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
-        tx.send(ReaderMsg::Start {
+        tx.send(ReaderMsg::Start(Box::new(ScanStart {
             conn: 1,
             sub: SubKey {
                 id: SubId::parse("s").unwrap(),
@@ -279,7 +274,7 @@ mod tests {
             filters,
             snapshot: u64::MAX,
             out,
-        })
+        })))
         .unwrap();
         let reader = std::thread::spawn(move || {
             run(
@@ -327,7 +322,7 @@ mod tests {
             text: "x".repeat(1024),
         });
         let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
-        tx.send(ReaderMsg::Start {
+        tx.send(ReaderMsg::Start(Box::new(ScanStart {
             conn: 1,
             sub: SubKey {
                 id: SubId::parse("s").unwrap(),
@@ -336,7 +331,7 @@ mod tests {
             filters,
             snapshot: 0,
             out,
-        })
+        })))
         .unwrap();
 
         let before = LOOP_TICKS.load(Ordering::Relaxed);

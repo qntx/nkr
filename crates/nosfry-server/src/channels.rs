@@ -11,7 +11,7 @@ use nosfry::session::SubKey;
 use tokio::sync::mpsc;
 
 /// Connection identifier; also the shard/reader routing key.
-pub type ConnId = u64;
+pub(crate) type ConnId = u64;
 
 /// Route `conn` to `conn % slots.len()`.
 ///
@@ -26,22 +26,22 @@ pub(crate) fn route<T>(slots: &[T], conn: ConnId) -> &T {
 }
 
 /// One committed write batch: `(seq, event)` for `Stored` events only.
-pub type Batch = Vec<(u64, Arc<Event>)>;
+pub(crate) type Batch = Vec<(u64, Arc<Event>)>;
 
 /// A publish request queued for the single writer thread.
 #[derive(Debug)]
-pub struct WriteRequest {
+pub(crate) struct WriteRequest {
     /// The verified event.
-    pub event: Arc<Event>,
+    pub(crate) event: Arc<Event>,
     /// The connection's outbound queue; the writer pushes the `OK`
     /// frame onto it directly (one fewer task wake-up than a reply
     /// channel bouncing through the connection's `select!`).
-    pub out: Outbound,
+    pub(crate) out: Outbound,
 }
 
 /// Inbox item for a monitor shard thread.
 #[derive(Debug)]
-pub enum ShardMsg {
+pub(crate) enum ShardMsg {
     /// Register a subscription as pending; the shard forwards a
     /// [`ReaderMsg::Start`] carrying the current snapshot — the highest
     /// seq the shard has already received — so a `Cancel` it forwards
@@ -84,20 +84,9 @@ pub enum ShardMsg {
 
 /// Inbox item for a reader thread.
 #[derive(Debug)]
-pub enum ReaderMsg {
-    /// Start a snapshot-bounded scan.
-    Start {
-        /// Owning connection.
-        conn: ConnId,
-        /// Subscription key (with generation).
-        sub: SubKey,
-        /// Compiled filters.
-        filters: Arc<[Filter]>,
-        /// Snapshot seq S assigned by the shard.
-        snapshot: u64,
-        /// Where results go.
-        out: Outbound,
-    },
+pub(crate) enum ReaderMsg {
+    /// Start a snapshot-bounded scan (boxed: it dwarfs the other variants).
+    Start(Box<ScanStart>),
     /// Cancel one scan.
     Cancel {
         /// Owning connection.
@@ -112,9 +101,24 @@ pub enum ReaderMsg {
     },
 }
 
+/// Arguments for [`ReaderMsg::Start`].
+#[derive(Debug)]
+pub(crate) struct ScanStart {
+    /// Owning connection.
+    pub(crate) conn: ConnId,
+    /// Subscription key (with generation).
+    pub(crate) sub: SubKey,
+    /// Compiled filters.
+    pub(crate) filters: Arc<[Filter]>,
+    /// Snapshot seq S assigned by the shard.
+    pub(crate) snapshot: u64,
+    /// Where results go.
+    pub(crate) out: Outbound,
+}
+
 /// One outbound item for a connection's write loop.
 #[derive(Debug)]
-pub enum Out {
+pub(crate) enum Out {
     /// A pre-serialized frame; `sub` carries the generation the
     /// connection checks before writing (`None` always goes out).
     Frame {
@@ -155,7 +159,7 @@ impl Out {
     /// `Frame`, the serialized frame's size for `Event` (payload plus
     /// `["EVENT",<sub>,` overhead) and `Closed`.
     #[must_use]
-    pub fn accounted_bytes(&self) -> usize {
+    pub(crate) fn accounted_bytes(&self) -> usize {
         match self {
             Self::Frame { text, .. } => text.len(),
             Self::Frames { texts, .. } => texts.iter().map(String::len).sum(),
@@ -163,23 +167,12 @@ impl Out {
             Self::Closed { sub, reason } => sub.id.json().len() + reason.len() + 14,
         }
     }
-
-    /// The subscription tag for the `is_current` gate.
-    #[must_use]
-    pub const fn sub(&self) -> Option<&SubKey> {
-        match self {
-            Self::Frame { sub, .. } => sub.as_ref(),
-            Self::Frames { sub, .. } | Self::Event { sub, .. } | Self::Closed { sub, .. } => {
-                Some(sub)
-            }
-        }
-    }
 }
 
 /// Per-connection outbound queue: unbounded frames plus a bounded byte
 /// budget tracked atomically.
 #[derive(Debug)]
-pub struct Outbound {
+pub(crate) struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
     pending: Arc<AtomicUsize>,
     dead: Arc<AtomicBool>,
@@ -189,7 +182,7 @@ pub struct Outbound {
 impl Outbound {
     /// New queue; `max_pending` is the byte budget.
     #[must_use]
-    pub fn new(max_pending: usize) -> (Self, mpsc::UnboundedReceiver<Out>) {
+    pub(crate) fn new(max_pending: usize) -> (Self, mpsc::UnboundedReceiver<Out>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
@@ -204,7 +197,7 @@ impl Outbound {
 
     /// Queue a frame. Pushing pending bytes above `max_pending` marks
     /// the connection dead and drops the frame instead.
-    pub fn push(&self, out: Out) {
+    pub(crate) fn push(&self, out: Out) {
         let len = out.accounted_bytes();
         let prev = self.pending.fetch_add(len, Ordering::Relaxed);
         if prev + len > self.max_pending {
@@ -218,19 +211,19 @@ impl Outbound {
     }
 
     /// Account for a frame actually written to the socket.
-    pub fn written(&self, bytes: usize) {
+    pub(crate) fn written(&self, bytes: usize) {
         self.pending.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Pending outbound bytes.
     #[must_use]
-    pub fn pending(&self) -> usize {
+    pub(crate) fn pending(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
     }
 
     /// The byte budget was exceeded; the connection should close.
     #[must_use]
-    pub fn is_dead(&self) -> bool {
+    pub(crate) fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
     }
 }

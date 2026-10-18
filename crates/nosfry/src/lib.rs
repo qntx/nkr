@@ -1,7 +1,7 @@
 //! `nosfry` — sans-IO Nostr relay protocol core.
 //!
 //! Strict NIP-01 ingest (events, filters, client messages), a
-//! strfry-compatible packed index record, the compiled-filter matcher, a
+//! strfry-style packed index record, the compiled-filter matcher, a
 //! per-connection session state machine and the live-subscription inverted
 //! index. No async, no I/O, no system clock (time arrives as `now: u64` unix
 //! seconds), no randomness; the crate builds for `wasm32-unknown-unknown`.

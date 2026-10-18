@@ -4,11 +4,11 @@
 
 use std::path::Path;
 
-use nosfry::event::UnverifiedEvent;
+use nosfry::event::{EventLimits, UnverifiedEvent};
 use nosfry::filter::Filter;
 use nosfry::message::ClientMessage;
 use nosfry::packed::TagValueBuf;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Load `tests/vectors/<file>` and return its `cases` array.
 pub(crate) fn cases<T: for<'de> Deserialize<'de>>(file: &str) -> Vec<T> {
@@ -112,9 +112,9 @@ fn tag_wire_value(name: u8, value: &TagValueBuf) -> String {
     serde_json::to_string(raw.as_str()).unwrap_or_default()
 }
 
-/// Canonical client message wire form, rebuilt from the parsed accessors.
+/// Canonical client message wire form, rebuilt from the parsed message.
 /// Used to compare `encoded` in `message-client.json`.
-pub(crate) fn message_wire(message: &ClientMessage<'_>) -> String {
+pub(crate) fn message_wire(message: ClientMessage<'_>) -> String {
     match message {
         ClientMessage::Event(ev) => format!("[\"EVENT\",{}]", event_wire(ev)),
         ClientMessage::Req { sub_id, filters } => {
@@ -142,11 +142,11 @@ pub(crate) fn message_wire(message: &ClientMessage<'_>) -> String {
         } => format!(
             "[\"NEG-OPEN\",{},{},\"{}\"]",
             sub_id.json(),
-            filter_wire(filter),
-            hex_lower(msg)
+            filter_wire(&filter),
+            hex_lower(&msg)
         ),
         ClientMessage::NegMsg { sub_id, msg } => {
-            format!("[\"NEG-MSG\",{},\"{}\"]", sub_id.json(), hex_lower(msg))
+            format!("[\"NEG-MSG\",{},\"{}\"]", sub_id.json(), hex_lower(&msg))
         }
         ClientMessage::NegClose { sub_id } => {
             format!("[\"NEG-CLOSE\",{}]", sub_id.json())
@@ -154,32 +154,12 @@ pub(crate) fn message_wire(message: &ClientMessage<'_>) -> String {
     }
 }
 
-/// Canonical event JSON in fixed field order — the same layout
-/// `Event::json()` produces after verification.
-#[derive(Serialize)]
-struct WireEvent<'a> {
-    id: String,
-    pubkey: String,
-    created_at: u64,
-    kind: u16,
-    tags: Vec<Vec<&'a str>>,
-    content: &'a str,
-    sig: String,
-}
-
-fn event_wire(ev: &UnverifiedEvent<'_>) -> String {
-    let tags: Vec<Vec<&str>> = ev
-        .tags()
-        .map(|tag| tag.iter().map(AsRef::as_ref).collect())
-        .collect();
-    serde_json::to_string(&WireEvent {
-        id: ev.id().to_string(),
-        pubkey: ev.pubkey().to_string(),
-        created_at: ev.created_at(),
-        kind: ev.kind().0,
-        tags,
-        content: ev.content(),
-        sig: hex_lower(&ev.sig()),
-    })
-    .expect("wire json")
+/// Canonical event JSON via the public verify path. `encoded` vectors
+/// never carry an EVENT/AUTH payload, so an unverifiable event only
+/// appears in a failure diagnostic.
+fn event_wire(ev: UnverifiedEvent<'_>) -> String {
+    match ev.verify(&EventLimits::default()) {
+        Ok(event) => event.json().to_owned(),
+        Err(error) => format!("\"<{}>\"", error.reason()),
+    }
 }

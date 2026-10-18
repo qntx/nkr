@@ -20,9 +20,9 @@ The format is based on [Keep a Changelog]; this project follows
     duplicate keys rejected, lowercase hex only, strfry `e`/`p` tag
     rule; verify checks the SHA-256 NIP-01 preimage and the BIP-340
     schnorr signature), immutable `Event` with canonical JSON, packed record,
-    NIP-70 `is_protected`, and replaceable/addressable `address_hash`;
+    and replaceable/addressable `address_hash`;
     `cmp_newest_first`/`supersedes` ordering helpers.
-  - `packed`: strfry-compatible `PackedEvent`/`PackedRef` index record
+  - `packed`: strfry-style `PackedEvent`/`PackedRef` index record
     (single-letter tag names, first value only, ≤255-byte values, `e`/`p`
     stored raw, NIP-40 `expiration` in the header).
   - `filter`: strict compiled `Filter` (duplicate keys rejected, unknown
@@ -80,6 +80,15 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Changed
 
+- `nosfry`: `SubId` is an `Arc`-backed handle — monitor hits, reader
+  chunks, and outbound frames clone a refcount instead of two `Box<str>`
+  allocations.
+- `nosfry-server` and `nosfry-lmdb`: the shard `conns`/`pending` maps
+  and the stored-scan dedup set use `foldhash::fast::RandomState`
+  instead of SipHash.
+- `nosfry-server`: `channels`, `connection`, and `http` are private
+  modules; the public API is `config`, `Server`, `serve`, and
+  `ServerError`.
 - Renamed the project to nosfry (crates nosfry, nosfry-lmdb,
   nosfry-server; binary nosfry; NOSFRY_CONFIG; nosfry.toml)
 - `nosfry-server`: use the system allocator; mimalloc raised memory per
@@ -103,6 +112,15 @@ The format is based on [Keep a Changelog]; this project follows
   an exhaustive match in the writer itself.
 
 ### Fixed
+
+- `nosfry`: subscription ids containing JSON escapes (`\uXXXX`,
+  `\"`, ...) now parse for `REQ`/`CLOSE`/`COUNT`/`NEG-*` — a borrowed
+  `&str` deserialize rejected any escape sequence even though NIP-01
+  allows any string. The verb and the NEG hex payload still only accept
+  literal strings.
+- `nosfry`: `UnverifiedEvent::verify` checks the canonical-JSON size
+  before BIP-340 verification, so an oversized event no longer pays
+  for a signature check before rejection.
 
 - `nosfry-server`: a stale `Activate` from a superseded subscription
   generation no longer flushes/activates the re-registered generation
@@ -140,6 +158,11 @@ The format is based on [Keep a Changelog]; this project follows
   can no longer start a wasted scan after its cancel.
 
 ### Removed
+
+- `nosfry`: `Event::is_protected` (unused; NIP-70 will add what it
+  needs when implemented).
+- `nosfry`: `UnverifiedEvent` accessors `pubkey`, `tags`, `content`,
+  and `sig` (nothing outside tests used them).
 
 - `nosfry`: `Limits::max_filter_limit_count` (no consumer until COUNT
   exists) and `cmp_oldest_first` (unused outside tests).

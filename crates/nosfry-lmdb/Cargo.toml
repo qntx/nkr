@@ -12,6 +12,7 @@ categories.workspace = true
 
 [dependencies]
 nosfry.workspace = true
+foldhash.workspace = true
 heed.workspace = true
 thiserror.workspace = true
 

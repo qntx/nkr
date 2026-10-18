@@ -11,10 +11,18 @@ use nosfry::session::SubKey;
 use nosfry_lmdb::Store;
 use tokio::sync::mpsc;
 
-use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg, route};
+use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ScanStart, ShardMsg, route};
 
 /// Buffered matches per pending subscription before `CLOSED`.
 const PENDING_CAP: usize = 4096;
+
+/// foldhash for the hot-path maps (server-assigned conn ids and client
+/// sub ids); randomized seeding keeps `HashDoS` resistance.
+type Map<K, V> = HashMap<K, V, foldhash::fast::RandomState>;
+
+fn map<K, V>() -> Map<K, V> {
+    Map::with_hasher(foldhash::fast::RandomState::default())
+}
 
 /// A subscription registered but not yet activated: its live matches
 /// buffer until the stored scan finishes.
@@ -26,13 +34,14 @@ struct PendingSub {
     buffer: VecDeque<(SubKey, Arc<Event>)>,
 }
 
-/// Per-connection state inside one shard.
-#[derive(Debug, Default)]
+/// Per-connection state inside one shard; created on `Register`, which
+/// always carries the connection's outbound queue.
+#[derive(Debug)]
 struct ConnState {
     /// Where frames go.
-    out: Option<Outbound>,
+    out: Outbound,
     /// Pending subscriptions: sub id -> generation + buffered matches.
-    pending: HashMap<SubId, PendingSub>,
+    pending: Map<SubId, PendingSub>,
 }
 
 /// One monitor shard's state: the monitor index, connection outbound
@@ -41,7 +50,7 @@ struct ConnState {
 #[derive(Debug)]
 struct Shard {
     monitors: Monitors<ConnId>,
-    conns: HashMap<ConnId, ConnState>,
+    conns: Map<ConnId, ConnState>,
     /// Reader inboxes, routed `conn % len`; forwarding Start/Cancel from
     /// here keeps a subscription's reader messages in shard order.
     readers: Arc<[std::sync::mpsc::Sender<ReaderMsg>]>,
@@ -53,7 +62,7 @@ impl Shard {
     fn new(store: &Store, readers: Arc<[std::sync::mpsc::Sender<ReaderMsg>]>) -> Self {
         Self {
             monitors: Monitors::new(),
-            conns: HashMap::new(),
+            conns: map(),
             readers,
             last_seq: store.snapshot().unwrap_or(0),
             hits: Vec::new(),
@@ -69,8 +78,14 @@ impl Shard {
                 filters,
                 out,
             } => {
-                let state = self.conns.entry(conn).or_default();
-                state.out = Some(out.clone());
+                let state = self
+                    .conns
+                    .entry(conn)
+                    .and_modify(|state| state.out = out.clone())
+                    .or_insert_with(|| ConnState {
+                        out: out.clone(),
+                        pending: map(),
+                    });
                 state.pending.insert(
                     sub.id.clone(),
                     PendingSub {
@@ -80,13 +95,15 @@ impl Shard {
                 );
                 self.monitors
                     .insert(conn, sub.clone(), Arc::clone(&filters));
-                drop(route(&self.readers, conn).send(ReaderMsg::Start {
-                    conn,
-                    sub,
-                    filters,
-                    snapshot: self.last_seq,
-                    out,
-                }));
+                drop(
+                    route(&self.readers, conn).send(ReaderMsg::Start(Box::new(ScanStart {
+                        conn,
+                        sub,
+                        filters,
+                        snapshot: self.last_seq,
+                        out,
+                    }))),
+                );
             }
             ShardMsg::Activate { conn, sub } => {
                 let Some(state) = self.conns.get_mut(&conn) else {
@@ -102,10 +119,8 @@ impl Shard {
                 {
                     return;
                 }
-                if let Some(pending) = state.pending.remove(&sub.id)
-                    && let Some(out) = &state.out
-                {
-                    flush(out, pending.buffer);
+                if let Some(pending) = state.pending.remove(&sub.id) {
+                    flush(&state.out, pending.buffer);
                 }
             }
             ShardMsg::Remove { conn, sub_id } => {
@@ -161,24 +176,20 @@ fn route_hit(
     event: &Arc<Event>,
 ) {
     let Some(pending) = state.pending.get_mut(&sub.id) else {
-        if let Some(out) = &state.out {
-            out.push(Out::Event {
-                sub,
-                event: Arc::clone(event),
-            });
-        }
+        state.out.push(Out::Event {
+            sub,
+            event: Arc::clone(event),
+        });
         return;
     };
     if pending.buffer.len() < PENDING_CAP {
         pending.buffer.push_back((sub, Arc::clone(event)));
         return;
     }
-    if let Some(out) = &state.out {
-        out.push(Out::Closed {
-            sub: sub.clone(),
-            reason: "error: subscription fell behind".to_owned(),
-        });
-    }
+    state.out.push(Out::Closed {
+        sub: sub.clone(),
+        reason: "error: subscription fell behind".to_owned(),
+    });
     state.pending.remove(&sub.id);
     monitors.remove(conn, &sub.id);
 }
@@ -332,7 +343,7 @@ mod tests {
         });
 
         match reader_rx.try_recv() {
-            Ok(ReaderMsg::Start { snapshot, .. }) => assert_eq!(snapshot, 42),
+            Ok(ReaderMsg::Start(start)) => assert_eq!(start.snapshot, 42),
             other => panic!("expected Start with snapshot 42, got {other:?}"),
         }
     }
@@ -360,7 +371,7 @@ mod tests {
         });
 
         match reader_rx.try_recv() {
-            Ok(ReaderMsg::Start { conn: 1, .. }) => {}
+            Ok(ReaderMsg::Start(start)) if start.conn == 1 => {}
             other => panic!("expected Start first, got {other:?}"),
         }
         match reader_rx.try_recv() {

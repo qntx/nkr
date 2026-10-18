@@ -17,6 +17,9 @@ const BUDGET_CHECK_EVERY: usize = 64;
 /// A `(created_at, id, seq)` match collected for one filter.
 type Match = (u64, EventId, u64);
 
+/// foldhash for the cross-filter dedup set (server-assigned seq keys).
+type SeqSet = HashSet<u64, foldhash::fast::RandomState>;
+
 /// A live reverse-range iterator, borrowing the step's read txn.
 type RevIter<'a> = Box<dyn Iterator<Item = Result<(&'a [u8], &'a [u8]), heed::Error>> + 'a>;
 
@@ -220,7 +223,7 @@ pub struct Scan {
     filters: Arc<[Filter]>,
     snapshot: u64,
     plans: Vec<Plan>,
-    emitted: HashSet<u64>,
+    emitted: SeqSet,
     done: bool,
 }
 
@@ -251,7 +254,7 @@ impl Scan {
             filters,
             snapshot,
             plans,
-            emitted: HashSet::new(),
+            emitted: SeqSet::with_hasher(foldhash::fast::RandomState::default()),
             done: false,
         }
     }
@@ -329,7 +332,7 @@ struct Step<'a> {
     /// Upper bound on seqs this scan may emit.
     snapshot: u64,
     /// seqs already emitted by an earlier filter.
-    emitted: &'a mut HashSet<u64>,
+    emitted: &'a mut SeqSet,
     /// Candidates processed so far this step (budget check cadence).
     processed: usize,
     /// When the step began.

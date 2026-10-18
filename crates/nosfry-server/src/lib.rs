@@ -12,10 +12,10 @@
     )
 )]
 
-pub mod channels;
+mod channels;
 pub mod config;
-pub mod connection;
-pub mod http;
+mod connection;
+mod http;
 mod reader;
 mod shard;
 mod writer;
@@ -165,7 +165,11 @@ impl Server {
             tracker: tokio_util::task::TaskTracker::new(),
         };
         Ok(Self {
-            state: http::AppState { config, conn },
+            state: http::AppState {
+                nip11: http::nip11(&config).into(),
+                config,
+                conn,
+            },
             stop_tx,
             writer_tx,
             shard_txs,
