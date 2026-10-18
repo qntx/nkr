@@ -110,6 +110,15 @@ pub enum Out {
         /// The serialized frame.
         text: String,
     },
+    /// A chunk of pre-serialized scan frames for one subscription:
+    /// the reader packs a step's emits so the connection wakes once
+    /// per chunk instead of once per event.
+    Frames {
+        /// Subscription key.
+        sub: SubKey,
+        /// Serialized frames in emit order.
+        texts: Vec<String>,
+    },
     /// A live match: one shared `Arc` per event, framed into
     /// `["EVENT",sub,json]` by the connection at write time.
     Event {
@@ -136,6 +145,7 @@ impl Out {
     pub fn accounted_bytes(&self) -> usize {
         match self {
             Self::Frame { text, .. } => text.len(),
+            Self::Frames { texts, .. } => texts.iter().map(String::len).sum(),
             Self::Event { sub, event } => event.json().len() + sub.id.json().len() + 12,
             Self::Closed { sub, reason } => sub.id.json().len() + reason.len() + 14,
         }
@@ -146,7 +156,9 @@ impl Out {
     pub const fn sub(&self) -> Option<&SubKey> {
         match self {
             Self::Frame { sub, .. } => sub.as_ref(),
-            Self::Event { sub, .. } | Self::Closed { sub, .. } => Some(sub),
+            Self::Frames { sub, .. } | Self::Event { sub, .. } | Self::Closed { sub, .. } => {
+                Some(sub)
+            }
         }
     }
 }

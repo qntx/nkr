@@ -121,6 +121,39 @@ async fn req_returns_stored_events_then_eose() {
     relay.stop().await;
 }
 
+/// A 500-event stored result arrives complete and in newest-first
+/// order before EOSE through the reader's chunked `Out::Frames` path.
+#[tokio::test]
+async fn req_500_events_complete_in_order_before_eose() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let base = now() - 10_000;
+    let mut events = Vec::new();
+    for i in 0..500u64 {
+        let ev = common::event(&key(5), 1, base + i, &json!([]), &format!("e{i}"));
+        send_text(&mut ws, &event_wire(&ev)).await;
+        let _ok = recv_text(&mut ws, T).await;
+        events.push(ev);
+    }
+    send_text(&mut ws, &req_wire("s", "{\"kinds\":[1],\"limit\":500}")).await;
+    let mut got = Vec::new();
+    loop {
+        let frame = json(&recv_text(&mut ws, T).await);
+        match frame[0].as_str().unwrap() {
+            "EVENT" => got.push(frame[2]["id"].as_str().unwrap().to_owned()),
+            "EOSE" => break,
+            other => panic!("unexpected frame {other}"),
+        }
+    }
+    let want: Vec<String> = events
+        .iter()
+        .rev()
+        .map(|e| json(e.json())["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(got, want);
+    relay.stop().await;
+}
+
 #[tokio::test]
 async fn req_limit_and_multi_filter_dedup() {
     let relay = Relay::start().await;
