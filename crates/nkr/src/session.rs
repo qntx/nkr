@@ -149,12 +149,15 @@ impl Session {
             return;
         }
         let created_at = unverified.created_at();
-        let reject = if created_at > now.saturating_add(limits.reject_events_newer_than_seconds) {
+        let reject = if created_at
+            > now.saturating_add(limits.event.reject_events_newer_than_seconds)
+        {
             Some("created_at is too far in the future")
-        } else if created_at < now.saturating_sub(limits.reject_events_older_than_seconds) {
+        } else if created_at < now.saturating_sub(limits.event.reject_events_older_than_seconds) {
             Some("created_at is too far in the past")
         } else if unverified.kind().is_ephemeral()
-            && created_at < now.saturating_sub(limits.reject_ephemeral_events_older_than_seconds)
+            && created_at
+                < now.saturating_sub(limits.event.reject_ephemeral_events_older_than_seconds)
         {
             Some("ephemeral event created_at is too far in the past")
         } else {
@@ -176,7 +179,7 @@ impl Session {
     }
 
     fn on_req(&mut self, sub_id: SubId, filters: Vec<Filter>, out: &mut Vec<Command>) {
-        if filters.len() > self.limits.max_req_filter_size {
+        if filters.len() > self.limits.req.max_req_filter_size {
             out.push(Command::Send(closed_frame(
                 &sub_id,
                 &Reason::Invalid.message("too many filters in request"),
@@ -185,7 +188,7 @@ impl Session {
         }
         if filters
             .iter()
-            .any(|filter| filter.tag_filter_count() > self.limits.max_tags_per_filter)
+            .any(|filter| filter.tag_filter_count() > self.limits.req.max_tags_per_filter)
         {
             out.push(Command::Send(closed_frame(
                 &sub_id,
@@ -194,7 +197,7 @@ impl Session {
             return;
         }
         if !self.subs.contains_key(&sub_id)
-            && self.subs.len() >= self.limits.max_subs_per_connection
+            && self.subs.len() >= self.limits.req.max_subs_per_connection
         {
             out.push(Command::Send(closed_frame(
                 &sub_id,

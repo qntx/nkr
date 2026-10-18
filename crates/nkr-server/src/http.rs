@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, get};
@@ -48,10 +49,6 @@ async fn preflight() -> Response {
     response
 }
 
-#[allow(
-    clippy::excessive_nesting,
-    reason = "the three-way dispatch is clearest inline"
-)]
 async fn root(State(state): State<AppState>, request: Request) -> Response {
     let (mut parts, _body) = request.into_parts();
     let peer = parts
@@ -63,39 +60,8 @@ async fn root(State(state): State<AppState>, request: Request) -> Response {
         .get(header::UPGRADE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    if wants_upgrade && let Ok(upgrade) = IncomingUpgrade::from_request_parts(&mut parts, &()).await
-    {
-        let compression = &state.config.relay.compression;
-        let options =
-            Options::default().with_max_payload_read(state.config.relay.max_websocket_payload_size);
-        let options = if compression.enabled {
-            Options {
-                compression: Some(yawc::DeflateOptions {
-                    level: yawc::CompressionLevel::default(),
-                    server_no_context_takeover: !compression.sliding_window,
-                    client_no_context_takeover: !compression.sliding_window,
-                }),
-                ..options
-            }
-        } else {
-            options
-        };
-        let Ok((response, fut)) = upgrade.upgrade(options) else {
-            return StatusCode::BAD_REQUEST.into_response();
-        };
-        let handle = state.conn.clone();
-        let ip = client_ip(&state, &parts.headers, peer);
-        let tracker = handle.tracker.clone();
-        tracker.spawn(async move {
-            match fut.await {
-                Ok(mut ws) => {
-                    tracing::debug!(%ip, "connection open");
-                    connection::run(&mut ws, &handle).await;
-                }
-                Err(err) => tracing::debug!(%err, "upgrade failed"),
-            }
-        });
-        return response.into_response();
+    if wants_upgrade && let Some(response) = websocket(&state, &mut parts, peer).await {
+        return response;
     }
     let accepts_nostr = parts
         .headers
@@ -119,6 +85,52 @@ async fn root(State(state): State<AppState>, request: Request) -> Response {
             "nkr: a nostr relay. connect with a websocket client.\n",
         ))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// WebSocket upgrade branch of `root`; `None` when the upgrade headers
+/// were malformed and the request falls through to NIP-11/plain text.
+/// The deflate level is fixed at `fast()` (level 1, strfry's
+/// `deflateInit2` level) — query responses dominate and level 6 costs
+/// CPU without buying meaningful bytes at these message sizes.
+async fn websocket(
+    state: &AppState,
+    parts: &mut Parts,
+    peer: Option<SocketAddr>,
+) -> Option<Response> {
+    let Ok(upgrade) = IncomingUpgrade::from_request_parts(parts, &()).await else {
+        return None;
+    };
+    let compression = &state.config.relay.compression;
+    let options =
+        Options::default().with_max_payload_read(state.config.relay.max_websocket_payload_size);
+    let options = if compression.enabled {
+        Options {
+            compression: Some(yawc::DeflateOptions {
+                level: yawc::CompressionLevel::fast(),
+                server_no_context_takeover: !compression.sliding_window,
+                client_no_context_takeover: !compression.sliding_window,
+            }),
+            ..options
+        }
+    } else {
+        options
+    };
+    let Ok((response, fut)) = upgrade.upgrade(options) else {
+        return Some(StatusCode::BAD_REQUEST.into_response());
+    };
+    let handle = state.conn.clone();
+    let ip = client_ip(state, &parts.headers, peer);
+    let tracker = handle.tracker.clone();
+    tracker.spawn(async move {
+        match fut.await {
+            Ok(mut ws) => {
+                tracing::debug!(%ip, "connection open");
+                connection::run(&mut ws, &handle).await;
+            }
+            Err(err) => tracing::debug!(%err, "upgrade failed"),
+        }
+    });
+    Some(response.into_response())
 }
 
 fn client_ip(state: &AppState, headers: &header::HeaderMap, peer: Option<SocketAddr>) -> String {

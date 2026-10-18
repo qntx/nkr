@@ -123,7 +123,10 @@ fn req_replace_unsubscribes_then_subscribes_new_generation() {
 #[test]
 fn req_over_cap_closes() {
     let limits = Limits {
-        max_subs_per_connection: 1,
+        req: nkr::limits::ReqLimits {
+            max_subs_per_connection: 1,
+            ..nkr::limits::ReqLimits::default()
+        },
         ..Limits::default()
     };
     let mut s = Session::new(Arc::new(limits));

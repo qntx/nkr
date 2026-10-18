@@ -58,7 +58,6 @@ impl Default for StoreOptions {
 
 /// Outcome of writing one event, in arrival order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum WriteOutcome {
     /// Stored under a fresh sequence number.
     Stored {
@@ -272,54 +271,72 @@ impl Store {
     ///
     /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
     /// broken index invariant.
-    #[allow(
-        clippy::excessive_nesting,
-        reason = "the per-event branch chain stays readable inline"
-    )]
     pub fn write(&self, events: &[Arc<Event>]) -> Result<Vec<WriteOutcome>, StoreError> {
         let mut txn = self.env.write_txn()?;
         let mut next_seq = self.next_seq(&txn)?;
         let mut outcomes = Vec::with_capacity(events.len());
         for event in events {
-            if event.kind().is_ephemeral() {
-                outcomes.push(WriteOutcome::Ephemeral);
-                continue;
-            }
-            if self.ix_id.get(&txn, &event.id().0)?.is_some() {
-                outcomes.push(WriteOutcome::Duplicate);
-                continue;
-            }
-            if let Some(address) = event.address()
-                && let Some(old_seq) = self.ix_replace.get(&txn, &address)?
-            {
-                let old_seq = decode_seq(old_seq)?;
-                let old_bytes = self
-                    .events
-                    .get(&txn, &old_seq.to_be_bytes())?
-                    .ok_or(StoreError::Corrupt("ix_replace points at a missing event"))?
-                    .to_vec();
-                let old =
-                    PackedRef::new(&old_bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
-                if !supersedes(
-                    (event.created_at(), &event.id()),
-                    (old.created_at(), &old.id()),
-                ) {
-                    outcomes.push(WriteOutcome::Superseded);
-                    continue;
-                }
-                self.delete(&mut txn, old, old_seq, &address)?;
-            }
-            let seq = next_seq;
-            next_seq = next_seq
-                .checked_add(1)
-                .ok_or(StoreError::Corrupt("seq overflow"))?;
-            self.insert(&mut txn, event, seq)?;
-            outcomes.push(WriteOutcome::Stored { seq });
+            outcomes.push(self.apply(&mut txn, event, &mut next_seq)?);
         }
         self.meta
             .put(&mut txn, b"next_seq", &next_seq.to_be_bytes())?;
         txn.commit()?;
         Ok(outcomes)
+    }
+
+    /// Apply one event inside the write transaction: ephemeral and
+    /// duplicate ids are skipped, a losing replace is `Superseded`, and
+    /// a winner deletes its predecessor before the insert.
+    fn apply(
+        &self,
+        txn: &mut RwTxn<'_>,
+        event: &Arc<Event>,
+        next_seq: &mut u64,
+    ) -> Result<WriteOutcome, StoreError> {
+        if event.kind().is_ephemeral() {
+            return Ok(WriteOutcome::Ephemeral);
+        }
+        if self.ix_id.get(txn, &event.id().0)?.is_some() {
+            return Ok(WriteOutcome::Duplicate);
+        }
+        if let Some(address) = event.address()
+            && let Some((old_seq, old_bytes)) = self.stored_version(txn, &address)?
+        {
+            let old = PackedRef::new(&old_bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
+            if !supersedes(
+                (event.created_at(), &event.id()),
+                (old.created_at(), &old.id()),
+            ) {
+                return Ok(WriteOutcome::Superseded);
+            }
+            self.delete(txn, old, old_seq, &address)?;
+        }
+        let seq = *next_seq;
+        *next_seq = next_seq
+            .checked_add(1)
+            .ok_or(StoreError::Corrupt("seq overflow"))?;
+        self.insert(txn, event, seq)?;
+        Ok(WriteOutcome::Stored { seq })
+    }
+
+    /// The `(seq, packed bytes)` of the stored event `ix_replace` points
+    /// at for `address`; the record load doubles as an index-consistency
+    /// check.
+    fn stored_version(
+        &self,
+        txn: &RwTxn<'_>,
+        address: &[u8; 32],
+    ) -> Result<Option<(u64, Vec<u8>)>, StoreError> {
+        let Some(old_seq) = self.ix_replace.get(txn, address)? else {
+            return Ok(None);
+        };
+        let old_seq = decode_seq(old_seq)?;
+        let bytes = self
+            .events
+            .get(txn, &old_seq.to_be_bytes())?
+            .ok_or(StoreError::Corrupt("ix_replace points at a missing event"))?
+            .to_vec();
+        Ok(Some((old_seq, bytes)))
     }
 
     /// The highest assigned sequence number (`0` when empty); the upper

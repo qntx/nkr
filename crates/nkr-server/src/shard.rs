@@ -11,7 +11,7 @@ use nkr::session::SubKey;
 use nkr_lmdb::Store;
 use tokio::sync::mpsc;
 
-use crate::channels::{ConnId, Out, Outbound, ShardMsg};
+use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg, route};
 
 /// Buffered matches per pending subscription before `CLOSED`.
 const PENDING_CAP: usize = 4096;
@@ -36,20 +36,25 @@ struct ConnState {
 }
 
 /// One monitor shard's state: the monitor index, connection outbound
-/// queues, and the authoritative `last_seq` snapshot source.
+/// queues, the reader routing table it forwards scan control to, and
+/// the authoritative `last_seq` snapshot source.
 #[derive(Debug)]
 struct Shard {
     monitors: Monitors<ConnId>,
     conns: HashMap<ConnId, ConnState>,
+    /// Reader inboxes, routed `conn % len`; forwarding Start/Cancel from
+    /// here keeps a subscription's reader messages in shard order.
+    readers: Arc<[std::sync::mpsc::Sender<ReaderMsg>]>,
     last_seq: u64,
     hits: Vec<(ConnId, SubKey)>,
 }
 
 impl Shard {
-    fn new(store: &Store) -> Self {
+    fn new(store: &Store, readers: Arc<[std::sync::mpsc::Sender<ReaderMsg>]>) -> Self {
         Self {
             monitors: Monitors::new(),
             conns: HashMap::new(),
+            readers,
             last_seq: store.snapshot().unwrap_or(0),
             hits: Vec::new(),
         }
@@ -63,10 +68,9 @@ impl Shard {
                 sub,
                 filters,
                 out,
-                reply,
             } => {
                 let state = self.conns.entry(conn).or_default();
-                state.out = Some(out);
+                state.out = Some(out.clone());
                 state.pending.insert(
                     sub.id.clone(),
                     PendingSub {
@@ -74,8 +78,15 @@ impl Shard {
                         buffer: VecDeque::new(),
                     },
                 );
-                self.monitors.insert(conn, sub, filters);
-                reply.send(self.last_seq).ok();
+                self.monitors
+                    .insert(conn, sub.clone(), Arc::clone(&filters));
+                drop(route(&self.readers, conn).send(ReaderMsg::Start {
+                    conn,
+                    sub,
+                    filters,
+                    snapshot: self.last_seq,
+                    out,
+                }));
             }
             ShardMsg::Activate { conn, sub } => {
                 let Some(state) = self.conns.get_mut(&conn) else {
@@ -102,10 +113,12 @@ impl Shard {
                 if let Some(state) = self.conns.get_mut(&conn) {
                     state.pending.remove(&sub_id);
                 }
+                drop(route(&self.readers, conn).send(ReaderMsg::Cancel { conn, sub_id }));
             }
             ShardMsg::RemoveConn { conn } => {
                 self.monitors.remove_connection(conn);
                 self.conns.remove(&conn);
+                drop(route(&self.readers, conn).send(ReaderMsg::CancelConn { conn }));
             }
             ShardMsg::Batch(batch) => {
                 for (seq, event) in batch.iter() {
@@ -119,39 +132,55 @@ impl Shard {
         }
     }
 
-    /// Match the event against the monitor index and route it: buffered
-    /// for pending subs, one shared `Arc` per match for active ones.
-    #[allow(
-        clippy::excessive_nesting,
-        reason = "pending/active routing stays readable inline"
-    )]
+    /// Match the event against the monitor index and route each hit.
     fn deliver(&mut self, event: &Arc<Event>) {
         self.monitors.matches(event.packed(), &mut self.hits);
-        for (conn, sub) in self.hits.drain(..) {
-            let Some(state) = self.conns.get_mut(&conn) else {
+        let Self {
+            monitors,
+            conns,
+            hits,
+            ..
+        } = self;
+        for (conn, sub) in hits.drain(..) {
+            let Some(state) = conns.get_mut(&conn) else {
                 continue;
             };
-            if let Some(pending) = state.pending.get_mut(&sub.id) {
-                if pending.buffer.len() >= PENDING_CAP {
-                    if let Some(out) = &state.out {
-                        out.push(Out::Closed {
-                            sub: sub.clone(),
-                            reason: "error: subscription fell behind".to_owned(),
-                        });
-                    }
-                    state.pending.remove(&sub.id);
-                    self.monitors.remove(conn, &sub.id);
-                } else {
-                    pending.buffer.push_back((sub, Arc::clone(event)));
-                }
-            } else if let Some(out) = &state.out {
-                out.push(Out::Event {
-                    sub,
-                    event: Arc::clone(event),
-                });
-            }
+            route_hit(monitors, state, conn, sub, event);
         }
     }
+}
+
+/// Route one monitor hit: buffered while the subscription's stored scan
+/// runs (closed and dropped when the buffer overflows), one shared
+/// `Arc` pushed to the connection once active.
+fn route_hit(
+    monitors: &mut Monitors<ConnId>,
+    state: &mut ConnState,
+    conn: ConnId,
+    sub: SubKey,
+    event: &Arc<Event>,
+) {
+    let Some(pending) = state.pending.get_mut(&sub.id) else {
+        if let Some(out) = &state.out {
+            out.push(Out::Event {
+                sub,
+                event: Arc::clone(event),
+            });
+        }
+        return;
+    };
+    if pending.buffer.len() < PENDING_CAP {
+        pending.buffer.push_back((sub, Arc::clone(event)));
+        return;
+    }
+    if let Some(out) = &state.out {
+        out.push(Out::Closed {
+            sub: sub.clone(),
+            reason: "error: subscription fell behind".to_owned(),
+        });
+    }
+    state.pending.remove(&sub.id);
+    monitors.remove(conn, &sub.id);
 }
 
 /// Push every buffered live match to the connection.
@@ -162,9 +191,14 @@ fn flush(out: &Outbound, buffer: VecDeque<(SubKey, Arc<Event>)>) {
 }
 
 /// Shard thread main loop. `last_seq` starts at the store snapshot —
-/// every later seq arrives only via [`ShardMsg::Batch`].
-pub(crate) fn run(store: &Store, mut rx: mpsc::Receiver<ShardMsg>) {
-    let mut shard = Shard::new(store);
+/// every later seq arrives only via [`ShardMsg::Batch`]. `readers` is
+/// the routing table the shard forwards scan control into.
+pub(crate) fn run(
+    store: &Store,
+    mut rx: mpsc::Receiver<ShardMsg>,
+    readers: Arc<[std::sync::mpsc::Sender<ReaderMsg>]>,
+) {
+    let mut shard = Shard::new(store, readers);
     while let Some(msg) = rx.blocking_recv() {
         shard.handle(msg);
     }
@@ -233,28 +267,25 @@ mod tests {
     fn stale_activate_does_not_flush_new_generation() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
-        let mut shard = Shard::new(&store);
+        let (reader_tx, _reader_rx) = std::sync::mpsc::channel();
+        let mut shard = Shard::new(&store, Arc::from([reader_tx]));
         let (out, mut out_rx) = Outbound::new(1 << 20);
 
-        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
         shard.handle(ShardMsg::Register {
             conn: 1,
             sub: sub_key("s", 1),
             filters: filters(),
             out: out.clone(),
-            reply: reply_tx,
         });
         shard.handle(ShardMsg::Remove {
             conn: 1,
             sub_id: SubId::parse("s").unwrap(),
         });
-        let (reply_tx2, _reply_rx2) = tokio::sync::oneshot::channel();
         shard.handle(ShardMsg::Register {
             conn: 1,
             sub: sub_key("s", 2),
             filters: filters(),
             out,
-            reply: reply_tx2,
         });
         // The stale generation's scan finished late; Activate is ignored.
         shard.handle(ShardMsg::Activate {
@@ -278,6 +309,63 @@ mod tests {
         match out_rx.try_recv() {
             Ok(Out::Event { sub, .. }) => assert_eq!(sub.generation, 2),
             other => panic!("expected buffered Event, got {other:?}"),
+        }
+    }
+
+    /// `Register` after a `Batch` must send the reader a `Start`
+    /// carrying the shard's post-batch `last_seq` as the snapshot.
+    #[test]
+    fn register_starts_scan_at_current_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+        let (reader_tx, reader_rx) = std::sync::mpsc::channel();
+        let mut shard = Shard::new(&store, Arc::from([reader_tx]));
+        let (out, _out_rx) = Outbound::new(1 << 20);
+
+        let batch: crate::channels::Batch = vec![(42u64, event(1, "hi"))];
+        shard.handle(ShardMsg::Batch(Arc::new(batch)));
+        shard.handle(ShardMsg::Register {
+            conn: 1,
+            sub: sub_key("s", 1),
+            filters: filters(),
+            out,
+        });
+
+        match reader_rx.try_recv() {
+            Ok(ReaderMsg::Start { snapshot, .. }) => assert_eq!(snapshot, 42),
+            other => panic!("expected Start with snapshot 42, got {other:?}"),
+        }
+    }
+
+    /// `Register` then `Remove` must reach the reader as `Start` then
+    /// `Cancel` in that order — the FIFO channel keeps a fast REQ+CLOSE
+    /// from spawning a scan after its cancel.
+    #[test]
+    fn register_then_remove_orders_start_before_cancel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+        let (reader_tx, reader_rx) = std::sync::mpsc::channel();
+        let mut shard = Shard::new(&store, Arc::from([reader_tx]));
+        let (out, _out_rx) = Outbound::new(1 << 20);
+
+        shard.handle(ShardMsg::Register {
+            conn: 1,
+            sub: sub_key("s", 1),
+            filters: filters(),
+            out,
+        });
+        shard.handle(ShardMsg::Remove {
+            conn: 1,
+            sub_id: SubId::parse("s").unwrap(),
+        });
+
+        match reader_rx.try_recv() {
+            Ok(ReaderMsg::Start { conn: 1, .. }) => {}
+            other => panic!("expected Start first, got {other:?}"),
+        }
+        match reader_rx.try_recv() {
+            Ok(ReaderMsg::Cancel { conn: 1, .. }) => {}
+            other => panic!("expected Cancel second, got {other:?}"),
         }
     }
 }

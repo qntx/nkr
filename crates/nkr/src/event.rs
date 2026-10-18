@@ -50,8 +50,9 @@ impl fmt::Display for PublicKey {
     }
 }
 
-/// Structural ingest limits, checked before any hashing.
-#[derive(Debug, Clone, Copy, Deserialize)]
+/// Event acceptance limits: structure plus `created_at` windows, all
+/// strfry defaults; unknown keys are rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EventLimits {
     /// Maximum size of the canonical event JSON, in bytes.
@@ -60,6 +61,12 @@ pub struct EventLimits {
     pub max_num_tags: usize,
     /// Maximum size of a single tag element, in bytes.
     pub max_tag_val_size: usize,
+    /// Reject events whose `created_at` is more than this far in the future.
+    pub reject_events_newer_than_seconds: u64,
+    /// Reject events whose `created_at` is older than this many seconds.
+    pub reject_events_older_than_seconds: u64,
+    /// Reject ephemeral events whose `created_at` is older than this many seconds.
+    pub reject_ephemeral_events_older_than_seconds: u64,
 }
 
 impl Default for EventLimits {
@@ -68,6 +75,9 @@ impl Default for EventLimits {
             max_event_size: 65_536,
             max_num_tags: 2_000,
             max_tag_val_size: 1_024,
+            reject_events_newer_than_seconds: 900,
+            reject_events_older_than_seconds: 94_608_000,
+            reject_ephemeral_events_older_than_seconds: 60,
         }
     }
 }

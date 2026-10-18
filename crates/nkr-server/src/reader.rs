@@ -8,8 +8,9 @@ use nkr::message::{eose_frame, event_frame};
 use nkr::session::SubKey;
 use nkr_lmdb::{Progress, Scan, Store};
 use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::watch;
 
-use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg};
+use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg, route};
 
 /// How long an idle reader waits for new work.
 const IDLE_WAIT: Duration = Duration::from_millis(5);
@@ -38,19 +39,16 @@ struct ScanEntry {
 
 /// Reader thread main loop. `high_water` pauses scans for connections
 /// whose outbound queue is backing up; new scans always run before
-/// resumed ones.
-#[allow(
-    clippy::excessive_nesting,
-    reason = "the dispatch/step loop is clearest inline"
-)]
+/// resumed ones. `shutdown` ends the idle wait even while shard
+/// senders still point at this reader (shards forward into it).
 pub(crate) fn run(
     store: &Store,
     rx: &Receiver<ReaderMsg>,
     shards: &[tokio_mpsc::Sender<ShardMsg>],
-    monitors: usize,
     budget: Duration,
     high_water: usize,
     max_filter_limit: u64,
+    shutdown: &watch::Receiver<bool>,
 ) {
     let mut new_scans: VecDeque<ScanEntry> = VecDeque::new();
     let mut resumed: VecDeque<ScanEntry> = VecDeque::new();
@@ -68,85 +66,111 @@ pub(crate) fn run(
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
         // Prefer new scans; then round-robin the resumed ones.
-        let Some(mut entry) = new_scans.pop_front().or_else(|| resumed.pop_front()) else {
-            match rx.recv_timeout(IDLE_WAIT) {
-                Ok(msg) => apply(msg, &mut new_scans, &mut resumed, max_filter_limit),
-                Err(RecvTimeoutError::Disconnected) => return,
-                Err(RecvTimeoutError::Timeout) => {}
+        let Some(entry) = new_scans.pop_front().or_else(|| resumed.pop_front()) else {
+            if !idle(rx, &mut new_scans, &mut resumed, max_filter_limit, shutdown) {
+                return;
             }
             continue;
         };
         // Pause scans for connections above the outbound high-water mark.
-        if entry.out.pending() > high_water {
-            resumed.push_back(entry);
-            skipped += 1;
-            if skipped >= new_scans.len() + resumed.len() {
-                // A full pass with nothing runnable: block for new work
-                // instead of spinning.
-                match rx.recv_timeout(IDLE_WAIT) {
-                    Ok(msg) => apply(msg, &mut new_scans, &mut resumed, max_filter_limit),
-                    Err(RecvTimeoutError::Disconnected) => return,
-                    Err(RecvTimeoutError::Timeout) => {}
-                }
-                skipped = 0;
-            }
+        if entry.out.pending() <= high_water {
+            skipped = 0;
+            step(entry, store, budget, shards, &mut resumed);
             continue;
         }
+        resumed.push_back(entry);
+        skipped += 1;
+        if skipped < new_scans.len() + resumed.len() {
+            continue;
+        }
+        // A full pass with nothing runnable: block for new work
+        // instead of spinning.
+        if !idle(rx, &mut new_scans, &mut resumed, max_filter_limit, shutdown) {
+            return;
+        }
         skipped = 0;
-        let out = entry.out.clone();
-        let sub = entry.sub.clone();
-        let mut first = !entry.first_pushed;
-        let mut texts = Vec::new();
-        let mut bytes = 0usize;
-        let result = entry.scan.step(store, budget, &mut |json| {
-            let text = event_frame(&sub.id, json);
-            if first {
-                first = false;
-                out.push(Out::Frames {
-                    sub: sub.clone(),
-                    texts: vec![text],
-                });
-                return;
-            }
-            bytes += text.len();
-            texts.push(text);
-            if texts.len() >= CHUNK_FRAMES || bytes >= CHUNK_BYTES {
-                out.push(Out::Frames {
-                    sub: sub.clone(),
-                    texts: std::mem::take(&mut texts),
-                });
-                bytes = 0;
-            }
-        });
-        entry.first_pushed |= !first;
-        if !texts.is_empty() {
+    }
+}
+
+/// Block up to `IDLE_WAIT` for one control message; `false` means the
+/// reader exits (senders gone or shutdown raised).
+fn idle(
+    rx: &Receiver<ReaderMsg>,
+    new_scans: &mut VecDeque<ScanEntry>,
+    resumed: &mut VecDeque<ScanEntry>,
+    max_filter_limit: u64,
+    shutdown: &watch::Receiver<bool>,
+) -> bool {
+    match rx.recv_timeout(IDLE_WAIT) {
+        Ok(msg) => {
+            apply(msg, new_scans, resumed, max_filter_limit);
+            true
+        }
+        Err(RecvTimeoutError::Disconnected) => false,
+        Err(RecvTimeoutError::Timeout) => !*shutdown.borrow(),
+    }
+}
+
+/// Run one time-slice of `entry` — chunked `Frames` pushes, EOSE plus
+/// `Activate` on completion, `Closed` on error — and requeue it into
+/// `resumed` when it stays pending.
+fn step(
+    mut entry: ScanEntry,
+    store: &Store,
+    budget: Duration,
+    shards: &[tokio_mpsc::Sender<ShardMsg>],
+    resumed: &mut VecDeque<ScanEntry>,
+) {
+    let out = entry.out.clone();
+    let sub = entry.sub.clone();
+    let mut first = !entry.first_pushed;
+    let mut texts = Vec::new();
+    let mut bytes = 0usize;
+    let result = entry.scan.step(store, budget, &mut |json| {
+        let text = event_frame(&sub.id, json);
+        if first {
+            first = false;
             out.push(Out::Frames {
                 sub: sub.clone(),
-                texts,
+                texts: vec![text],
             });
+            return;
         }
-        match result {
-            Ok(Progress::Pending) => resumed.push_back(entry),
-            Ok(Progress::Done) => {
-                entry.out.push(Out::Frame {
-                    sub: Some(entry.sub.clone()),
-                    text: eose_frame(&entry.sub.id),
-                });
-                let index = usize::try_from(entry.conn).unwrap_or(usize::MAX) % monitors.max(1);
-                if let Some(tx) = shards.get(index) {
-                    drop(tx.blocking_send(ShardMsg::Activate {
-                        conn: entry.conn,
-                        sub: entry.sub,
-                    }));
-                }
-            }
-            Err(err) => {
-                tracing::error!(%err, conn = entry.conn, "scan failed");
-                entry.out.push(Out::Closed {
-                    sub: entry.sub.clone(),
-                    reason: "error: internal error".to_owned(),
-                });
-            }
+        bytes += text.len();
+        texts.push(text);
+        if texts.len() >= CHUNK_FRAMES || bytes >= CHUNK_BYTES {
+            out.push(Out::Frames {
+                sub: sub.clone(),
+                texts: std::mem::take(&mut texts),
+            });
+            bytes = 0;
+        }
+    });
+    entry.first_pushed |= !first;
+    if !texts.is_empty() {
+        out.push(Out::Frames {
+            sub: sub.clone(),
+            texts,
+        });
+    }
+    match result {
+        Ok(Progress::Pending) => resumed.push_back(entry),
+        Ok(Progress::Done) => {
+            entry.out.push(Out::Frame {
+                sub: Some(entry.sub.clone()),
+                text: eose_frame(&entry.sub.id),
+            });
+            drop(route(shards, entry.conn).blocking_send(ShardMsg::Activate {
+                conn: entry.conn,
+                sub: entry.sub,
+            }));
+        }
+        Err(err) => {
+            tracing::error!(%err, conn = entry.conn, "scan failed");
+            entry.out.push(Out::Closed {
+                sub: entry.sub.clone(),
+                reason: "error: internal error".to_owned(),
+            });
         }
     }
 }
@@ -199,6 +223,7 @@ mod tests {
     use nkr::filter::Filter;
     use nkr::message::SubId;
     use nkr_lmdb::StoreOptions;
+    use tokio::sync::mpsc;
 
     use super::*;
 
@@ -242,6 +267,7 @@ mod tests {
         let events: Vec<Arc<nkr::event::Event>> = (0..10).map(event).collect();
         store.write(&events).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (shard_tx, _shard_rx) = mpsc::channel(8);
         let (out, mut out_rx) = Outbound::new(1 << 30);
         let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
         tx.send(ReaderMsg::Start {
@@ -259,11 +285,11 @@ mod tests {
             run(
                 &store,
                 &rx,
-                &[],
-                1,
+                &[shard_tx],
                 Duration::from_secs(10),
                 usize::MAX,
                 500,
+                &watch::channel(false).1,
             );
         });
         let first = out_rx.blocking_recv().unwrap();
@@ -292,6 +318,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
+        let (shard_tx, _shard_rx) = mpsc::channel(8);
         let (out, _out_rx) = Outbound::new(1 << 20);
         // The queued scan's connection is over the high-water mark from
         // the start, so its step can never run.
@@ -314,7 +341,15 @@ mod tests {
 
         let before = LOOP_TICKS.load(Ordering::Relaxed);
         let reader = std::thread::spawn(move || {
-            run(&store, &rx, &[], 1, Duration::ZERO, 0, 500);
+            run(
+                &store,
+                &rx,
+                &[shard_tx],
+                Duration::ZERO,
+                0,
+                500,
+                &watch::channel(false).1,
+            );
         });
         std::thread::sleep(Duration::from_millis(300));
         drop(tx);
