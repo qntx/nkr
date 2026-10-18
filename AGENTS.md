@@ -19,14 +19,13 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
 CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang" \
-    cargo check -p nkr --target wasm32-unknown-unknown
+    cargo check -p nosfry --target wasm32-unknown-unknown
 ```
 
 Run the relay locally:
 
 ```bash
-cargo run --release -p nkr-server -- relay --config nkr.example.toml
+cargo run --release -p nosfry-server -- relay --config nosfry.example.toml
 ```
 
-`docs/` is a committed Fumadocs tree validated by `qntx/workflows` ci-docs;
-do not generate it.
+`docs/` is local-only and is never pushed: the whole directory is gitignored; never commit any file under `docs/`. Locally it is a Fumadocs tree: every page needs non-empty `title` and `description` frontmatter and must be listed in its folder's `meta.json`; headings start at `##`, every fenced code block has a language. Verify doc changes with `bunx oxfmt --ignore-path=/dev/null <files>` and `bun validate-docs-tree.ts docs --lint` from a checkout of `qntx/workflows/actions/validate-docs-tree`.

@@ -1,0 +1,73 @@
+# nosfry relay configuration — every key shown with its default.
+# Copy to nosfry.toml (or pass --config / set NOSFRY_CONFIG).
+
+[db]
+# LMDB environment directory.
+path = "./nosfry-db"
+# Map size in bytes (10 TiB default).
+map_size = 10995116277760
+# Maximum concurrent read transactions.
+max_readers = 256
+# Disable kernel read-ahead for databases larger than RAM.
+no_read_ahead = false
+
+[events]
+# Maximum canonical event size in bytes.
+max_event_size = 65536
+# Reject events this many seconds in the future.
+reject_events_newer_than_seconds = 900
+# Reject events this many seconds in the past.
+reject_events_older_than_seconds = 94608000
+# Reject ephemeral events this many seconds in the past.
+reject_ephemeral_events_older_than_seconds = 60
+# Maximum tags per event.
+max_num_tags = 2000
+# Maximum tag value size in bytes.
+max_tag_val_size = 1024
+
+[relay]
+# Listen address and port.
+bind = "127.0.0.1"
+port = 7777
+# Header carrying the real client IP (empty = socket address).
+real_ip_header = ""
+# Maximum inbound WebSocket payload in bytes.
+max_websocket_payload_size = 131072
+# WebSocket ping interval in seconds.
+auto_ping_seconds = 55
+# Pending outbound bytes above which a connection is closed (1008).
+max_pending_outbound_bytes = 33554432
+# Per-slice stored-scan budget in microseconds.
+query_timeslice_budget_microseconds = 10000
+
+[relay.limits]
+# Maximum filters per REQ.
+max_req_filter_size = 200
+# Maximum open subscriptions per connection.
+max_subs_per_connection = 200
+# Per-filter limit cap for stored scans.
+max_filter_limit = 500
+# Maximum `#x` conditions per filter.
+max_tags_per_filter = 3
+# Limit cap for COUNT responses.
+
+[relay.threads]
+# Stored-scan reader threads.
+readers = 3
+# Live-monitor shard threads.
+monitors = 3
+
+[relay.compression]
+# Negotiate permessage-deflate.
+enabled = true
+# Keep the LZ77 sliding window between messages (false = no context
+# takeover either direction).
+sliding_window = true
+
+[relay.info]
+# NIP-11 relay information fields.
+name = "nosfry"
+description = ""
+pubkey = ""
+contact = ""
+icon = ""

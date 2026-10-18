@@ -1,5 +1,0 @@
-{
-  "title": "Architecture",
-  "description": "System shape, invariants, and the design of each component.",
-  "pages": ["index", "protocol", "storage", "server", "workers"]
-}
