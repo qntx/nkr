@@ -155,6 +155,12 @@ pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle) {
                                 }
                                 ws.feed(Frame::text(text.into_bytes())).await
                             }
+                            Out::Frames { sub, texts } => {
+                                if !session.is_current(&sub) {
+                                    continue;
+                                }
+                                feed_texts(ws, texts).await
+                            }
                             Out::Event { sub, event } => {
                                 if !session.is_current(&sub) {
                                     continue;
@@ -349,4 +355,15 @@ async fn handle_command(
         }
         Command::Send(text) => out.push(Out::Frame { sub: None, text }),
     }
+}
+
+/// Feed a chunk of pre-serialized scan frames; first error aborts.
+async fn feed_texts(
+    ws: &mut HttpWebSocket,
+    texts: Vec<String>,
+) -> Result<(), yawc::WebSocketError> {
+    for text in texts {
+        ws.feed(Frame::text(text.into_bytes())).await?;
+    }
+    Ok(())
 }
