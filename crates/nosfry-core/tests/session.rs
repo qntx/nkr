@@ -28,7 +28,8 @@ use std::sync::Arc;
 use nosfry_core::event::{PublicKey, event_id, serialize_for_id};
 use nosfry_core::kind::Kind;
 use nosfry_core::limits::Limits;
-use nosfry_core::session::{Command, Session};
+use nosfry_core::message::ClientVerb;
+use nosfry_core::session::{Command, Received, Session};
 use secp256k1::Keypair;
 use secp256k1::schnorr;
 
@@ -42,9 +43,14 @@ fn feed(session: &mut Session, now: u64, text: &str) -> Vec<Command> {
 
 /// `feed` at millisecond resolution, for the rate-limit tests.
 fn feed_ms(session: &mut Session, now_ms: u64, text: &str) -> Vec<Command> {
+    receive(session, now_ms, text).0
+}
+
+/// `feed` plus the returned [`Received`].
+fn receive(session: &mut Session, now_ms: u64, text: &str) -> (Vec<Command>, Received) {
     let mut out = Vec::new();
-    session.on_text(now_ms, text, &mut out);
-    out
+    let received = session.on_text(now_ms, text, &mut out);
+    (out, received)
 }
 
 fn event_json(created_at: u64, kind: u16, content: &str) -> String {
@@ -89,7 +95,7 @@ fn signed_event_tags(created_at: u64, kind: u16, tags: &str, content: &str) -> S
 fn sends(cmds: &[Command]) -> Vec<&str> {
     cmds.iter()
         .filter_map(|c| match c {
-            Command::Send(s) => Some(s.as_str()),
+            Command::Send { text, .. } => Some(text.as_str()),
             _ => None,
         })
         .collect()
@@ -508,4 +514,96 @@ fn zero_rate_per_second_disables() {
             "{out:?}"
         );
     }
+}
+
+/// Every recognized client verb surfaces through `Received.verb`, even
+/// when the message fails validation.
+#[test]
+fn received_verb_covers_every_client_verb() {
+    let mut s = session();
+    let t = 1_700_000_000_000u64;
+    let cases: [(String, ClientVerb); 8] = [
+        (signed_event(1_700_000_000, 1, "gm"), ClientVerb::Event),
+        ("[\"REQ\",\"a\",{}]".to_owned(), ClientVerb::Req),
+        ("[\"CLOSE\",\"a\"]".to_owned(), ClientVerb::Close),
+        ("[\"COUNT\",\"a\",{}]".to_owned(), ClientVerb::Count),
+        (
+            format!("[\"AUTH\",{}]", event_json(1_700_000_000, 1, "gm")),
+            ClientVerb::Auth,
+        ),
+        (
+            "[\"NEG-OPEN\",\"a\",{},\"aa\"]".to_owned(),
+            ClientVerb::NegOpen,
+        ),
+        ("[\"NEG-MSG\",\"a\",\"aa\"]".to_owned(), ClientVerb::NegMsg),
+        ("[\"NEG-CLOSE\",\"a\"]".to_owned(), ClientVerb::NegClose),
+    ];
+    for (text, want) in cases {
+        let (_, received) = receive(&mut s, t, &text);
+        assert_eq!(received.verb, Some(want), "{text}");
+        assert!(!received.rate_limited, "{text}");
+    }
+}
+
+/// Rejected messages still report their verb: parser arity/type errors
+/// and session-level rejections alike.
+#[test]
+fn rejected_messages_still_report_their_verb() {
+    let mut s = session();
+    for (text, want) in [
+        ("[\"EVENT\",\"bad\"]", ClientVerb::Event),
+        ("[\"REQ\"]", ClientVerb::Req),
+        ("[\"REQ\",\"a\"]", ClientVerb::Req),
+        ("[\"CLOSE\",1]", ClientVerb::Close),
+        ("[\"NEG-OPEN\",\"a\",{},\"zz\"]", ClientVerb::NegOpen),
+    ] {
+        let (_, received) = receive(&mut s, 1_000, text);
+        assert_eq!(received.verb, Some(want), "{text}");
+    }
+    // A verified-format event rejected by the session time window.
+    let (_, received) = receive(&mut s, 1_000_000, &signed_event(u64::MAX, 1, "x"));
+    assert_eq!(received.verb, Some(ClientVerb::Event));
+    assert!(
+        sends(&receive(&mut s, 1_000_000, &signed_event(u64::MAX, 1, "x")).0)[0]
+            .contains("invalid:"),
+    );
+}
+
+/// Unparseable frames and unknown verbs report `None`.
+#[test]
+fn unparseable_and_unknown_verbs_report_none() {
+    let mut s = session();
+    for text in ["not json", "[]", "[1,2]", "[\"BOGUS\",\"x\"]"] {
+        let (_, received) = receive(&mut s, 1_000, text);
+        assert_eq!(received.verb, None, "{text}");
+        assert!(!received.rate_limited, "{text}");
+    }
+}
+
+/// `rate_limited` flags exactly the messages the buckets refuse.
+#[test]
+fn rate_limited_flag_marks_refusals() {
+    let rate = nosfry_core::limits::RateLimits {
+        events_per_second: 1_000,
+        events_burst: 1,
+        reqs_per_second: 1_000,
+        reqs_burst: 1,
+    };
+    let mut s = session_with_rate(rate);
+    let t = 1_000u64;
+    let event = signed_event(1_700_000_000, 1, "gm");
+    let (_, received) = receive(&mut s, t, &event);
+    assert!(!received.rate_limited);
+    let (_, received) = receive(&mut s, t, &event);
+    assert!(received.rate_limited);
+    assert_eq!(received.verb, Some(ClientVerb::Event));
+    let (_, received) = receive(&mut s, t, "[\"REQ\",\"a\",{}]");
+    assert!(!received.rate_limited);
+    let (_, received) = receive(&mut s, t, "[\"REQ\",\"b\",{}]");
+    assert!(received.rate_limited);
+    assert_eq!(received.verb, Some(ClientVerb::Req));
+    // CLOSE is never charged.
+    let (_, received) = receive(&mut s, t, "[\"CLOSE\",\"a\"]");
+    assert_eq!(received.verb, Some(ClientVerb::Close));
+    assert!(!received.rate_limited);
 }

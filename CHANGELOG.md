@@ -54,17 +54,30 @@ The format is based on [Keep a Changelog]; this project follows
 - Per-connection token-bucket rate limits (`[relay.rate_limits]`,
   20 events/s and 20 REQs/s with a burst of 100 each; a `*_per_second`
   of 0 disables that bucket). Over-limit EVENTs are answered `OK false
-  rate-limited: slow down`, over-limit REQs `CLOSED rate-limited: slow
-  down`; CLOSE is never charged.
+rate-limited: slow down`, over-limit REQs `CLOSED rate-limited: slow
+down`; CLOSE is never charged.
 - Connection caps: `[relay] max_connections` (default 0 = unlimited)
   and `max_connections_per_ip` (default 128) refuse over-cap upgrades
   with `429 Too Many Requests`. IPv4 counts per address, IPv4-mapped
   IPv6 folds to IPv4, other IPv6 groups per /64 prefix.
+- Optional Prometheus metrics: `[relay] metrics = true` serves
+  unauthenticated `GET /metrics` on the relay port in the text
+  exposition format — `nostr_client_messages_total{verb}`,
+  `nostr_relay_messages_total{verb}`, `nostr_events_total{kind}`,
+  `nosfry_connections`, `nosfry_connections_rejected_total`, and
+  `nosfry_rate_limited_total{verb}`, all on fixed label sets from
+  lock-free counters.
 
 ### Changed
 
 - `Session::on_text` takes the current unix time in **milliseconds**
-  (previously seconds), needed for millisecond-accurate rate buckets.
+  (previously seconds), needed for millisecond-accurate rate buckets,
+  and returns `Received { verb, rate_limited }` — the recognized client
+  verb even when the message fails validation. `Command::Send` is now
+  `Send { verb, text }` carrying the relay frame type.
+- `MessageError` variants carry the recognized `ClientVerb`
+  (`MessageError::verb()`), and `FilterVerb` is superseded by
+  `ClientVerb`.
 - The LMDB format version is now 2 (three new lifecycle databases);
   databases created by 0.1.0 cannot be opened. Since 0.1.0 had no
   `export`, a 0.1.0 database must be re-imported from its source.
@@ -88,7 +101,7 @@ The format is based on [Keep a Changelog]; this project follows
   compressed frame size, not the inflated one, so a permessage-deflate
   message could decompress hundreds of times past
   `max_websocket_payload_size`. Enable it only for trusted clients.
-- `real_ip_header` now trusts the *last* comma-separated value parsed
+- `real_ip_header` now trusts the _last_ comma-separated value parsed
   as an `IpAddr` (the entry written by the proxy in front), falling
   back to the socket peer on missing or unparsable values — the first
   value is client-controlled.

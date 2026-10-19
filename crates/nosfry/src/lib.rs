@@ -18,6 +18,7 @@ pub mod config;
 mod connection;
 mod http;
 mod limiter;
+mod metrics;
 mod reader;
 mod shard;
 mod writer;
@@ -179,12 +180,14 @@ impl Server {
                     .map_err(ServerError::Spawn)?,
             );
         }
+        let metrics = Arc::new(metrics::Metrics::new());
         let conn = connection::Handle {
             writer: writer_tx.clone(),
             shards: Arc::from(shard_txs.as_slice()),
             limits: Arc::new(config.limits()),
             ping_interval: Duration::from_secs(config.relay.auto_ping_seconds),
             max_pending_outbound: config.relay.max_pending_outbound_bytes,
+            metrics: Arc::clone(&metrics),
             shutdown: stop_rx,
             tracker: tokio_util::task::TaskTracker::new(),
         };
@@ -192,6 +195,7 @@ impl Server {
             state: http::AppState {
                 nip11: http::nip11(&config).into(),
                 conn,
+                metrics,
                 limiter: Arc::new(limiter::ConnectionLimiter::new(
                     config.relay.max_connections,
                     config.relay.max_connections_per_ip,

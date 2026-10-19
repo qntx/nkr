@@ -53,6 +53,12 @@ impl ConnectionLimiter {
         }
     }
 
+    /// Live connections right now (the `nosfry_connections` gauge);
+    /// counted even when `max_total` is unlimited.
+    pub(crate) fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
     /// Count one new connection; `None` when a cap is reached. The
     /// mutex only ever guards a map update, never an `.await`.
     pub(crate) fn try_acquire(self: &Arc<Self>, ip: Option<IpAddr>) -> Option<ConnectionPermit> {

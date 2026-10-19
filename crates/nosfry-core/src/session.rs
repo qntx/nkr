@@ -7,7 +7,7 @@ use crate::event::{Event, UnverifiedEvent};
 use crate::filter::Filter;
 use crate::limits::{Limits, TokenBucket};
 use crate::message::{
-    ClientMessage, FilterVerb, MessageError, Reason, SubId, closed_frame, neg_err_frame,
+    ClientMessage, ClientVerb, MessageError, Reason, RelayVerb, SubId, closed_frame, neg_err_frame,
     notice_frame, ok_frame,
 };
 
@@ -41,7 +41,24 @@ pub enum Command {
         sub_id: SubId,
     },
     /// A frame to send immediately.
-    Send(String),
+    Send {
+        /// The frame's verb (for relay-side metrics).
+        verb: RelayVerb,
+        /// The serialized frame.
+        text: String,
+    },
+}
+
+/// What the session made of one inbound text frame, so the transport can
+/// account per-verb metrics without re-parsing.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Received {
+    /// The recognized client verb — `Some` even when the message failed
+    /// validation, `None` only for unparseable frames and unknown verbs.
+    pub verb: Option<ClientVerb>,
+    /// The message was refused by a rate-limit bucket.
+    pub rate_limited: bool,
 }
 
 /// Per-connection protocol state.
@@ -97,30 +114,19 @@ impl Session {
     /// `now_ms` is the current unix time in milliseconds: the session
     /// derives seconds for `created_at` checks and uses milliseconds
     /// for the rate-limit buckets.
-    pub fn on_text(&mut self, now_ms: u64, text: &str, out: &mut Vec<Command>) {
+    pub fn on_text(&mut self, now_ms: u64, text: &str, out: &mut Vec<Command>) -> Received {
         let message = match ClientMessage::parse(text) {
             Ok(message) => message,
-            Err(MessageError::Event { id, source }) => {
-                let reason = source.reason();
-                let frame =
-                    id.map_or_else(|| notice_frame(&reason), |id| ok_frame(&id, false, &reason));
-                out.push(Command::Send(frame));
-                return;
-            }
-            Err(MessageError::Filter { verb, sub, source }) => {
-                let reason = source.reason();
-                let frame = match verb {
-                    FilterVerb::Req => closed_frame(&sub, &reason),
-                    FilterVerb::Neg => neg_err_frame(&sub, &reason),
-                };
-                out.push(Command::Send(frame));
-                return;
-            }
             Err(error) => {
-                out.push(Command::Send(notice_frame(&error.reason())));
-                return;
+                let verb = error.verb();
+                out.push(rejection(error));
+                return Received {
+                    verb,
+                    rate_limited: false,
+                };
             }
         };
+        let verb = message.verb();
         // Charge the rate-limit buckets right after a successful parse,
         // before any other work: an over-limit client is throttled no
         // matter what its message would have done.
@@ -129,12 +135,18 @@ impl Session {
                 if let Some(bucket) = &mut self.event_bucket
                     && !bucket.take(now_ms)
                 {
-                    out.push(Command::Send(ok_frame(
-                        &unverified.id(),
-                        false,
-                        &Reason::RateLimited.message("slow down"),
-                    )));
-                    return;
+                    out.push(Command::Send {
+                        verb: RelayVerb::Ok,
+                        text: ok_frame(
+                            &unverified.id(),
+                            false,
+                            &Reason::RateLimited.message("slow down"),
+                        ),
+                    });
+                    return Received {
+                        verb: Some(verb),
+                        rate_limited: true,
+                    };
                 }
                 self.on_event(now_ms / 1000, unverified, out);
             }
@@ -142,11 +154,14 @@ impl Session {
                 if let Some(bucket) = &mut self.req_bucket
                     && !bucket.take(now_ms)
                 {
-                    out.push(Command::Send(closed_frame(
-                        &sub_id,
-                        &Reason::RateLimited.message("slow down"),
-                    )));
-                    return;
+                    out.push(Command::Send {
+                        verb: RelayVerb::Closed,
+                        text: closed_frame(&sub_id, &Reason::RateLimited.message("slow down")),
+                    });
+                    return Received {
+                        verb: Some(verb),
+                        rate_limited: true,
+                    };
                 }
                 self.on_req(sub_id, filters, out);
             }
@@ -156,35 +171,39 @@ impl Session {
                 }
             }
             ClientMessage::Count { sub_id, .. } => {
-                out.push(Command::Send(closed_frame(
-                    &sub_id,
-                    &Reason::Unsupported.message("COUNT"),
-                )));
+                out.push(Command::Send {
+                    verb: RelayVerb::Closed,
+                    text: closed_frame(&sub_id, &Reason::Unsupported.message("COUNT")),
+                });
             }
             ClientMessage::Auth(..) => {
-                out.push(Command::Send(notice_frame(
-                    &Reason::Unsupported.message("AUTH"),
-                )));
+                out.push(Command::Send {
+                    verb: RelayVerb::Notice,
+                    text: notice_frame(&Reason::Unsupported.message("AUTH")),
+                });
             }
             ClientMessage::NegOpen { sub_id, .. }
             | ClientMessage::NegMsg { sub_id, .. }
             | ClientMessage::NegClose { sub_id } => {
-                out.push(Command::Send(neg_err_frame(
-                    &sub_id,
-                    &Reason::Unsupported.message("negentropy sync"),
-                )));
+                out.push(Command::Send {
+                    verb: RelayVerb::NegErr,
+                    text: neg_err_frame(&sub_id, &Reason::Unsupported.message("negentropy sync")),
+                });
             }
+        }
+        Received {
+            verb: Some(verb),
+            rate_limited: false,
         }
     }
 
     fn on_event(&self, now: u64, unverified: UnverifiedEvent<'_>, out: &mut Vec<Command>) {
         let limits = &*self.limits;
         if let Err(error) = unverified.check_limits(&limits.event) {
-            out.push(Command::Send(ok_frame(
-                &unverified.id(),
-                false,
-                &error.reason(),
-            )));
+            out.push(Command::Send {
+                verb: RelayVerb::Ok,
+                text: ok_frame(&unverified.id(), false, &error.reason()),
+            });
             return;
         }
         let created_at = unverified.created_at();
@@ -208,45 +227,56 @@ impl Session {
             None
         };
         if let Some(reason) = reject {
-            out.push(Command::Send(ok_frame(
-                &unverified.id(),
-                false,
-                &Reason::Invalid.message(reason),
-            )));
+            out.push(Command::Send {
+                verb: RelayVerb::Ok,
+                text: ok_frame(&unverified.id(), false, &Reason::Invalid.message(reason)),
+            });
             return;
         }
         let id = unverified.id();
         match unverified.verify(&limits.event) {
             Ok(event) => out.push(Command::Publish(Arc::new(event))),
-            Err(error) => out.push(Command::Send(ok_frame(&id, false, &error.reason()))),
+            Err(error) => out.push(Command::Send {
+                verb: RelayVerb::Ok,
+                text: ok_frame(&id, false, &error.reason()),
+            }),
         }
     }
 
     fn on_req(&mut self, sub_id: SubId, filters: Vec<Filter>, out: &mut Vec<Command>) {
         if filters.len() > self.limits.req.max_req_filter_size {
-            out.push(Command::Send(closed_frame(
-                &sub_id,
-                &Reason::Invalid.message("too many filters in request"),
-            )));
+            out.push(Command::Send {
+                verb: RelayVerb::Closed,
+                text: closed_frame(
+                    &sub_id,
+                    &Reason::Invalid.message("too many filters in request"),
+                ),
+            });
             return;
         }
         if filters
             .iter()
             .any(|filter| filter.tag_filter_count() > self.limits.req.max_tags_per_filter)
         {
-            out.push(Command::Send(closed_frame(
-                &sub_id,
-                &Reason::Invalid.message("filter has too many tag conditions"),
-            )));
+            out.push(Command::Send {
+                verb: RelayVerb::Closed,
+                text: closed_frame(
+                    &sub_id,
+                    &Reason::Invalid.message("filter has too many tag conditions"),
+                ),
+            });
             return;
         }
         if !self.subs.contains_key(&sub_id)
             && self.subs.len() >= self.limits.req.max_subs_per_connection
         {
-            out.push(Command::Send(closed_frame(
-                &sub_id,
-                &Reason::Error.message("too many open subscriptions"),
-            )));
+            out.push(Command::Send {
+                verb: RelayVerb::Closed,
+                text: closed_frame(
+                    &sub_id,
+                    &Reason::Error.message("too many open subscriptions"),
+                ),
+            });
             return;
         }
         let generation = self.next_generation;
@@ -263,5 +293,34 @@ impl Session {
             },
             filters: filters.into(),
         });
+    }
+}
+
+/// Map a parse error to its rejection frame command: `OK` when a
+/// claimed id exists, `NEG-ERR` for NIP-77 verbs, `CLOSED` for
+/// subscription-bearing verbs, `NOTICE` otherwise.
+fn rejection(error: MessageError) -> Command {
+    match error {
+        MessageError::Event { id, source, .. } => {
+            let reason = source.reason();
+            let (verb, text) = id.map_or_else(
+                || (RelayVerb::Notice, notice_frame(&reason)),
+                |id| (RelayVerb::Ok, ok_frame(&id, false, &reason)),
+            );
+            Command::Send { verb, text }
+        }
+        MessageError::Filter { verb, sub, source } => {
+            let reason = source.reason();
+            let (verb, text) = if verb.is_neg() {
+                (RelayVerb::NegErr, neg_err_frame(&sub, &reason))
+            } else {
+                (RelayVerb::Closed, closed_frame(&sub, &reason))
+            };
+            Command::Send { verb, text }
+        }
+        error => Command::Send {
+            verb: RelayVerb::Notice,
+            text: notice_frame(&error.reason()),
+        },
     }
 }

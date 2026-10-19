@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nosfry_core::message::{eose_frame, event_frame};
+use nosfry_core::message::{RelayVerb, eose_frame, event_frame};
 use nosfry_core::session::SubKey;
 use nosfry_lmdb::{Progress, Scan, Store};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -170,6 +170,7 @@ fn step(
         Ok(Progress::Done) => {
             entry.out.push(Out::Frame {
                 sub: Some(entry.sub.clone()),
+                verb: RelayVerb::Eose,
                 text: eose_frame(&entry.sub.id),
             });
             drop(route(shards, entry.conn).blocking_send(ShardMsg::Activate {
@@ -337,6 +338,7 @@ mod tests {
         // the start, so its step can never run.
         out.push(Out::Frame {
             sub: None,
+            verb: RelayVerb::Notice,
             text: "x".repeat(1024),
         });
         let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
