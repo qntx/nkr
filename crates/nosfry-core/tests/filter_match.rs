@@ -89,6 +89,7 @@ fn filter_match() {
             &pubkey,
             case.event.created_at,
             Kind(case.event.kind),
+            0,
             &case.event.tags,
         );
         assert_eq!(

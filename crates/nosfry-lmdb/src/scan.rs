@@ -222,6 +222,8 @@ fn plan(filter: &Filter) -> Mode {
 pub struct Scan {
     filters: Arc<[Filter]>,
     snapshot: u64,
+    /// NIP-40 cutoff: events with `expiration <= now` are hidden.
+    now: u64,
     plans: Vec<Plan>,
     emitted: SeqSet,
     done: bool,
@@ -230,8 +232,11 @@ pub struct Scan {
 impl Scan {
     /// New scan over `filters`, bounded to entries with `seq <= snapshot`
     /// and per-filter `Filter::effective_limit(max_filter_limit)`.
+    /// Events with an NIP-40 `expiration` at or before `now` are never
+    /// emitted and never count toward limits; `now = 0` disables the
+    /// check (expiration values are always `>= 100`).
     #[must_use]
-    pub fn new(filters: Arc<[Filter]>, snapshot: u64, max_filter_limit: u64) -> Self {
+    pub fn new(filters: Arc<[Filter]>, snapshot: u64, max_filter_limit: u64, now: u64) -> Self {
         let plans = filters
             .iter()
             .map(|filter| {
@@ -253,6 +258,7 @@ impl Scan {
         Self {
             filters,
             snapshot,
+            now,
             plans,
             emitted: SeqSet::with_hasher(foldhash::fast::RandomState::default()),
             done: false,
@@ -260,7 +266,7 @@ impl Scan {
     }
 
     /// Process candidates for up to `budget` wall time. `emit` receives
-    /// canonical event JSON in scan order (per filter: newest first).
+    /// `(seq, canonical JSON)` in scan order (per filter: newest first).
     ///
     /// The budget is checked every 64 candidates, so `Duration::ZERO`
     /// still makes progress.
@@ -273,7 +279,7 @@ impl Scan {
         &mut self,
         store: &Store,
         budget: Duration,
-        emit: &mut dyn FnMut(&str),
+        emit: &mut dyn FnMut(u64, &str),
     ) -> Result<Progress, StoreError> {
         if self.done {
             return Ok(Progress::Done);
@@ -285,6 +291,7 @@ impl Scan {
                 store,
                 txn: &txn,
                 snapshot: self.snapshot,
+                now: self.now,
                 emitted: &mut self.emitted,
                 processed: 0,
                 start,
@@ -331,6 +338,8 @@ struct Step<'a> {
     txn: &'a Reader<'a>,
     /// Upper bound on seqs this scan may emit.
     snapshot: u64,
+    /// NIP-40 cutoff: events with `expiration <= now` are skipped.
+    now: u64,
     /// seqs already emitted by an earlier filter.
     emitted: &'a mut SeqSet,
     /// Candidates processed so far this step (budget check cadence).
@@ -340,7 +349,7 @@ struct Step<'a> {
     /// Wall-clock budget for this step.
     budget: Duration,
     /// Where emitted payloads go.
-    emit: &'a mut dyn FnMut(&str),
+    emit: &'a mut dyn FnMut(u64, &str),
 }
 
 /// Drive one filter until it finishes or the budget fires.
@@ -484,6 +493,7 @@ fn flush_group(step: &mut Step<'_>, state: &mut PlanState) -> Result<(), StoreEr
 fn emit_payload(step: &mut Step<'_>, seq: u64) -> Result<(), StoreError> {
     if let Some(bytes) = step.store.payloads.get(step.txn, &seq.to_be_bytes())? {
         (step.emit)(
+            seq,
             std::str::from_utf8(bytes).map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?,
         );
     }
@@ -518,6 +528,12 @@ fn try_candidate(
         return Ok(()); // deleted between slices
     };
     let packed = PackedRef::new(bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
+    // NIP-40: an expired event is never served and never consumes a
+    // limit, even before the sweep removes it.
+    let expiration = packed.expiration();
+    if expiration != 0 && expiration <= step.now {
+        return Ok(());
+    }
     if filter.matches(packed) {
         collected.push((packed.created_at(), packed.id(), seq));
     }

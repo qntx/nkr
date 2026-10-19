@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nosfry_core::message::{eose_frame, event_frame};
 use nosfry_core::session::SubKey;
@@ -126,7 +126,7 @@ fn step(
     let mut first = !entry.first_pushed;
     let mut texts = Vec::new();
     let mut bytes = 0usize;
-    let result = entry.scan.step(store, budget, &mut |json| {
+    let result = entry.scan.step(store, budget, &mut |_seq, json| {
         let text = event_frame(&sub.id, json);
         if first {
             first = false;
@@ -186,7 +186,14 @@ fn apply(
         ReaderMsg::Start(start) => new_scans.push_back(ScanEntry {
             conn: start.conn,
             sub: start.sub,
-            scan: Scan::new(start.filters, start.snapshot, max_filter_limit),
+            scan: Scan::new(
+                start.filters,
+                start.snapshot,
+                max_filter_limit,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
             out: start.out,
             first_pushed: false,
         }),

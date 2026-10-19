@@ -57,6 +57,14 @@ enum Cmd {
         /// Filter JSON, e.g. '{"kinds":[1]}'.
         filter: String,
     },
+    /// Delete stored events matching a REQ filter (JSON).
+    Delete {
+        /// Count matches without deleting.
+        #[arg(long)]
+        dry_run: bool,
+        /// Filter JSON, e.g. '{"kinds":[1]}'.
+        filter: String,
+    },
     /// Write a compacted copy of the database to a new file.
     Compact {
         /// Destination file; must not exist.
@@ -147,6 +155,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => export(&config, since, until, reverse),
         Cmd::Import { show_rejected } => import(&config, show_rejected),
         Cmd::Scan { count, filter } => scan(&config, &filter, count),
+        Cmd::Delete { dry_run, filter } => delete(&config, &filter, dry_run),
         Cmd::Compact { dest } => compact(&config, &dest),
     }
 }
@@ -196,6 +205,16 @@ fn scan(config: &Config, filter: &str, count: bool) -> Result<(), Box<dyn std::e
     if count {
         writeln!(out, "{matched}")?;
     }
+    out.flush()?;
+    Ok(())
+}
+
+fn delete(config: &Config, filter: &str, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let filter = nosfry_core::filter::Filter::parse(filter)?;
+    let store = open_existing(config)?;
+    let mut out = stdout();
+    let deleted = nosfry::admin::delete(&store, filter, dry_run)?;
+    writeln!(out, "{deleted}")?;
     out.flush()?;
     Ok(())
 }

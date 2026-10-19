@@ -62,6 +62,25 @@ fn signed_event(created_at: u64, kind: u16, content: &str) -> String {
     format!("[\"EVENT\",{}]", event_json(created_at, kind, content))
 }
 
+/// A signed event carrying arbitrary tags (raw JSON tag array).
+fn signed_event_tags(created_at: u64, kind: u16, tags: &str, content: &str) -> String {
+    let keypair = Keypair::from_secret_bytes([9u8; 32]).expect("secret key");
+    let pubkey = PublicKey(keypair.x_only_public_key().0.to_byte_array());
+    let tags_v: Vec<Vec<String>> = serde_json::from_str(tags).expect("tags json");
+    let preimage = serialize_for_id(&pubkey, created_at, Kind(kind), &tags_v, content);
+    let id = event_id(preimage.as_bytes());
+    let sig = schnorr::sign_no_aux_rand(&id.0, &keypair);
+    let mut sig_hex = String::with_capacity(128);
+    for b in sig.to_byte_array() {
+        write!(sig_hex, "{b:02x}").expect("write");
+    }
+    let content_json = serde_json::to_string(content).expect("content");
+    format!(
+        "[\"EVENT\",{{\"id\":\"{id}\",\"pubkey\":\"{pubkey}\",\"created_at\":{created_at},\
+         \"kind\":{kind},\"tags\":{tags},\"content\":{content_json},\"sig\":\"{sig_hex}\"}}]"
+    )
+}
+
 fn sends(cmds: &[Command]) -> Vec<&str> {
     cmds.iter()
         .filter_map(|c| match c {
@@ -359,4 +378,24 @@ fn subkey_generation_monotonic() {
         };
         assert_eq!(sub.generation, n);
     }
+}
+
+#[test]
+fn expired_event_is_rejected_invalid() {
+    let mut s = session();
+    let now = 1_700_000_000u64;
+    let tags = format!("[[\"expiration\",\"{}\"]]", now - 5);
+    let out = feed(&mut s, now, &signed_event_tags(now - 10, 1, &tags, "old"));
+    let frames = sends(&out);
+    assert_eq!(frames.len(), 1);
+    assert!(
+        frames[0].contains("\"OK\"") && frames[0].contains("invalid: event has expired"),
+        "{}",
+        frames[0]
+    );
+
+    // Still-valid expiration reaches verification (Publish).
+    let tags = format!("[[\"expiration\",\"{}\"]]", now + 100);
+    let out = feed(&mut s, now, &signed_event_tags(now, 1, &tags, "fresh"));
+    assert!(matches!(out.last(), Some(Command::Publish(_))), "{out:?}");
 }

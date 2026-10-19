@@ -16,13 +16,13 @@ use tokio::sync::{mpsc, watch};
 use yawc::close::CloseCode;
 use yawc::{Frame, HttpWebSocket, OpCode};
 
-use crate::channels::{ConnId, Out, Outbound, ShardMsg, WriteRequest, route};
+use crate::channels::{ConnId, Out, Outbound, ShardMsg, WriteRequest, WriterMsg, route};
 
 /// Per-connection state handed down from the server.
 #[derive(Debug, Clone)]
 pub(crate) struct Handle {
     /// Writer inbox.
-    pub(crate) writer: mpsc::Sender<WriteRequest>,
+    pub(crate) writer: mpsc::Sender<WriterMsg>,
     /// Monitor shard inboxes, indexed by `conn % shards.len()`; the
     /// shard owns the reader routing for scans.
     pub(crate) shards: Arc<[mpsc::Sender<ShardMsg>]>,
@@ -154,10 +154,10 @@ impl<'a> Connection<'a> {
         if self
             .handle
             .writer
-            .send(WriteRequest {
+            .send(WriterMsg::Publish(WriteRequest {
                 event,
                 out: self.out.clone(),
-            })
+            }))
             .await
             .is_err()
         {

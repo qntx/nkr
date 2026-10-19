@@ -46,10 +46,10 @@ fn events(key: &secp256k1::Keypair, from: u64, n: u64) -> Vec<Arc<Event>> {
 
 fn emitted_count(store: &Store, filters: &Arc<[Filter]>) -> usize {
     let snapshot = store.snapshot().unwrap();
-    let mut scan = Scan::new(Arc::clone(filters), snapshot, 500);
+    let mut scan = Scan::new(Arc::clone(filters), snapshot, 500, 0);
     let mut emitted = 0usize;
     while scan
-        .step(store, Duration::from_secs(3_600), &mut |_| {
+        .step(store, Duration::from_secs(3_600), &mut |_, _| {
             emitted += 1;
         })
         .unwrap()
@@ -60,10 +60,10 @@ fn emitted_count(store: &Store, filters: &Arc<[Filter]>) -> usize {
 
 fn first_emit(store: &Store, filters: &Arc<[Filter]>) -> Duration {
     let snapshot = store.snapshot().unwrap();
-    let mut scan = Scan::new(Arc::clone(filters), snapshot, 500);
+    let mut scan = Scan::new(Arc::clone(filters), snapshot, 500, 0);
     let started = std::time::Instant::now();
     let mut first = None;
-    scan.step(store, Duration::from_secs(3_600), &mut |_| {
+    scan.step(store, Duration::from_secs(3_600), &mut |_, _| {
         if first.is_none() {
             first = Some(started.elapsed());
         }

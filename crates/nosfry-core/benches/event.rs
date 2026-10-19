@@ -77,7 +77,7 @@ fn filter_match(c: &mut Criterion) {
     let keypair = Keypair::from_secret_bytes([9u8; 32]).expect("secret key");
     let pubkey = PublicKey(keypair.x_only_public_key().0.to_byte_array());
     let tags: Vec<Vec<String>> = Vec::new();
-    let packed = PackedEvent::build(&event_id(b"x"), &pubkey, 1_700_000_000, Kind(1), &tags);
+    let packed = PackedEvent::build(&event_id(b"x"), &pubkey, 1_700_000_000, Kind(1), 0, &tags);
     c.bench_function("filter match 100 authors", |b| {
         b.iter(|| filter.matches(packed.packed()));
     });

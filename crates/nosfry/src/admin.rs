@@ -1,6 +1,6 @@
 //! Administration commands on the store: `export`, `import`, `scan`,
-//! `compact`. Each takes an opened [`Store`] plus explicit inputs so
-//! tests can drive them directly; `main` only wires stdio.
+//! `delete`, `compact`. Each takes an opened [`Store`] plus explicit
+//! inputs so tests can drive them directly; `main` only wires stdio.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -48,6 +48,8 @@ pub struct ImportStats {
     pub superseded: u64,
     /// Ephemeral events (verified, never stored).
     pub ephemeral: u64,
+    /// Events a stored same-author kind 5 deleted or blocks.
+    pub blocked: u64,
     /// Rejected lines (too long, malformed, or failed verification).
     pub rejected: u64,
 }
@@ -173,12 +175,13 @@ impl Importer<'_> {
         if self.batch.is_empty() {
             return Ok(());
         }
-        for outcome in self.store.write(&self.batch)? {
+        for outcome in self.store.write(&self.batch)?.outcomes {
             match outcome {
                 WriteOutcome::Stored { .. } => self.stats.added += 1,
                 WriteOutcome::Duplicate => self.stats.duplicates += 1,
                 WriteOutcome::Superseded => self.stats.superseded += 1,
                 WriteOutcome::Ephemeral => self.stats.ephemeral += 1,
+                WriteOutcome::Deleted => self.stats.blocked += 1,
             }
         }
         self.batch.clear();
@@ -203,11 +206,14 @@ pub fn scan(
     count_only: bool,
     out: &mut impl Write,
 ) -> Result<u64, AdminError> {
-    let mut scan = Scan::new(Arc::from([filter]), store.snapshot()?, u64::MAX);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut scan = Scan::new(Arc::from([filter]), store.snapshot()?, u64::MAX, now);
     let mut count = 0u64;
     let mut write_err: Option<std::io::Error> = None;
     loop {
-        let mut emit = |json: &str| {
+        let mut emit = |_seq: u64, json: &str| {
             if write_err.is_some() {
                 return;
             }
@@ -223,6 +229,37 @@ pub fn scan(
         match progress {
             Progress::Pending => {}
             Progress::Done => break,
+        }
+    }
+    Ok(count)
+}
+
+/// Delete stored events matching `filter`; with `dry_run`, count what
+/// would be deleted without touching the store. Returns the deleted
+/// (or would-be-deleted) count.
+///
+/// The scan runs with `now = 0`, so already-expired events stay
+/// deletable; there is no relay `max_filter_limit` cap.
+///
+/// # Errors
+///
+/// [`AdminError::Store`] on store failure.
+pub fn delete(store: &Store, filter: Filter, dry_run: bool) -> Result<u64, AdminError> {
+    let mut scan = Scan::new(Arc::from([filter]), store.snapshot()?, u64::MAX, 0);
+    let mut count = 0u64;
+    let mut seqs = Vec::new();
+    loop {
+        let progress = scan.step(store, SCAN_STEP_BUDGET, &mut |seq, _| {
+            seqs.push(seq);
+        })?;
+        if dry_run {
+            count += seqs.len() as u64;
+        } else {
+            count += store.delete(&seqs)?;
+        }
+        seqs.clear();
+        if progress == Progress::Done {
+            break;
         }
     }
     Ok(count)

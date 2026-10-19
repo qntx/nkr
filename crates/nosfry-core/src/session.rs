@@ -160,6 +160,11 @@ impl Session {
                 < now.saturating_sub(limits.event.reject_ephemeral_events_older_than_seconds)
         {
             Some("ephemeral event created_at is too far in the past")
+        } else if unverified
+            .expiration()
+            .is_some_and(|expires| expires <= now)
+        {
+            Some("event has expired")
         } else {
             None
         };

@@ -1,15 +1,31 @@
-//! The single writer thread: group commits and batch broadcast.
+//! The single writer thread: group commits, expiry sweeps, batch broadcast.
 
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nosfry_core::message::ok_frame;
 use nosfry_lmdb::{Store, WriteOutcome};
 use tokio::sync::mpsc;
 
-use crate::channels::{Batch, Out, ShardMsg, WriteRequest};
+use crate::channels::{Batch, Out, ShardMsg, WriteRequest, WriterMsg};
 
 /// Maximum events applied per write transaction.
 const BATCH_CAP: usize = 1024;
+
+/// Events deleted per expiry sweep; a sweep hitting the cap keeps
+/// looping (without blocking on the inbox) until it clears.
+const EXPIRE_CAP: usize = 10_000;
+
+/// Expiry timer cadence (strfry's cron interval is ~9 s).
+const EXPIRE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Current unix time; `0` before the epoch (never in practice).
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Map one write outcome to the `OK` reply's `(accepted, message)` —
 /// exhaustive so a new [`WriteOutcome`] variant cannot slip in
@@ -19,62 +35,127 @@ const fn ok_reply(outcome: WriteOutcome) -> (bool, &'static str) {
         WriteOutcome::Stored { .. } | WriteOutcome::Ephemeral => (true, ""),
         WriteOutcome::Duplicate => (true, "duplicate: have this event"),
         WriteOutcome::Superseded => (false, "duplicate: have a newer version"),
+        WriteOutcome::Deleted => (false, "blocked: deleted by its author"),
     }
 }
 
-/// Writer thread main loop: block for the first request, drain up to
-/// [`BATCH_CAP`], commit once, queue the batch on every shard, then
-/// push each request's `OK` straight onto its connection's outbound
-/// queue. Exits when every sender is dropped.
+/// Writer thread main loop: block for the first message, drain up to
+/// [`BATCH_CAP`] publishes (an `Expire` seen while draining is
+/// deferred, not batched), commit once, queue the batch — minus the
+/// seqs the same transaction deleted — on every shard, then push each
+/// request's `OK` straight onto its connection's outbound queue.
+/// After the batch, one expiry sweep runs when pending; a sweep that
+/// hits [`EXPIRE_CAP`] keeps the loop in non-blocking mode so large
+/// backlogs interleave with publishes instead of starving them.
+/// Exits when every sender is dropped.
 ///
 /// Ordering invariant: every shard has the batch queued before any
 /// `OK` is sent, so a `REQ` issued after `OK` always snapshots the
 /// event (read-your-writes before `EOSE`).
 pub(crate) fn run(
     store: &Store,
-    mut rx: mpsc::Receiver<WriteRequest>,
+    mut rx: mpsc::Receiver<WriterMsg>,
     shards: &[mpsc::Sender<ShardMsg>],
 ) {
-    while let Some(first) = rx.blocking_recv() {
-        let mut reqs = vec![first];
-        while reqs.len() < BATCH_CAP {
+    let mut expire_pending = false;
+    let mut expire_backlog = false;
+    loop {
+        let first = if expire_backlog {
             match rx.try_recv() {
-                Ok(req) => reqs.push(req),
-                Err(_) => break,
+                Ok(msg) => Some(msg),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
-        }
-        let events: Vec<Arc<nosfry_core::event::Event>> =
-            reqs.iter().map(|r| Arc::clone(&r.event)).collect();
-        let outcomes = match store.write(&events) {
-            Ok(outcomes) => outcomes,
-            Err(err) => {
-                tracing::error!(%err, "store write failed");
-                for req in reqs {
-                    req.out.push(Out::Frame {
-                        sub: None,
-                        text: ok_frame(&req.event.id(), false, "error: internal error"),
-                    });
-                }
-                continue;
+        } else {
+            match rx.blocking_recv() {
+                Some(msg) => Some(msg),
+                None => break,
             }
         };
-        let mut batch: Batch = Vec::new();
-        let mut replies = Vec::with_capacity(reqs.len());
-        for (req, (outcome, event)) in reqs.into_iter().zip(outcomes.into_iter().zip(events)) {
-            let (accepted, message) = ok_reply(outcome);
-            replies.push((req.out, ok_frame(&event.id(), accepted, message)));
-            if let WriteOutcome::Stored { seq } = outcome {
-                batch.push((seq, event));
+        match first {
+            Some(WriterMsg::Publish(req)) => {
+                let mut reqs = vec![req];
+                while reqs.len() < BATCH_CAP {
+                    match rx.try_recv() {
+                        Ok(WriterMsg::Publish(next)) => reqs.push(next),
+                        Ok(WriterMsg::Expire) => expire_pending = true,
+                        Err(_) => break,
+                    }
+                }
+                write_batch(store, reqs, shards);
+            }
+            Some(WriterMsg::Expire) | None => expire_pending = true,
+        }
+        if expire_pending {
+            match store.expire(now(), EXPIRE_CAP) {
+                Ok(deleted) => {
+                    expire_backlog = deleted >= EXPIRE_CAP;
+                    expire_pending = expire_backlog;
+                }
+                Err(err) => {
+                    tracing::error!(%err, "expiry sweep failed");
+                    expire_pending = false;
+                    expire_backlog = false;
+                }
             }
         }
-        if !batch.is_empty() {
-            let batch = Arc::new(batch);
-            for shard in shards {
-                drop(shard.blocking_send(ShardMsg::Batch(Arc::clone(&batch))));
+    }
+}
+
+/// Commit one publish batch, queue `Stored` events on every shard,
+/// then push each request's `OK`. Events stored and removed inside
+/// the same transaction (`Written::deleted`) are never broadcast.
+fn write_batch(store: &Store, reqs: Vec<WriteRequest>, shards: &[mpsc::Sender<ShardMsg>]) {
+    let events: Vec<Arc<nosfry_core::event::Event>> =
+        reqs.iter().map(|r| Arc::clone(&r.event)).collect();
+    let written = match store.write(&events) {
+        Ok(written) => written,
+        Err(err) => {
+            tracing::error!(%err, "store write failed");
+            for req in reqs {
+                req.out.push(Out::Frame {
+                    sub: None,
+                    text: ok_frame(&req.event.id(), false, "error: internal error"),
+                });
             }
+            return;
         }
-        for (out, text) in replies {
-            out.push(Out::Frame { sub: None, text });
+    };
+    let mut batch: Batch = Vec::new();
+    let mut replies = Vec::with_capacity(reqs.len());
+    for (req, (outcome, event)) in reqs
+        .into_iter()
+        .zip(written.outcomes.into_iter().zip(events))
+    {
+        let (accepted, message) = ok_reply(outcome);
+        replies.push((req.out, ok_frame(&event.id(), accepted, message)));
+        if let WriteOutcome::Stored { seq } = outcome
+            && !written.deleted.contains(&seq)
+        {
+            batch.push((seq, event));
+        }
+    }
+    if !batch.is_empty() {
+        let batch = Arc::new(batch);
+        for shard in shards {
+            drop(shard.blocking_send(ShardMsg::Batch(Arc::clone(&batch))));
+        }
+    }
+    for (out, text) in replies {
+        out.push(Out::Frame { sub: None, text });
+    }
+}
+
+/// The expiry timer: nudge the writer every [`EXPIRE_INTERVAL`]. The
+/// blocking `recv_timeout` ends the thread the moment `Server::stop`
+/// drops the stop sender; a full writer inbox just skips the tick, a
+/// closed one exits. `tx`/`stop_rx` are borrowed: the spawn closure
+/// owns them, so the writer's channel closes when this thread exits.
+pub(crate) fn expire_timer(tx: &mpsc::Sender<WriterMsg>, stop_rx: &std::sync::mpsc::Receiver<()>) {
+    while stop_rx.recv_timeout(EXPIRE_INTERVAL) == Err(RecvTimeoutError::Timeout) {
+        match tx.try_send(WriterMsg::Expire) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
     }
 }

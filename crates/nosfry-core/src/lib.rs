@@ -16,6 +16,7 @@
 
 mod hex;
 
+pub mod deletion;
 pub mod event;
 pub mod filter;
 pub mod kind;
