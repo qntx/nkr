@@ -15,13 +15,13 @@
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use nosfry::event::{EventId, PublicKey};
-use nosfry::filter::Filter;
-use nosfry::kind::Kind;
-use nosfry::message::SubId;
-use nosfry::monitor::Monitors;
-use nosfry::packed::PackedEvent;
-use nosfry::session::SubKey;
+use nosfry_core::event::{EventId, PublicKey};
+use nosfry_core::filter::Filter;
+use nosfry_core::kind::Kind;
+use nosfry_core::message::SubId;
+use nosfry_core::monitor::Monitors;
+use nosfry_core::packed::PackedEvent;
+use nosfry_core::session::SubKey;
 
 fn monitors_matches(c: &mut Criterion) {
     let mut monitors = Monitors::<u64>::new();

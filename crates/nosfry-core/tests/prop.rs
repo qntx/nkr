@@ -27,13 +27,13 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use nosfry::event::{EventId, PublicKey};
-use nosfry::filter::Filter;
-use nosfry::kind::Kind;
-use nosfry::message::SubId;
-use nosfry::monitor::Monitors;
-use nosfry::packed::{PackedEvent, PackedRef, encode_tag_value};
-use nosfry::session::SubKey;
+use nosfry_core::event::{EventId, PublicKey};
+use nosfry_core::filter::Filter;
+use nosfry_core::kind::Kind;
+use nosfry_core::message::SubId;
+use nosfry_core::monitor::Monitors;
+use nosfry_core::packed::{PackedEvent, PackedRef, encode_tag_value};
+use nosfry_core::session::SubKey;
 use proptest::prelude::*;
 
 fn hex64(bytes: &[u8; 32]) -> String {

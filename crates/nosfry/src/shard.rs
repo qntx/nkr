@@ -4,10 +4,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use nosfry::event::Event;
-use nosfry::message::SubId;
-use nosfry::monitor::Monitors;
-use nosfry::session::SubKey;
+use nosfry_core::event::Event;
+use nosfry_core::message::SubId;
+use nosfry_core::monitor::Monitors;
+use nosfry_core::session::SubKey;
 use nosfry_lmdb::Store;
 use tokio::sync::mpsc;
 
@@ -226,8 +226,8 @@ pub(crate) fn run(
 )]
 #[cfg(test)]
 mod tests {
-    use nosfry::event::{EventLimits, UnverifiedEvent};
-    use nosfry::filter::Filter;
+    use nosfry_core::event::{EventLimits, UnverifiedEvent};
+    use nosfry_core::filter::Filter;
     use nosfry_lmdb::StoreOptions;
     use secp256k1::{Keypair, SecretKey, schnorr};
     use serde_json::json;

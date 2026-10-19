@@ -22,8 +22,8 @@
 
 mod common;
 
-use nosfry::event::{PublicKey, event_id, serialize_for_id};
-use nosfry::kind::Kind;
+use nosfry_core::event::{PublicKey, event_id, serialize_for_id};
+use nosfry_core::kind::Kind;
 use serde::Deserialize;
 
 #[derive(Deserialize)]

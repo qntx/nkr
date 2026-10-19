@@ -27,19 +27,11 @@ allow = [
   "ISC",
   "MPL-2.0",
   "Unicode-3.0",
-  "Unicode-DFS-2016",
   "Zlib",
   "CC0-1.0",
   "CDLA-Permissive-2.0",
-  "OpenSSL",
 ]
 confidence-threshold = 0.93
-
-[[licenses.exceptions]]
-# `ring` ships under a custom permissive licence bundle that confuses
-# pure SPDX matching; trust the upstream attestation.
-allow = ["OpenSSL", "ISC", "MIT"]
-crate = "ring"
 
 [bans]
 multiple-versions = "warn"

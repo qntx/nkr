@@ -26,7 +26,7 @@
 
 mod common;
 
-use nosfry::event::{EventError, EventLimits, UnverifiedEvent};
+use nosfry_core::event::{EventError, EventLimits, UnverifiedEvent};
 use serde::Deserialize;
 
 /// `(reason, why)` — legitimate serde/JSON.parse divergences.

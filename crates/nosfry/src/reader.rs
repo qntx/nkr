@@ -4,8 +4,8 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
-use nosfry::message::{eose_frame, event_frame};
-use nosfry::session::SubKey;
+use nosfry_core::message::{eose_frame, event_frame};
+use nosfry_core::session::SubKey;
 use nosfry_lmdb::{Progress, Scan, Store};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::watch;
@@ -214,8 +214,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
-    use nosfry::filter::Filter;
-    use nosfry::message::SubId;
+    use nosfry_core::filter::Filter;
+    use nosfry_core::message::SubId;
     use nosfry_lmdb::StoreOptions;
     use tokio::sync::mpsc;
 
@@ -223,8 +223,8 @@ mod tests {
     use crate::channels::ScanStart;
 
     /// A signed kind-1 event at a distinct `created_at`.
-    fn event(i: u64) -> Arc<nosfry::event::Event> {
-        use nosfry::event::{EventLimits, UnverifiedEvent};
+    fn event(i: u64) -> Arc<nosfry_core::event::Event> {
+        use nosfry_core::event::{EventLimits, UnverifiedEvent};
         use sha2::Digest;
         let mut secret = [0u8; 32];
         secret[..8].copy_from_slice(&(i + 1).to_be_bytes());
@@ -259,7 +259,7 @@ mod tests {
     fn first_emit_is_a_single_frame_chunk() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
-        let events: Vec<Arc<nosfry::event::Event>> = (0..10).map(event).collect();
+        let events: Vec<Arc<nosfry_core::event::Event>> = (0..10).map(event).collect();
         store.write(&events).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let (shard_tx, _shard_rx) = mpsc::channel(8);

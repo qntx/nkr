@@ -25,10 +25,10 @@ mod common;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use nosfry::event::{PublicKey, event_id, serialize_for_id};
-use nosfry::kind::Kind;
-use nosfry::limits::Limits;
-use nosfry::session::{Command, Session};
+use nosfry_core::event::{PublicKey, event_id, serialize_for_id};
+use nosfry_core::kind::Kind;
+use nosfry_core::limits::Limits;
+use nosfry_core::session::{Command, Session};
 use secp256k1::Keypair;
 use secp256k1::schnorr;
 
@@ -123,9 +123,9 @@ fn req_replace_unsubscribes_then_subscribes_new_generation() {
 #[test]
 fn req_over_cap_closes() {
     let limits = Limits {
-        req: nosfry::limits::ReqLimits {
+        req: nosfry_core::limits::ReqLimits {
             max_subs_per_connection: 1,
-            ..nosfry::limits::ReqLimits::default()
+            ..nosfry_core::limits::ReqLimits::default()
         },
         ..Limits::default()
     };
@@ -289,9 +289,9 @@ fn event_malformed_reports_id_or_notice() {
 
     // Limit failure inside `on_event` with a recoverable id -> OK false.
     let limits = Limits {
-        event: nosfry::event::EventLimits {
+        event: nosfry_core::event::EventLimits {
             max_num_tags: 0,
-            ..nosfry::event::EventLimits::default()
+            ..nosfry_core::event::EventLimits::default()
         },
         ..Limits::default()
     };
@@ -325,7 +325,7 @@ fn sub_id_emoji_length_counts_chars() {
 
 #[test]
 fn close_by_relay_only_removes_current_generation() {
-    use nosfry::session::SubKey;
+    use nosfry_core::session::SubKey;
     let mut s = session();
     let out = feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
     let Command::Subscribe { sub: first, .. } = &out[0] else {

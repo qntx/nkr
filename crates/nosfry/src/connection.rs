@@ -1,4 +1,4 @@
-//! One connection task per WebSocket: owns the `nosfry::session::Session`
+//! One connection task per WebSocket: owns the `nosfry_core::session::Session`
 //! and bridges it to the writer and its monitor shard (which forwards
 //! scan control to the reader).
 
@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
-use nosfry::filter::Filter;
-use nosfry::message::{SubId, closed_frame, event_frame, notice_frame, ok_frame};
-use nosfry::session::{Command, Session, SubKey};
+use nosfry_core::filter::Filter;
+use nosfry_core::message::{SubId, closed_frame, event_frame, notice_frame, ok_frame};
+use nosfry_core::session::{Command, Session, SubKey};
 use tokio::sync::{mpsc, watch};
 use yawc::close::CloseCode;
 use yawc::{Frame, HttpWebSocket, OpCode};
@@ -27,7 +27,7 @@ pub(crate) struct Handle {
     /// shard owns the reader routing for scans.
     pub(crate) shards: Arc<[mpsc::Sender<ShardMsg>]>,
     /// Session limits.
-    pub(crate) limits: Arc<nosfry::limits::Limits>,
+    pub(crate) limits: Arc<nosfry_core::limits::Limits>,
     /// Ping interval.
     pub(crate) ping_interval: Duration,
     /// Outbound byte budget.
@@ -141,7 +141,7 @@ impl<'a> Connection<'a> {
 
     /// Broadcast an ephemeral event or queue a stored write; the writer
     /// pushes the `OK` onto this connection's `Outbound` itself.
-    async fn publish(&self, event: Arc<nosfry::event::Event>) {
+    async fn publish(&self, event: Arc<nosfry_core::event::Event>) {
         if event.kind().is_ephemeral() {
             self.broadcast(&event).await;
             self.out.push(Out::Frame {
@@ -169,7 +169,7 @@ impl<'a> Connection<'a> {
     }
 
     /// Fan an ephemeral event out to every monitor shard.
-    async fn broadcast(&self, event: &Arc<nosfry::event::Event>) {
+    async fn broadcast(&self, event: &Arc<nosfry_core::event::Event>) {
         for shard in self.handle.shards.iter() {
             if shard
                 .send(ShardMsg::Ephemeral(Arc::clone(event)))

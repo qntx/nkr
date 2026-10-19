@@ -4,10 +4,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use nosfry::event::Event;
-use nosfry::filter::Filter;
-use nosfry::message::SubId;
-use nosfry::session::SubKey;
+use nosfry_core::event::Event;
+use nosfry_core::filter::Filter;
+use nosfry_core::message::SubId;
+use nosfry_core::session::SubKey;
 use tokio::sync::mpsc;
 
 /// Connection identifier; also the shard/reader routing key.
@@ -35,7 +35,9 @@ pub(crate) struct WriteRequest {
     pub(crate) event: Arc<Event>,
     /// The connection's outbound queue; the writer pushes the `OK`
     /// frame onto it directly (one fewer task wake-up than a reply
-    /// channel bouncing through the connection's `select!`).
+    /// channel bouncing through the connection's `select!`). The `OK`
+    /// is pushed only after the batch is queued on every shard, so a
+    /// `REQ` issued after `OK` always snapshots the event.
     pub(crate) out: Outbound,
 }
 
@@ -77,6 +79,8 @@ pub(crate) enum ShardMsg {
         conn: ConnId,
     },
     /// A committed write batch to match against live subscriptions.
+    /// The writer queues it on every shard before sending any `OK`,
+    /// so a `REQ` issued after `OK` always snapshots the event.
     Batch(Arc<Batch>),
     /// An ephemeral event to broadcast (never stored).
     Ephemeral(Arc<Event>),
