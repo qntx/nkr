@@ -12,6 +12,11 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- Multi-arch container image published to `ghcr.io/qntx/nosfry` on tag
+  pushes: distroless non-root runtime, `NOSFRY_CONFIG` pointing at a
+  bundled config with `/data` as the database volume.
+- taplo formatting for every TOML file (`.taplo.toml`, aligned `=`),
+  checked in CI.
 - Administration commands on the `nosfry` binary: `export` writes every
   stored event as JSON lines ordered by `created_at` (with `--since`,
   `--until`, and `--reverse`), `import` verifies and stores event JSON

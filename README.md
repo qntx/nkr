@@ -13,30 +13,57 @@ in progress. Linux and macOS are supported.
 - `nosfry` — the relay crate and binary: WebSocket NIP-01 + NIP-11 over
   the store, on a writer/shard/reader thread topology (native only)
 
-## Install
-
-```bash
-cargo install nosfry --locked
-```
+## Deployment
 
 Prebuilt binaries for Linux (x86_64, aarch64) and macOS (aarch64) are
-attached to every [GitHub release](https://github.com/qntx/nosfry/releases).
+attached to every [GitHub release](https://github.com/qntx/nosfry/releases);
+`cargo install nosfry --locked` builds from source. The relay listens on
+`127.0.0.1:7777` by default; every key in `nosfry.example.toml` carries
+its default and a comment. `NOSFRY_CONFIG` points at the config file,
+`RUST_LOG` controls tracing, `RUST_LOG_JSON=1` selects JSON logs, and
+SIGINT/SIGTERM shut down gracefully.
 
-## Quick start
+### systemd
 
-```bash
-cp nosfry.example.toml nosfry.toml
-nosfry relay --config nosfry.toml
+```ini
+[Unit]
+Description=nosfry Nostr relay
+After=network.target
+
+[Service]
+User=nosfry
+WorkingDirectory=/var/lib/nosfry
+ExecStart=/usr/local/bin/nosfry --config /etc/nosfry/nosfry.toml relay
+LimitNOFILE=1000000
+TimeoutStopSec=20
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 ```
 
-From a checkout, `cargo run --release -p nosfry -- relay --config nosfry.toml`
-does the same.
+### Container image
 
-The relay listens on `127.0.0.1:7777` by default; every key in
-`nosfry.example.toml` carries its default and a comment. `NOSFRY_CONFIG`
-points at the config file too. `RUST_LOG` controls tracing;
-`RUST_LOG_JSON=1` selects JSON logs. SIGINT/SIGTERM shut down
-gracefully.
+Multi-arch images are published to `ghcr.io/qntx/nosfry` on every tag.
+The database lives in `/data`; always mount a volume there.
+
+```bash
+docker run -d --name nosfry \
+    -p 7777:7777 \
+    -v nosfry-data:/data \
+    --ulimit nofile=1000000:1000000 \
+    --stop-timeout 20 \
+    ghcr.io/qntx/nosfry:latest
+```
+
+For many-connection deployments, `--network host` avoids Docker's
+bridge NAT. Run administration commands inside the relay container, so
+they share its PID namespace (LMDB tracks readers by PID):
+
+```bash
+docker exec nosfry /nosfry export > dump.jsonl
+docker exec -i nosfry /nosfry import < dump.jsonl
+```
 
 ## Administration
 

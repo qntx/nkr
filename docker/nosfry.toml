@@ -1,0 +1,8 @@
+# Container overrides only — every other key defaults as documented in
+# nosfry.example.toml.
+
+[db]
+path = "/data/nosfry-db"
+
+[relay]
+bind = "0.0.0.0"

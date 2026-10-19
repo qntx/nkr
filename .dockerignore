@@ -1,0 +1,22 @@
+# Build outputs and editor / OS noise.
+target/
+**/target/
+.git/
+.github/
+.idea/
+.vscode/
+.windsurf/
+.DS_Store
+
+# rust-toolchain.toml would make rustup download a toolchain inside the
+# image; the base image's RUST_VERSION pins the compiler instead.
+rust-toolchain.toml
+
+docs/
+bench/
+
+# Local-only files
+*.log
+*.swp
+.env
+.env.*
