@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
-use nosfry_core::message::SubId;
+use nosfry_core::message::{RelayVerb, SubId};
 use nosfry_core::session::SubKey;
 use tokio::sync::mpsc;
 
@@ -137,6 +137,8 @@ pub(crate) enum Out {
     Frame {
         /// Subscription tag for the `is_current` gate.
         sub: Option<SubKey>,
+        /// The frame type (for relay-side metrics).
+        verb: RelayVerb,
         /// The serialized frame.
         text: String,
     },

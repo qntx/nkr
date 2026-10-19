@@ -47,6 +47,9 @@ max_connections = 0
 # Maximum simultaneous WebSocket connections per client IP (0 =
 # unlimited). IPv4 counts per address; IPv6 per /64 prefix.
 max_connections_per_ip = 128
+# Serve GET /metrics (Prometheus text exposition format) on the relay
+# port. Unauthenticated — keep it behind a reverse proxy or firewall.
+metrics = false
 # Per-slice stored-scan budget in microseconds.
 query_timeslice_budget_microseconds = 10000
 

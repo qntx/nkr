@@ -62,6 +62,10 @@ pub struct Relay {
     /// Maximum simultaneous WebSocket connections per client IP
     /// (0 = unlimited). IPv4 counts per address; IPv6 per /64.
     pub max_connections_per_ip: usize,
+    /// Serve `GET /metrics` (Prometheus text exposition format) on the
+    /// relay port. Unauthenticated — keep it behind a reverse proxy or
+    /// firewall.
+    pub metrics: bool,
     /// Per-slice scan budget in microseconds.
     pub query_timeslice_budget_microseconds: u64,
     /// REQ limits (`nosfry_core::limits::ReqLimits` verbatim).
@@ -140,6 +144,7 @@ impl Default for Relay {
             max_pending_outbound_bytes: 33_554_432,
             max_connections: 0,
             max_connections_per_ip: 128,
+            metrics: false,
             query_timeslice_budget_microseconds: 10_000,
             limits: ReqLimits::default(),
             rate_limits: RateLimits::default(),

@@ -533,10 +533,13 @@ async fn oversized_frame_closes_connection() {
 }
 
 /// One HTTP GET returning the raw response text.
-async fn http_get(addr: std::net::SocketAddr) -> String {
+async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
     let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     tcp.write_all(
-        b"GET / HTTP/1.1\r\nHost: x\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n",
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: x\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n"
+        )
+        .as_bytes(),
     )
     .await
     .unwrap();
@@ -554,7 +557,7 @@ fn nip11_body(text: &str) -> Value {
 async fn nip11_document() {
     // Empty info fields are omitted; `name` stays unconditionally.
     let relay = Relay::start().await;
-    let text = http_get(relay.addr).await;
+    let text = http_get(relay.addr, "/").await;
     assert!(text.contains("content-type: application/nostr+json"));
     assert!(text.contains("access-control-allow-origin: *"));
     let doc = nip11_body(&text);
@@ -578,7 +581,7 @@ async fn nip11_document() {
     config.relay.info.contact = "admin@example.com".to_owned();
     config.relay.info.icon = "https://example.com/icon.png".to_owned();
     let relay = Relay::start_with(config).await;
-    let doc = nip11_body(&http_get(relay.addr).await);
+    let doc = nip11_body(&http_get(relay.addr, "/").await);
     assert_eq!(doc["description"], "test relay");
     assert_eq!(doc["pubkey"], "ab".repeat(32));
     assert_eq!(doc["contact"], "admin@example.com");
@@ -1106,4 +1109,128 @@ async fn event_rate_limit_is_per_connection() {
 
 async fn ws_recv(ws: &mut yawc::TcpWebSocket) -> Value {
     json(&recv_text(ws, T).await)
+}
+
+/// The integer value of one Prometheus series line (`<series> <value>`),
+/// matched on the whole label block so `{kind="1"}` cannot match
+/// `{kind="11"}`.
+fn metric_value(body: &str, series: &str) -> Option<u64> {
+    body.lines().find_map(|line| {
+        let (head, value) = line.rsplit_once(' ')?;
+        (head == series).then(|| value.parse().ok()).flatten()
+    })
+}
+
+#[tokio::test]
+async fn metrics_endpoint_reports_prometheus_series() {
+    let mut config = common::config();
+    config.relay.metrics = true;
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+
+    let ev = common::event(&key(40), 1, now(), &json!([]), "m");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[0], "OK");
+    assert_eq!(ok[2], true);
+
+    send_text(&mut ws, &req_wire("m", "{\"kinds\":[1]}")).await;
+    loop {
+        let frame = json(&recv_text(&mut ws, T).await);
+        assert!(frame[0] == "EVENT" || frame[0] == "EOSE", "{frame}");
+        if frame[0] == "EOSE" {
+            break;
+        }
+    }
+
+    let body = http_get(relay.addr, "/metrics").await;
+    assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+    assert!(
+        body.contains("content-type: text/plain; version=0.0.4"),
+        "{body}"
+    );
+    assert_eq!(
+        metric_value(&body, "nostr_client_messages_total{verb=\"EVENT\"}"),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        metric_value(&body, "nostr_client_messages_total{verb=\"REQ\"}"),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        metric_value(&body, "nostr_events_total{kind=\"1\"}"),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        metric_value(&body, "nostr_relay_messages_total{verb=\"OK\"}"),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(
+        metric_value(&body, "nostr_relay_messages_total{verb=\"EOSE\"}"),
+        Some(1),
+        "{body}"
+    );
+    // The metrics GET itself is plain HTTP and must not count.
+    assert_eq!(metric_value(&body, "nosfry_connections"), Some(1), "{body}");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_endpoint_is_404_by_default() {
+    let relay = Relay::start().await;
+    let body = http_get(relay.addr, "/metrics").await;
+    assert!(body.starts_with("HTTP/1.1 404"), "{body}");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_count_rate_limited_events() {
+    let mut config = common::config();
+    config.relay.metrics = true;
+    config.relay.rate_limits = nosfry_core::limits::RateLimits::default();
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+
+    let base = now();
+    for i in 0..300u64 {
+        let ev = common::event(&key(41), 1, base, &json!([]), &format!("f{i}"));
+        send_text(&mut ws, &event_wire(&ev)).await;
+    }
+    let mut saw_limited = false;
+    for _ in 0..300 {
+        if recv_text(&mut ws, T).await.contains("rate-limited:") {
+            saw_limited = true;
+        }
+    }
+    assert!(saw_limited, "300 events never hit the rate limit");
+
+    let body = http_get(relay.addr, "/metrics").await;
+    assert!(
+        metric_value(&body, "nosfry_rate_limited_total{verb=\"EVENT\"}").unwrap_or(0) > 0,
+        "{body}"
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn metrics_count_rejected_upgrades() {
+    let mut config = common::config();
+    config.relay.metrics = true;
+    config.relay.max_connections_per_ip = 1;
+    let relay = Relay::start_with(config).await;
+    let _ws = relay.connect().await;
+    let status = upgrade_status(relay.addr).await;
+    assert!(status.contains("429"), "{status}");
+    let body = http_get(relay.addr, "/metrics").await;
+    assert_eq!(
+        metric_value(&body, "nosfry_connections_rejected_total"),
+        Some(1),
+        "{body}"
+    );
+    assert_eq!(metric_value(&body, "nosfry_connections"), Some(1), "{body}");
+    relay.stop().await;
 }

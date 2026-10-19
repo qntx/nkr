@@ -38,9 +38,10 @@ impl SubId {
     pub fn parse(raw: &str) -> Result<Self, MessageError> {
         let chars = raw.chars().count();
         if chars == 0 || chars > SUB_ID_MAX_CHARS {
-            return Err(MessageError::Invalid(format!(
-                "subscription id must be 1..={SUB_ID_MAX_CHARS} chars"
-            )));
+            return Err(MessageError::Invalid {
+                verb: None,
+                message: format!("subscription id must be 1..={SUB_ID_MAX_CHARS} chars"),
+            });
         }
         Ok(Self(Arc::new(SubIdInner {
             raw: raw.into(),
@@ -76,14 +77,123 @@ impl core::hash::Hash for SubId {
     }
 }
 
-/// Verb a [`MessageError::Filter`] was raised while parsing; selects the
-/// right error frame (`CLOSED` vs `NEG-ERR`).
+/// A recognized client→relay verb: the first element of a NIP-01
+/// message array. Bounded label set for per-verb metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilterVerb {
-    /// `["REQ", ...]` or `["COUNT", ...]`.
+pub enum ClientVerb {
+    /// `["EVENT", <event>]`.
+    Event,
+    /// `["REQ", <sub>, <filter>+]`.
     Req,
-    /// `["NEG-OPEN", ...]`.
-    Neg,
+    /// `["CLOSE", <sub>]`.
+    Close,
+    /// `["COUNT", <sub>, <filter>+]` (NIP-45).
+    Count,
+    /// `["AUTH", <event>]` (NIP-42).
+    Auth,
+    /// `["NEG-OPEN", <sub>, <filter>, <hex>]` (NIP-77).
+    NegOpen,
+    /// `["NEG-MSG", <sub>, <hex>]` (NIP-77).
+    NegMsg,
+    /// `["NEG-CLOSE", <sub>]` (NIP-77).
+    NegClose,
+}
+
+impl ClientVerb {
+    /// Every verb, for fixed-size per-verb tables.
+    pub const ALL: [Self; 8] = [
+        Self::Event,
+        Self::Req,
+        Self::Close,
+        Self::Count,
+        Self::Auth,
+        Self::NegOpen,
+        Self::NegMsg,
+        Self::NegClose,
+    ];
+
+    /// The wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "EVENT",
+            Self::Req => "REQ",
+            Self::Close => "CLOSE",
+            Self::Count => "COUNT",
+            Self::Auth => "AUTH",
+            Self::NegOpen => "NEG-OPEN",
+            Self::NegMsg => "NEG-MSG",
+            Self::NegClose => "NEG-CLOSE",
+        }
+    }
+
+    /// The error frame a failed filter message gets: `NEG-ERR` for
+    /// NIP-77 verbs, `CLOSED` otherwise.
+    pub(crate) const fn is_neg(self) -> bool {
+        matches!(self, Self::NegOpen | Self::NegMsg | Self::NegClose)
+    }
+}
+
+impl std::str::FromStr for ClientVerb {
+    type Err = ();
+
+    /// The verb for a wire string; `Err(())` when unrecognized.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        Ok(match text {
+            "EVENT" => Self::Event,
+            "REQ" => Self::Req,
+            "CLOSE" => Self::Close,
+            "COUNT" => Self::Count,
+            "AUTH" => Self::Auth,
+            "NEG-OPEN" => Self::NegOpen,
+            "NEG-MSG" => Self::NegMsg,
+            "NEG-CLOSE" => Self::NegClose,
+            _ => return Err(()),
+        })
+    }
+}
+
+/// A frame type the relay writes to sockets; bounded label set for
+/// per-verb metrics. Only frames the relay can emit today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayVerb {
+    /// `["EVENT", <sub>, <event>]`.
+    Event,
+    /// `["EOSE", <sub>]`.
+    Eose,
+    /// `["OK", <id>, <accepted>, <message>]`.
+    Ok,
+    /// `["NOTICE", <message>]`.
+    Notice,
+    /// `["CLOSED", <sub>, <message>]`.
+    Closed,
+    /// `["NEG-ERR", <sub>, <message>]`.
+    NegErr,
+}
+
+impl RelayVerb {
+    /// Every verb, for fixed-size per-verb tables.
+    pub const ALL: [Self; 6] = [
+        Self::Event,
+        Self::Eose,
+        Self::Ok,
+        Self::Notice,
+        Self::Closed,
+        Self::NegErr,
+    ];
+
+    /// The wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "EVENT",
+            Self::Eose => "EOSE",
+            Self::Ok => "OK",
+            Self::Notice => "NOTICE",
+            Self::Closed => "CLOSED",
+            Self::NegErr => "NEG-ERR",
+        }
+    }
 }
 
 /// Errors from client message parsing.
@@ -91,12 +201,20 @@ pub enum FilterVerb {
 #[derive(Debug, thiserror::Error)]
 pub enum MessageError {
     /// The input is not a well-formed message.
-    #[error("invalid message: {0}")]
-    Invalid(String),
+    #[error("invalid message: {message}")]
+    Invalid {
+        /// The recognized verb when the failure came after verb
+        /// parsing (`None` for malformed JSON or unknown verbs).
+        verb: Option<ClientVerb>,
+        /// Detail.
+        message: String,
+    },
     /// The event payload is not a structurally valid event; carries the
     /// best-effort claimed id so the session can answer `OK` when known.
     #[error("invalid event: {source}")]
     Event {
+        /// `EVENT` or `AUTH`.
+        verb: ClientVerb,
         /// The claimed event id, when the object carried a valid one.
         id: Option<EventId>,
         /// The structural error.
@@ -106,8 +224,9 @@ pub enum MessageError {
     /// subscription id so the session can answer `CLOSED`/`NEG-ERR`.
     #[error("invalid filter: {source}")]
     Filter {
-        /// Which verb carried the bad filter.
-        verb: FilterVerb,
+        /// Which verb carried the bad filter (`REQ`, `COUNT`, or
+        /// `NEG-OPEN`).
+        verb: ClientVerb,
         /// The (already validated) subscription id.
         sub: SubId,
         /// The filter error.
@@ -116,11 +235,40 @@ pub enum MessageError {
 }
 
 impl MessageError {
+    /// An `Invalid` without verb context (before the verb is known).
+    const fn invalid(message: String) -> Self {
+        Self::Invalid {
+            verb: None,
+            message,
+        }
+    }
+
+    /// Stamp the recognized verb onto an `Invalid` raised while
+    /// parsing that verb's elements.
+    fn with_verb(self, verb: ClientVerb) -> Self {
+        match self {
+            Self::Invalid { message, .. } => Self::Invalid {
+                verb: Some(verb),
+                message,
+            },
+            other => other,
+        }
+    }
+
+    /// The recognized verb of the failed message, if it got that far.
+    #[must_use]
+    pub const fn verb(&self) -> Option<ClientVerb> {
+        match self {
+            Self::Invalid { verb, .. } => *verb,
+            Self::Event { verb, .. } | Self::Filter { verb, .. } => Some(*verb),
+        }
+    }
+
     /// The NIP-01 machine-readable rejection message.
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
-            Self::Invalid(message) => format!("invalid: {message}"),
+            Self::Invalid { message, .. } => format!("invalid: {message}"),
             Self::Event { source, .. } => source.reason(),
             Self::Filter { source, .. } => source.reason(),
         }
@@ -178,6 +326,21 @@ pub enum ClientMessage<'a> {
 }
 
 impl<'a> ClientMessage<'a> {
+    /// The verb this message was written with.
+    #[must_use]
+    pub const fn verb(&self) -> ClientVerb {
+        match self {
+            Self::Event(_) => ClientVerb::Event,
+            Self::Req { .. } => ClientVerb::Req,
+            Self::Close { .. } => ClientVerb::Close,
+            Self::Count { .. } => ClientVerb::Count,
+            Self::Auth(_) => ClientVerb::Auth,
+            Self::NegOpen { .. } => ClientVerb::NegOpen,
+            Self::NegMsg { .. } => ClientVerb::NegMsg,
+            Self::NegClose { .. } => ClientVerb::NegClose,
+        }
+    }
+
     /// Parse a client message frame.
     ///
     /// # Errors
@@ -187,77 +350,80 @@ impl<'a> ClientMessage<'a> {
     /// or filter errors (with the sub id attached).
     pub fn parse(text: &'a str) -> Result<Self, MessageError> {
         let items: Vec<&RawValue> = serde_json::from_str(text)
-            .map_err(|e| MessageError::Invalid(format!("not a JSON array: {e}")))?;
-        let verb = items
+            .map_err(|e| MessageError::invalid(format!("not a JSON array: {e}")))?;
+        let verb_str = items
             .first()
             .and_then(|raw| serde_json::from_str::<&str>(raw.get()).ok())
-            .ok_or_else(|| MessageError::Invalid("expected [verb, ...] array".to_owned()))?;
-        match verb {
-            "EVENT" => {
-                expect_arity(&items, 2, "EVENT")?;
-                let event = required(&items, 1, "EVENT")?;
-                let unverified = parse_event(event)?;
+            .ok_or_else(|| MessageError::invalid("expected [verb, ...] array".to_owned()))?;
+        let Ok(verb) = verb_str.parse::<ClientVerb>() else {
+            return Err(MessageError::invalid(format!("unknown verb `{verb_str}`")));
+        };
+        let message: Result<Self, MessageError> = match verb {
+            ClientVerb::Event => {
+                expect_arity(&items, 2, verb)?;
+                let event = required(&items, 1, verb)?;
+                let unverified = parse_event(event, verb)?;
                 Ok(Self::Event(unverified))
             }
-            "REQ" => {
-                let sub_id = parse_sub(&items, 1, "REQ")?;
-                expect_min_arity(&items, 3, "REQ")?;
-                let filters = parse_filters(&items, 2, FilterVerb::Req, &sub_id)?;
+            ClientVerb::Req => {
+                let sub_id = parse_sub(&items, 1, verb)?;
+                expect_min_arity(&items, 3, verb)?;
+                let filters = parse_filters(&items, 2, verb, &sub_id)?;
                 Ok(Self::Req { sub_id, filters })
             }
-            "CLOSE" => {
-                expect_arity(&items, 2, "CLOSE")?;
-                let sub_id = parse_sub(&items, 1, "CLOSE")?;
+            ClientVerb::Close => {
+                expect_arity(&items, 2, verb)?;
+                let sub_id = parse_sub(&items, 1, verb)?;
                 Ok(Self::Close { sub_id })
             }
-            "AUTH" => {
-                expect_arity(&items, 2, "AUTH")?;
-                let event = required(&items, 1, "AUTH")?;
-                let unverified = parse_event(event)?;
+            ClientVerb::Auth => {
+                expect_arity(&items, 2, verb)?;
+                let event = required(&items, 1, verb)?;
+                let unverified = parse_event(event, verb)?;
                 Ok(Self::Auth(unverified))
             }
-            "COUNT" => {
-                let sub_id = parse_sub(&items, 1, "COUNT")?;
-                expect_min_arity(&items, 3, "COUNT")?;
-                let filters = parse_filters(&items, 2, FilterVerb::Req, &sub_id)?;
+            ClientVerb::Count => {
+                let sub_id = parse_sub(&items, 1, verb)?;
+                expect_min_arity(&items, 3, verb)?;
+                let filters = parse_filters(&items, 2, verb, &sub_id)?;
                 Ok(Self::Count { sub_id, filters })
             }
-            "NEG-OPEN" => {
-                expect_arity(&items, 4, "NEG-OPEN")?;
-                let sub_id = parse_sub(&items, 1, "NEG-OPEN")?;
-                let filter =
-                    Filter::from_raw(required(&items, 2, "NEG-OPEN")?).map_err(|source| {
-                        MessageError::Filter {
-                            verb: FilterVerb::Neg,
-                            sub: sub_id.clone(),
-                            source,
-                        }
-                    })?;
-                let msg = parse_neg_hex(items.get(3), "NEG-OPEN")?;
+            ClientVerb::NegOpen => {
+                expect_arity(&items, 4, verb)?;
+                let sub_id = parse_sub(&items, 1, verb)?;
+                let filter = Filter::from_raw(required(&items, 2, verb)?).map_err(|source| {
+                    MessageError::Filter {
+                        verb,
+                        sub: sub_id.clone(),
+                        source,
+                    }
+                })?;
+                let msg = parse_neg_hex(items.get(3), verb)?;
                 Ok(Self::NegOpen {
                     sub_id,
                     filter: Box::new(filter),
                     msg,
                 })
             }
-            "NEG-MSG" => {
-                expect_arity(&items, 3, "NEG-MSG")?;
-                let sub_id = parse_sub(&items, 1, "NEG-MSG")?;
-                let msg = parse_neg_hex(items.get(2), "NEG-MSG")?;
+            ClientVerb::NegMsg => {
+                expect_arity(&items, 3, verb)?;
+                let sub_id = parse_sub(&items, 1, verb)?;
+                let msg = parse_neg_hex(items.get(2), verb)?;
                 Ok(Self::NegMsg { sub_id, msg })
             }
-            "NEG-CLOSE" => {
-                expect_arity(&items, 2, "NEG-CLOSE")?;
-                let sub_id = parse_sub(&items, 1, "NEG-CLOSE")?;
+            ClientVerb::NegClose => {
+                expect_arity(&items, 2, verb)?;
+                let sub_id = parse_sub(&items, 1, verb)?;
                 Ok(Self::NegClose { sub_id })
             }
-            other => Err(MessageError::Invalid(format!("unknown verb `{other}`"))),
-        }
+        };
+        message.map_err(|error| error.with_verb(verb))
     }
 }
 
-fn parse_event(raw: &RawValue) -> Result<UnverifiedEvent<'_>, MessageError> {
+fn parse_event(raw: &RawValue, verb: ClientVerb) -> Result<UnverifiedEvent<'_>, MessageError> {
     UnverifiedEvent::parse_structural(raw.get()).map_err(|source| MessageError::Event {
+        verb,
         id: extract_event_id(raw),
         source,
     })
@@ -281,49 +447,59 @@ fn extract_event_id(raw: &RawValue) -> Option<EventId> {
 fn required<'a>(
     items: &[&'a RawValue],
     index: usize,
-    verb: &str,
+    verb: ClientVerb,
 ) -> Result<&'a RawValue, MessageError> {
     items
         .get(index)
         .copied()
-        .ok_or_else(|| MessageError::Invalid(format!("{verb} is missing element {index}")))
+        .ok_or_else(|| MessageError::Invalid {
+            verb: Some(verb),
+            message: format!("{} is missing element {index}", verb.as_str()),
+        })
 }
 
-fn expect_arity(items: &[&RawValue], arity: usize, verb: &str) -> Result<(), MessageError> {
+fn expect_arity(items: &[&RawValue], arity: usize, verb: ClientVerb) -> Result<(), MessageError> {
     if items.len() != arity {
-        return Err(MessageError::Invalid(format!(
-            "{verb} takes {} element(s)",
-            arity - 1
-        )));
+        return Err(MessageError::Invalid {
+            verb: Some(verb),
+            message: format!("{} takes {} element(s)", verb.as_str(), arity - 1),
+        });
     }
     Ok(())
 }
 
-fn expect_min_arity(items: &[&RawValue], arity: usize, verb: &str) -> Result<(), MessageError> {
+fn expect_min_arity(
+    items: &[&RawValue],
+    arity: usize,
+    verb: ClientVerb,
+) -> Result<(), MessageError> {
     if items.len() < arity {
-        return Err(MessageError::Invalid(format!(
-            "{verb} needs at least {} element(s)",
-            arity - 1
-        )));
+        return Err(MessageError::Invalid {
+            verb: Some(verb),
+            message: format!("{} needs at least {} element(s)", verb.as_str(), arity - 1),
+        });
     }
     Ok(())
 }
 
-fn parse_sub(items: &[&RawValue], index: usize, verb: &str) -> Result<SubId, MessageError> {
+fn parse_sub(items: &[&RawValue], index: usize, verb: ClientVerb) -> Result<SubId, MessageError> {
     // `Cow` so escaped ids ("\u00e9", "a\"b") deserialize too; a borrowed
     // `&str` fails on any escape sequence, although NIP-01 allows any
     // string of 1..=64 chars.
     let raw = items
         .get(index)
         .and_then(|raw| serde_json::from_str::<Cow<'_, str>>(raw.get()).ok())
-        .ok_or_else(|| MessageError::Invalid(format!("{verb} subscription id must be a string")))?;
+        .ok_or_else(|| MessageError::Invalid {
+            verb: Some(verb),
+            message: format!("{} subscription id must be a string", verb.as_str()),
+        })?;
     SubId::parse(raw.as_ref())
 }
 
 fn parse_filters(
     items: &[&RawValue],
     from: usize,
-    verb: FilterVerb,
+    verb: ClientVerb,
     sub_id: &SubId,
 ) -> Result<Vec<Filter>, MessageError> {
     items
@@ -339,14 +515,21 @@ fn parse_filters(
         .collect()
 }
 
-fn parse_neg_hex(raw: Option<&&RawValue>, verb: &str) -> Result<Box<[u8]>, MessageError> {
+fn parse_neg_hex(raw: Option<&&RawValue>, verb: ClientVerb) -> Result<Box<[u8]>, MessageError> {
     let text = raw
         .and_then(|raw| serde_json::from_str::<&str>(raw.get()).ok())
-        .ok_or_else(|| MessageError::Invalid(format!("{verb} payload must be a hex string")))?;
+        .ok_or_else(|| MessageError::Invalid {
+            verb: Some(verb),
+            message: format!("{} payload must be a hex string", verb.as_str()),
+        })?;
     hex::decode_list(text)
         .map(Vec::into_boxed_slice)
-        .ok_or_else(|| {
-            MessageError::Invalid(format!("{verb} payload must be non-empty even-length hex"))
+        .ok_or_else(|| MessageError::Invalid {
+            verb: Some(verb),
+            message: format!(
+                "{} payload must be non-empty even-length hex",
+                verb.as_str()
+            ),
         })
 }
 

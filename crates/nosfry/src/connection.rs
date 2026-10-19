@@ -10,13 +10,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
 use nosfry_core::filter::Filter;
-use nosfry_core::message::{SubId, closed_frame, event_frame, notice_frame, ok_frame};
+use nosfry_core::message::{RelayVerb, SubId, closed_frame, event_frame, notice_frame, ok_frame};
 use nosfry_core::session::{Command, Session, SubKey};
 use tokio::sync::{mpsc, watch};
 use yawc::close::CloseCode;
 use yawc::{Frame, HttpWebSocket, OpCode};
 
 use crate::channels::{ConnId, Out, Outbound, ShardMsg, WriteRequest, WriterMsg, route};
+use crate::metrics::Metrics;
 
 /// Per-connection state handed down from the server.
 #[derive(Debug, Clone)]
@@ -32,6 +33,8 @@ pub(crate) struct Handle {
     pub(crate) ping_interval: Duration,
     /// Outbound byte budget.
     pub(crate) max_pending_outbound: usize,
+    /// Process-wide counters.
+    pub(crate) metrics: Arc<Metrics>,
     /// Broadcast shutdown signal.
     pub(crate) shutdown: watch::Receiver<bool>,
     /// Tracks every live connection task for the shutdown deadline.
@@ -115,18 +118,28 @@ impl<'a> Connection<'a> {
                 let Ok(text) = std::str::from_utf8(frame.payload()) else {
                     self.out.push(Out::Frame {
                         sub: None,
+                        verb: RelayVerb::Notice,
                         text: notice_frame("invalid: malformed utf-8"),
                     });
                     return true;
                 };
                 let mut commands = Vec::new();
-                self.session.on_text(now_ms(), text, &mut commands);
+                let received = self.session.on_text(now_ms(), text, &mut commands);
+                if let Some(verb) = received.verb {
+                    self.handle.metrics.client_message(verb);
+                }
+                if received.rate_limited
+                    && let Some(verb) = received.verb
+                {
+                    self.handle.metrics.rate_limited(verb);
+                }
                 for cmd in commands {
                     self.command(cmd).await;
                 }
             }
             OpCode::Binary => self.out.push(Out::Frame {
                 sub: None,
+                verb: RelayVerb::Notice,
                 text: notice_frame("invalid: binary frames are not supported"),
             }),
             OpCode::Close => return false,
@@ -166,17 +179,25 @@ impl<'a> Connection<'a> {
             Command::Publish(event) => self.publish(event).await,
             Command::Subscribe { sub, filters } => self.subscribe(sub, filters).await,
             Command::Unsubscribe { sub_id } => self.unsubscribe(sub_id).await,
-            Command::Send(text) => self.out.push(Out::Frame { sub: None, text }),
+            Command::Send { verb, text } => {
+                self.out.push(Out::Frame {
+                    sub: None,
+                    verb,
+                    text,
+                });
+            }
         }
     }
 
     /// Broadcast an ephemeral event or queue a stored write; the writer
     /// pushes the `OK` onto this connection's `Outbound` itself.
     async fn publish(&self, event: Arc<nosfry_core::event::Event>) {
+        self.handle.metrics.event(u16::from(event.kind()));
         if event.kind().is_ephemeral() {
             self.broadcast(&event).await;
             self.out.push(Out::Frame {
                 sub: None,
+                verb: RelayVerb::Ok,
                 text: ok_frame(&event.id(), true, ""),
             });
             return;
@@ -194,6 +215,7 @@ impl<'a> Connection<'a> {
         {
             self.out.push(Out::Frame {
                 sub: None,
+                verb: RelayVerb::Ok,
                 text: ok_frame(&id, false, "error: internal error"),
             });
         }
@@ -318,11 +340,12 @@ impl<'a> Connection<'a> {
     /// Feed one outbound message; skipped subscriptions consume nothing.
     async fn feed(&mut self, ws: &mut HttpWebSocket, msg: Out) -> Result<(), yawc::WebSocketError> {
         match msg {
-            Out::Frame { sub, text } => {
+            Out::Frame { sub, verb, text } => {
                 if sub.as_ref().is_some_and(|s| !self.session.is_current(s)) {
                     return Ok(());
                 }
-                ws.feed(Frame::text(text.into_bytes())).await
+                ws.feed(Frame::text(text.into_bytes())).await?;
+                self.handle.metrics.relay_message(verb);
             }
             Out::Frames { sub, texts } => {
                 if !self.session.is_current(&sub) {
@@ -330,15 +353,16 @@ impl<'a> Connection<'a> {
                 }
                 for text in texts {
                     ws.feed(Frame::text(text.into_bytes())).await?;
+                    self.handle.metrics.relay_message(RelayVerb::Event);
                 }
-                Ok(())
             }
             Out::Event { sub, event } => {
                 if !self.session.is_current(&sub) {
                     return Ok(());
                 }
                 let text = event_frame(&sub.id, event.json());
-                ws.feed(Frame::text(text.into_bytes())).await
+                ws.feed(Frame::text(text.into_bytes())).await?;
+                self.handle.metrics.relay_message(RelayVerb::Event);
             }
             Out::Closed { sub, reason } => {
                 if !self.session.close_by_relay(&sub) {
@@ -355,9 +379,11 @@ impl<'a> Connection<'a> {
                         .await,
                 );
                 let text = closed_frame(&sub.id, &reason);
-                ws.feed(Frame::text(text.into_bytes())).await
+                ws.feed(Frame::text(text.into_bytes())).await?;
+                self.handle.metrics.relay_message(RelayVerb::Closed);
             }
         }
+        Ok(())
     }
 
     /// Ping tick: close an idle connection (1001), else send a ping.

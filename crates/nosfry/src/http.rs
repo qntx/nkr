@@ -16,6 +16,7 @@ use yawc::{IncomingUpgrade, Options};
 use crate::config::Config;
 use crate::connection;
 use crate::limiter::ConnectionLimiter;
+use crate::metrics::Metrics;
 
 /// Everything a connection handler needs.
 #[derive(Debug, Clone)]
@@ -24,17 +25,34 @@ pub(crate) struct AppState {
     pub(crate) config: Arc<Config>,
     /// Connection dispatch.
     pub(crate) conn: connection::Handle,
+    /// Process-wide counters.
+    pub(crate) metrics: Arc<Metrics>,
     /// Simultaneous-connection caps.
     pub(crate) limiter: Arc<ConnectionLimiter>,
     /// Pre-serialized NIP-11 document; static for the process lifetime.
     pub(crate) nip11: Bytes,
 }
 
-/// Build the application router.
+/// Build the application router. `/metrics` exists only when
+/// `[relay] metrics` is enabled — otherwise it falls through to the
+/// default 404 like any unknown path.
 pub(crate) fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(root).on(MethodFilter::OPTIONS, preflight))
-        .with_state(state)
+    let router = Router::new().route("/", get(root).on(MethodFilter::OPTIONS, preflight));
+    let router = if state.config.relay.metrics {
+        router.route("/metrics", get(metrics))
+    } else {
+        router
+    };
+    router.with_state(state)
+}
+
+/// Prometheus text exposition format (0.0.4), no CORS.
+async fn metrics(State(state): State<AppState>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render(state.limiter.total()),
+    )
+        .into_response()
 }
 
 const CORS_HEADERS: [(&str, &str); 3] = [
@@ -129,6 +147,7 @@ async fn websocket(
     let ip = client_ip(state, &parts.headers, peer);
     let Some(permit) = state.limiter.try_acquire(ip) else {
         tracing::debug!(?ip, "connection cap reached");
+        state.metrics.connection_rejected();
         return Some((StatusCode::TOO_MANY_REQUESTS, "too many connections").into_response());
     };
     let Ok((response, fut)) = upgrade.upgrade(options) else {
@@ -227,12 +246,14 @@ mod tests {
             nip11: Bytes::new(),
             config: Arc::new(config),
             limiter: Arc::new(ConnectionLimiter::new(0, 0)),
+            metrics: Arc::new(Metrics::new()),
             conn: connection::Handle {
                 writer: tokio::sync::mpsc::channel(1).0,
                 shards: Arc::from(vec![]),
                 limits: Arc::new(Limits::default()),
                 ping_interval: std::time::Duration::from_secs(1),
                 max_pending_outbound: 0,
+                metrics: Arc::new(Metrics::new()),
                 shutdown: tokio::sync::watch::channel(false).1,
                 tracker: tokio_util::task::TaskTracker::new(),
             },

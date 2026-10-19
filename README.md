@@ -30,7 +30,7 @@ At startup the relay raises its soft open-file limit to `relay.nofiles`
 hard limit above its default (systemd/containerd: 524288).
 
 `relay.compression.enabled` (permessage-deflate) is off by default:
-yawc bounds the *compressed* frame size, not the inflated one
+yawc bounds the _compressed_ frame size, not the inflated one
 ([infinitefield/yawc#55]), so a compressed message can decompress far
 past `max_websocket_payload_size` — enable it only for trusted
 clients.
@@ -43,6 +43,15 @@ caps total WebSocket connections and `relay.max_connections_per_ip`
 (default 128) caps them per client IP — IPv6 is grouped per /64; an
 over-cap upgrade is refused with `429 Too Many Requests` before the
 handshake.
+
+`relay.metrics = true` serves `GET /metrics` in the Prometheus text
+exposition format: `nostr_client_messages_total{verb}` counts inbound
+messages by recognized verb, `nostr_relay_messages_total{verb}` counts
+frames written to sockets, `nostr_events_total{kind}` counts verified
+events, `nosfry_connections` reports the live WebSocket count,
+`nosfry_connections_rejected_total` refused upgrades, and
+`nosfry_rate_limited_total{verb}` rate-limit refusals. The endpoint is
+unauthenticated — keep it behind a reverse proxy or firewall.
 
 ### systemd
 

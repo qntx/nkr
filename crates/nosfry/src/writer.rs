@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nosfry_core::message::ok_frame;
+use nosfry_core::message::{RelayVerb, ok_frame};
 use nosfry_lmdb::{Store, WriteOutcome};
 use tokio::sync::mpsc;
 
@@ -115,6 +115,7 @@ fn write_batch(store: &Store, reqs: Vec<WriteRequest>, shards: &[mpsc::Sender<Sh
             for req in reqs {
                 req.out.push(Out::Frame {
                     sub: None,
+                    verb: RelayVerb::Ok,
                     text: ok_frame(&req.event.id(), false, "error: internal error"),
                 });
             }
@@ -142,7 +143,11 @@ fn write_batch(store: &Store, reqs: Vec<WriteRequest>, shards: &[mpsc::Sender<Sh
         }
     }
     for (out, text) in replies {
-        out.push(Out::Frame { sub: None, text });
+        out.push(Out::Frame {
+            sub: None,
+            verb: RelayVerb::Ok,
+            text,
+        });
     }
 }
 
