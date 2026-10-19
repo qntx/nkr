@@ -32,7 +32,9 @@ port = 7777
 # Raise the soft open-file limit at startup up to this value, capped by
 # the hard limit; 0 leaves it unchanged.
 nofiles = 1000000
-# Header carrying the real client IP (empty = socket address).
+# Header carrying the real client IP (empty = socket address). The
+# last comma-separated value is trusted — set this only behind a proxy
+# that sets or appends the header.
 real_ip_header = ""
 # Maximum inbound WebSocket payload in bytes.
 max_websocket_payload_size = 131072
@@ -61,8 +63,10 @@ readers = 3
 monitors = 3
 
 [relay.compression]
-# Negotiate permessage-deflate.
-enabled = true
+# Negotiate permessage-deflate. Off by default: the inflated size of an
+# inbound message is not bounded by max_websocket_payload_size, so
+# enable it only for trusted clients.
+enabled = false
 # Keep the LZ77 sliding window between messages (false = no context
 # takeover either direction).
 sliding_window = true

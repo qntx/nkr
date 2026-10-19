@@ -99,12 +99,18 @@ impl<'a> Connection<'a> {
     }
 
     /// Handle one inbound frame; `false` means the connection ends.
-    async fn inbound(&mut self, frame: Option<Frame>, last_inbound: &mut Instant) -> bool {
+    async fn inbound(
+        &mut self,
+        ws: &mut HttpWebSocket,
+        frame: Option<Frame>,
+        last_inbound: &mut Instant,
+    ) -> bool {
         let Some(frame) = frame else {
             return false;
         };
         *last_inbound = Instant::now();
         match frame.opcode() {
+            OpCode::Ping => return self.pong(ws).await,
             OpCode::Text => {
                 let Ok(text) = std::str::from_utf8(frame.payload()) else {
                     self.out.push(Out::Frame {
@@ -127,6 +133,31 @@ impl<'a> Connection<'a> {
             _ => {}
         }
         true
+    }
+
+    /// Flush yawc's queued pong for an inbound ping under the batch
+    /// write deadline. `Sink::poll_ready` drains `obligated_sends`
+    /// (`poll_flush` does not), so the queue never holds more than one
+    /// flush; `false` means the connection ends.
+    async fn pong(&self, ws: &mut HttpWebSocket) -> bool {
+        let flushed = tokio::time::timeout(
+            self.handle.ping_interval,
+            futures_util::future::poll_fn(|cx| {
+                futures_util::Sink::poll_ready(std::pin::Pin::new(&mut *ws), cx)
+            }),
+        )
+        .await;
+        match flushed {
+            Ok(Ok(())) => true,
+            Ok(Err(err)) => {
+                tracing::debug!(%err, conn = self.conn, "pong write failed");
+                false
+            }
+            Err(_) => {
+                tracing::debug!(conn = self.conn, "pong write stalled");
+                false
+            }
+        }
     }
 
     /// Execute one session command.
@@ -374,7 +405,7 @@ pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle) {
     loop {
         tokio::select! {
             frame = ws.next() => {
-                if !conn.inbound(frame, &mut last_inbound).await {
+                if !conn.inbound(ws, frame, &mut last_inbound).await {
                     break;
                 }
             }

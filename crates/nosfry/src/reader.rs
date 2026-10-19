@@ -21,9 +21,12 @@ const CHUNK_FRAMES: usize = 64;
 /// Accounted bytes per `Out::Frames` chunk.
 const CHUNK_BYTES: usize = 256 * 1024;
 
-/// Loop iterations, test-only spin detector.
+// Loop iterations, test-only spin detector. Thread-local so readers
+// run by concurrent tests count independently.
 #[cfg(test)]
-static LOOP_TICKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    static LOOP_TICKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// One running scan.
 #[derive(Debug)]
@@ -38,8 +41,8 @@ struct ScanEntry {
 }
 
 /// Reader thread main loop. `high_water` pauses scans for connections
-/// whose outbound queue is backing up; new scans always run before
-/// resumed ones. `shutdown` ends the idle wait even while shard
+/// whose outbound queue is backing up; new and resumed scans alternate
+/// slices. `shutdown` ends the idle wait even while shard
 /// senders still point at this reader (shards forward into it).
 pub(crate) fn run(
     store: &Store,
@@ -53,9 +56,13 @@ pub(crate) fn run(
     let mut new_scans: VecDeque<ScanEntry> = VecDeque::new();
     let mut resumed: VecDeque<ScanEntry> = VecDeque::new();
     let mut skipped = 0usize;
+    // Alternate between the queues: new scans get their first slice
+    // quickly, but a steady stream of them may not starve resumed ones
+    // (resumed gets at least every other slice while both are queued).
+    let mut prefer_new = true;
     loop {
         #[cfg(test)]
-        LOOP_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LOOP_TICKS.with(|t| t.set(t.get() + 1));
         match rx.try_recv() {
             Ok(msg) => {
                 apply(msg, &mut new_scans, &mut resumed, max_filter_limit);
@@ -65,8 +72,13 @@ pub(crate) fn run(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
-        // Prefer new scans; then round-robin the resumed ones.
-        let Some(entry) = new_scans.pop_front().or_else(|| resumed.pop_front()) else {
+        let entry = if prefer_new {
+            new_scans.pop_front().or_else(|| resumed.pop_front())
+        } else {
+            resumed.pop_front().or_else(|| new_scans.pop_front())
+        };
+        prefer_new = !prefer_new;
+        let Some(entry) = entry else {
             if !idle(rx, &mut new_scans, &mut resumed, max_filter_limit, shutdown) {
                 return;
             }
@@ -219,7 +231,6 @@ fn apply(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
     use nosfry_core::filter::Filter;
     use nosfry_core::message::SubId;
@@ -341,7 +352,8 @@ mod tests {
         })))
         .unwrap();
 
-        let before = LOOP_TICKS.load(Ordering::Relaxed);
+        // The reader runs on its own thread and returns its private
+        // `LOOP_TICKS` count on join.
         let reader = std::thread::spawn(move || {
             run(
                 &store,
@@ -352,13 +364,90 @@ mod tests {
                 500,
                 &watch::channel(false).1,
             );
+            LOOP_TICKS.with(std::cell::Cell::get)
         });
         std::thread::sleep(Duration::from_millis(300));
         drop(tx);
-        reader.join().unwrap();
-        let ticks = LOOP_TICKS.load(Ordering::Relaxed) - before;
+        let ticks = reader.join().unwrap();
         // IDLE_WAIT is 5ms: roughly 60 passes in 300ms. An unpaused
         // spin would tick millions of times in the same window.
         assert!(ticks < 1000, "reader spun {ticks} times in 300ms");
+    }
+
+    /// A resumed scan must keep receiving slices while a steady stream
+    /// of new scans arrives: the scheduler alternates the queues, so a
+    /// flood of REQs cannot starve long-running scans.
+    #[test]
+    fn resumed_scan_progresses_during_new_scan_flood() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+        let events: Vec<Arc<nosfry_core::event::Event>> = (0..4_000).map(event).collect();
+        store.write(&events).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Every finishing scan `blocking_send`s an `Activate`; keep the
+        // inbox bigger than the flood.
+        let (shard_tx, mut shard_rx) = mpsc::channel(8_192);
+        let (long_out, mut long_rx) = Outbound::new(1 << 30);
+        let all: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
+        let one: Arc<[Filter]> =
+            Arc::from(vec![Filter::parse("{\"kinds\":[1],\"limit\":1}").unwrap()]);
+        tx.send(ReaderMsg::Start(Box::new(ScanStart {
+            conn: 1,
+            sub: SubKey {
+                id: SubId::parse("long").unwrap(),
+                generation: 1,
+            },
+            filters: Arc::clone(&all),
+            snapshot: u64::MAX,
+            out: long_out,
+        })))
+        .unwrap();
+        // Queue the flood before the reader starts so every scan is
+        // applied before the first step: `new_scans` is [long, n0..n499]
+        // and a scheduler that always prefers new scans cannot reach
+        // the resumed queue until the whole flood is done.
+        for i in 0..500u64 {
+            let (out, _rx) = Outbound::new(0);
+            tx.send(ReaderMsg::Start(Box::new(ScanStart {
+                conn: 2 + i,
+                sub: SubKey {
+                    id: SubId::parse(&format!("n{i}")).unwrap(),
+                    generation: 1,
+                },
+                filters: Arc::clone(&one),
+                snapshot: u64::MAX,
+                out,
+            })))
+            .unwrap();
+        }
+        let reader = std::thread::spawn(move || {
+            run(
+                &store,
+                &rx,
+                &[shard_tx],
+                Duration::from_micros(50),
+                usize::MAX,
+                5_000,
+                &watch::channel(false).1,
+            );
+        });
+        // Every finished scan reports one `Activate` on `shard_rx`.
+        // With alternating slices the long scan finishes long before
+        // the flood drains; a new-scans-first scheduler would not emit
+        // its EOSE until all 500 flood scans are done.
+        let (mut activates, mut eose) = (0usize, false);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !eose && activates < 500 && std::time::Instant::now() < deadline {
+            while let Ok(out) = long_rx.try_recv() {
+                eose |= matches!(out, Out::Frame { ref text, .. } if text.contains("EOSE"));
+            }
+            match shard_rx.try_recv() {
+                Ok(_) => activates += 1,
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert!(eose, "resumed scan starved during the flood");
+        drop(tx);
+        reader.join().unwrap();
     }
 }
