@@ -20,10 +20,11 @@
 mod common;
 
 use std::io::{Cursor, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use common::{event, key};
-use nosfry::admin::{AdminError, ImportStats, export, import, scan};
+use nosfry::admin::{AdminError, ImportStats, delete, export, import, scan};
 use nosfry_core::event::{Event, EventLimits};
 use nosfry_core::filter::Filter;
 use nosfry_lmdb::{Store, StoreOptions};
@@ -106,6 +107,7 @@ fn import_mixed_corpus_stats() {
             duplicates: 0,
             superseded: 1,
             ephemeral: 1,
+            blocked: 0,
             rejected: 3,
         }
     );
@@ -269,6 +271,145 @@ fn scan_propagates_write_error_on_final_step() {
 }
 
 #[test]
+fn delete_removes_matches_and_dry_run_counts() {
+    let (_dir, store) = store();
+    let k = key(7);
+    let notes: Vec<_> = (0..5u64)
+        .map(|i| event(&k, 1, 100 + i, &json!([]), &format!("n{i}")))
+        .collect();
+    let repost = event(&k, 7, 200, &json!([]), "r");
+    store.write(&notes).unwrap();
+    store.write(&[repost]).unwrap();
+
+    // Dry run counts without touching the store.
+    let filter = || Filter::parse("{\"kinds\":[1]}").unwrap();
+    assert_eq!(delete(&store, filter(), true).unwrap(), 5);
+    let mut out = Vec::new();
+    assert_eq!(export(&store, 0, u64::MAX, false, &mut out).unwrap(), 6);
+
+    // The real run deletes only the matches; deleting again finds none.
+    assert_eq!(delete(&store, filter(), false).unwrap(), 5);
+    let mut after = Vec::new();
+    assert_eq!(export(&store, 0, u64::MAX, false, &mut after).unwrap(), 1);
+    assert_eq!(delete(&store, filter(), false).unwrap(), 0);
+}
+
+#[test]
+fn delete_covers_expired_events() {
+    let (_dir, store) = store();
+    let k = key(8);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let expired = event(
+        &k,
+        1,
+        now - 200,
+        &json!([["expiration", (now - 100).to_string()]]),
+        "stale",
+    );
+    store.write(&[expired]).unwrap();
+    // The admin delete scans with now = 0, so expired events match.
+    assert_eq!(
+        delete(&store, Filter::parse("{\"kinds\":[1]}").unwrap(), false).unwrap(),
+        1
+    );
+}
+
+#[test]
+fn import_counts_blocked_events() {
+    let (_dir, store) = store();
+    let k = key(10);
+    let target = event(&k, 1, 100, &json!([]), "gone");
+    let kind5 = event(&k, 5, 200, &json!([["e", format!("{}", target.id())]]), "");
+    // The target's line appears again after its deletion request:
+    // the re-import is blocked.
+    let corpus = [line(&target), line(&kind5), line(&target)].join("\n");
+    let stats = import(
+        &store,
+        &EventLimits::default(),
+        MAX_LINE,
+        Cursor::new(corpus),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        stats,
+        ImportStats {
+            processed: 3,
+            added: 2,
+            duplicates: 0,
+            superseded: 0,
+            ephemeral: 0,
+            blocked: 1,
+            rejected: 0,
+        }
+    );
+}
+
+/// The `delete` leg of the CLI end-to-end: `--dry-run` counts, the real
+/// run prints the deleted count and leaves the rest.
+fn cli_delete_steps(bin: &str, config: &Path) {
+    let dry = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "delete",
+            "--dry-run",
+            "{\"kinds\":[7]}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        dry.status.success(),
+        "delete --dry-run: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(dry.stdout).unwrap(),
+        "1\n",
+        "dry-run count"
+    );
+
+    let del = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "delete",
+            "{\"kinds\":[7]}",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        del.status.success(),
+        "delete: {}",
+        String::from_utf8_lossy(&del.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(del.stdout).unwrap(),
+        "1\n",
+        "deleted count"
+    );
+
+    let after = Command::new(bin)
+        .args([
+            "scan",
+            "--count",
+            "{}",
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(after.stdout).unwrap(),
+        "2\n",
+        "remaining events"
+    );
+}
+
+#[test]
 fn cli_end_to_end() {
     let bin = env!("CARGO_BIN_EXE_nosfry");
     let dir = tempfile::tempdir().unwrap();
@@ -357,6 +498,8 @@ fn cli_end_to_end() {
         String::from_utf8_lossy(&compact_out.stderr)
     );
     assert!(dest.is_file());
+
+    cli_delete_steps(bin, &config);
 
     let empty = dir.path().join("empty.toml");
     std::fs::write(

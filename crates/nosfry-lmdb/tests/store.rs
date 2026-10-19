@@ -26,7 +26,7 @@ use std::time::Duration;
 use common::{event, key};
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
-use nosfry_lmdb::{Progress, Scan, Store, StoreError, StoreOptions, WriteOutcome};
+use nosfry_lmdb::{FORMAT_VERSION, Progress, Scan, Store, StoreError, StoreOptions, WriteOutcome};
 use serde_json::json;
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -36,12 +36,14 @@ fn store() -> (tempfile::TempDir, Store) {
 }
 
 /// Run a scan to completion, collecting every emitted JSON string.
-fn collect(store: &Store, filters: Arc<[Filter]>, snapshot: u64) -> Vec<String> {
-    let mut scan = Scan::new(filters, snapshot, 500);
+/// `now = 0` disables the NIP-40 cutoff; pass a real `now` where
+/// expiry visibility is under test.
+fn collect_now(store: &Store, filters: Arc<[Filter]>, snapshot: u64, now: u64) -> Vec<String> {
+    let mut scan = Scan::new(filters, snapshot, 500, now);
     let out = RefCell::new(Vec::new());
     loop {
         let progress = scan
-            .step(store, Duration::ZERO, &mut |json| {
+            .step(store, Duration::ZERO, &mut |_seq, json| {
                 out.borrow_mut().push(json.to_owned());
             })
             .unwrap();
@@ -52,6 +54,11 @@ fn collect(store: &Store, filters: Arc<[Filter]>, snapshot: u64) -> Vec<String> 
     out.into_inner()
 }
 
+/// `collect_now` with the expiry cutoff disabled.
+fn collect(store: &Store, filters: Arc<[Filter]>, snapshot: u64) -> Vec<String> {
+    collect_now(store, filters, snapshot, 0)
+}
+
 #[test]
 fn write_and_scan_all() {
     let (_dir, store) = store();
@@ -60,7 +67,7 @@ fn write_and_scan_all() {
     let e2 = event(&k, 1, 200, &json!([]), "b");
     let out = store.write(&[Arc::clone(&e1), Arc::clone(&e2)]).unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Stored { seq: 2 }
@@ -79,7 +86,7 @@ fn duplicate_and_ephemeral() {
     let eph = event(&k, 20_001, 100, &json!([]), "gone");
     let out = store.write(&[Arc::clone(&e), Arc::clone(&e), eph]).unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Duplicate,
@@ -100,7 +107,7 @@ fn replaceable_supersedes() {
         .write(&[Arc::clone(&old), Arc::clone(&new), stale])
         .unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Stored { seq: 2 },
@@ -126,7 +133,7 @@ fn replaceable_two_versions_one_batch() {
     let v2 = event(&k, 3, 300, &json!([]), "v2");
     let out = store.write(&[v1, Arc::clone(&v2)]).unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Stored { seq: 2 }
@@ -151,7 +158,7 @@ fn replaceable_tie_lower_id_wins() {
     let (winner, loser) = if a.id() < b.id() { (a, b) } else { (b, a) };
     let out = store.write(&[loser, Arc::clone(&winner)]).unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Stored { seq: 2 }
@@ -176,7 +183,7 @@ fn addressable_replaces_by_d_tag() {
         .write(&[v1, Arc::clone(&v2), Arc::clone(&other)])
         .unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Stored { seq: 2 },
@@ -200,7 +207,7 @@ fn addressable_long_d_replaces() {
     let v2 = event(&k, 30_002, 200, &json!([["d", long_d]]), "v2");
     let out = store.write(&[v1, Arc::clone(&v2)]).unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Stored { seq: 2 }
@@ -217,7 +224,7 @@ fn different_authors_do_not_replace() {
     let b = event(&key(2), 0, 50, &json!([]), "b");
     let out = store.write(&[Arc::clone(&a), Arc::clone(&b)]).unwrap();
     assert_eq!(
-        out,
+        out.outcomes,
         vec![
             WriteOutcome::Stored { seq: 1 },
             WriteOutcome::Stored { seq: 2 }
@@ -250,10 +257,10 @@ fn scan_writes_between_steps_invisible() {
         .collect();
     store.write(&events).unwrap();
     let snap = store.snapshot().unwrap();
-    let mut scan = Scan::new(Arc::from([Filter::parse("{}").unwrap()]), snap, 500);
+    let mut scan = Scan::new(Arc::from([Filter::parse("{}").unwrap()]), snap, 500, 0);
     let out = RefCell::new(Vec::new());
     let p1 = scan
-        .step(&store, Duration::ZERO, &mut |j| {
+        .step(&store, Duration::ZERO, &mut |_seq, j| {
             out.borrow_mut().push(j.to_owned());
         })
         .unwrap();
@@ -264,7 +271,7 @@ fn scan_writes_between_steps_invisible() {
     store.write(&later).unwrap();
     loop {
         let p = scan
-            .step(&store, Duration::ZERO, &mut |j| {
+            .step(&store, Duration::ZERO, &mut |_seq, j| {
                 out.borrow_mut().push(j.to_owned());
             })
             .unwrap();
@@ -363,7 +370,7 @@ fn persistence_reopen() {
     let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
     let e2 = event(&k, 1, 200, &json!([]), "two");
     let out = store.write(&[Arc::clone(&e2)]).unwrap();
-    assert_eq!(out, vec![WriteOutcome::Stored { seq: 2 }]);
+    assert_eq!(out.outcomes, vec![WriteOutcome::Stored { seq: 2 }]);
     let got = collect(&store, Arc::from([Filter::parse("{}").unwrap()]), 2);
     assert_eq!(got, vec![e2.json().to_owned(), e1.json().to_owned()]);
 }
@@ -393,8 +400,8 @@ fn format_mismatch_rejected() {
         err,
         StoreError::FormatMismatch {
             found: 9,
-            expected: 1
-        }
+            expected
+        } if expected == FORMAT_VERSION
     ));
 }
 
@@ -425,12 +432,12 @@ fn scan_emits_first_group_before_step_ends() {
     let snapshot = store.snapshot().unwrap();
     let filters: Arc<[Filter]> =
         Arc::from([Filter::parse("{\"kinds\":[1],\"limit\":500}").unwrap()]);
-    let mut scan = Scan::new(filters, snapshot, 500);
+    let mut scan = Scan::new(filters, snapshot, 500, 0);
     let mut emitted = 0usize;
     // A zero-budget step stops after BUDGET_CHECK_EVERY candidates; a
     // streaming scan has already flushed completed created_at groups.
     let progress = scan
-        .step(&store, Duration::ZERO, &mut |_| {
+        .step(&store, Duration::ZERO, &mut |_, _| {
             emitted += 1;
         })
         .unwrap();
@@ -556,4 +563,311 @@ fn compact_to_refuses_existing_dest() {
         "expected AlreadyExists, got {err}"
     );
     assert_eq!(std::fs::read(&dest).unwrap(), b"existing", "dest untouched");
+}
+
+/// The author's pubkey hex for `a` tag values.
+fn pk_hex(keypair: &secp256k1::Keypair) -> String {
+    format!("{}", keypair.x_only_public_key().0)
+}
+
+#[test]
+fn deletion_by_e_removes_target_and_blocks_republish() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let note = event(&k, 1, 100, &json!([]), "gone");
+    let kind5 = event(&k, 5, 200, &json!([["e", format!("{}", note.id())]]), "");
+    assert_eq!(
+        store.write(&[Arc::clone(&note)]).unwrap().outcomes,
+        vec![WriteOutcome::Stored { seq: 1 }]
+    );
+    let written = store.write(&[Arc::clone(&kind5)]).unwrap();
+    assert_eq!(written.outcomes, vec![WriteOutcome::Stored { seq: 2 }]);
+    assert_eq!(written.deleted, vec![1]);
+    let got = collect(&store, Arc::from([Filter::parse("{}").unwrap()]), 2);
+    assert_eq!(got, vec![kind5.json().to_owned()]);
+    // The id stays blocked for this author: republishing is Deleted.
+    let again = store.write(&[Arc::clone(&note)]).unwrap();
+    assert_eq!(again.outcomes, vec![WriteOutcome::Deleted]);
+    assert_eq!(again.deleted, Vec::<u64>::new());
+}
+
+#[test]
+fn deletion_kind5_targeting_kind5_has_no_effect() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let first = event(&k, 5, 100, &json!([]), "first");
+    let second = event(
+        &k,
+        5,
+        200,
+        &json!([["e", format!("{}", first.id())]]),
+        "second",
+    );
+    let written = store
+        .write(&[Arc::clone(&first), Arc::clone(&second)])
+        .unwrap();
+    assert_eq!(written.deleted, Vec::<u64>::new());
+    let got = collect(
+        &store,
+        Arc::from([Filter::parse("{\"kinds\":[5]}").unwrap()]),
+        2,
+    );
+    assert_eq!(got.len(), 2, "a kind 5 cannot delete a kind 5");
+}
+
+#[test]
+fn deletion_foreign_author_e_has_no_effect() {
+    let (_dir, store) = store();
+    let note = event(&key(1), 1, 100, &json!([]), "mine");
+    let kind5 = event(
+        &key(2),
+        5,
+        200,
+        &json!([["e", format!("{}", note.id())]]),
+        "",
+    );
+    let written = store
+        .write(&[Arc::clone(&note), Arc::clone(&kind5)])
+        .unwrap();
+    assert_eq!(written.deleted, Vec::<u64>::new());
+    let got = collect(&store, Arc::from([Filter::parse("{}").unwrap()]), 2);
+    assert_eq!(got.len(), 2, "a foreign-author e target is ignored");
+}
+
+#[test]
+fn deletion_by_a_removes_equal_and_older_versions() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let pk = pk_hex(&k);
+    let v1 = event(&k, 30_023, 100, &json!([["d", "art"]]), "v1");
+    let del = event(&k, 5, 200, &json!([["a", format!("30023:{pk}:art")]]), "");
+    let written = store.write(&[Arc::clone(&v1), Arc::clone(&del)]).unwrap();
+    assert_eq!(written.outcomes.len(), 2);
+    assert_eq!(written.deleted, vec![1]);
+    // Equal or older republishing is blocked; a newer version is accepted.
+    let v_older = event(&k, 30_023, 50, &json!([["d", "art"]]), "older");
+    let v_equal = event(&k, 30_023, 200, &json!([["d", "art"]]), "equal");
+    let v_newer = event(&k, 30_023, 250, &json!([["d", "art"]]), "newer");
+    let again = store
+        .write(&[
+            Arc::clone(&v1),
+            Arc::clone(&v_older),
+            Arc::clone(&v_equal),
+            Arc::clone(&v_newer),
+        ])
+        .unwrap();
+    assert_eq!(
+        again.outcomes,
+        vec![
+            WriteOutcome::Deleted,
+            WriteOutcome::Deleted,
+            WriteOutcome::Deleted,
+            WriteOutcome::Stored { seq: 3 }
+        ]
+    );
+    let got = collect(
+        &store,
+        Arc::from([Filter::parse("{\"kinds\":[30023]}").unwrap()]),
+        3,
+    );
+    assert_eq!(got, vec![v_newer.json().to_owned()]);
+}
+
+#[test]
+fn deletion_by_a_replaceable_uses_empty_d() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let pk = pk_hex(&k);
+    let profile = event(&k, 0, 100, &json!([]), "profile");
+    let del = event(&k, 5, 200, &json!([["a", format!("0:{pk}:")]]), "");
+    let written = store
+        .write(&[Arc::clone(&profile), Arc::clone(&del)])
+        .unwrap();
+    assert_eq!(written.deleted, vec![1]);
+    assert_eq!(
+        store.write(&[Arc::clone(&profile)]).unwrap().outcomes,
+        vec![WriteOutcome::Deleted]
+    );
+    let newer = event(&k, 0, 300, &json!([]), "new");
+    assert_eq!(
+        store.write(&[Arc::clone(&newer)]).unwrap().outcomes,
+        vec![WriteOutcome::Stored { seq: 3 }]
+    );
+}
+
+#[test]
+fn deletion_foreign_a_has_no_effect() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let other = pk_hex(&key(2));
+    let v1 = event(&k, 30_023, 100, &json!([["d", "art"]]), "v1");
+    // The a value names another author's address: not a target.
+    let del = event(
+        &k,
+        5,
+        200,
+        &json!([["a", format!("30023:{other}:art")]]),
+        "",
+    );
+    let written = store.write(&[Arc::clone(&v1), Arc::clone(&del)]).unwrap();
+    assert_eq!(written.deleted, Vec::<u64>::new());
+    let got = collect(
+        &store,
+        Arc::from([Filter::parse("{\"kinds\":[30023]}").unwrap()]),
+        2,
+    );
+    assert_eq!(got, vec![v1.json().to_owned()]);
+}
+
+/// A `d` longer than 255 bytes never fits the packed record; a delete
+/// must still find and remove every index entry. Shared by the `e` and
+/// `a` deletion tests.
+fn assert_long_d_deletion(store: &Store, del: Arc<Event>) {
+    let k = key(1);
+    let long_d = "d".repeat(300);
+    let v1 = event(&k, 30_002, 100, &json!([["d", long_d]]), "v1");
+    let written = store.write(&[Arc::clone(&v1), del]).unwrap();
+    assert_eq!(written.deleted, vec![1], "target must be deleted");
+    let blocked = store.write(&[Arc::clone(&v1)]).unwrap();
+    assert_eq!(
+        blocked.outcomes,
+        vec![WriteOutcome::Deleted],
+        "republish must be blocked"
+    );
+    // A newer version is accepted.
+    let v2 = event(&k, 30_002, 250, &json!([["d", long_d]]), "v2");
+    let newest = store.write(&[Arc::clone(&v2)]).unwrap();
+    assert_eq!(
+        newest.outcomes,
+        vec![WriteOutcome::Stored { seq: 3 }],
+        "newer version must be stored"
+    );
+}
+
+#[test]
+fn deletion_long_d_by_e() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let v1 = event(&k, 30_002, 100, &json!([["d", "d".repeat(300)]]), "v1");
+    let del = event(&k, 5, 200, &json!([["e", format!("{}", v1.id())]]), "");
+    assert_long_d_deletion(&store, del);
+}
+
+#[test]
+fn deletion_long_d_by_a() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let pk = pk_hex(&k);
+    let long_d = "d".repeat(300);
+    let del = event(
+        &k,
+        5,
+        200,
+        &json!([["a", format!("30002:{pk}:{long_d}")]]),
+        "",
+    );
+    assert_long_d_deletion(&store, del);
+}
+
+#[test]
+fn deletion_block_lifts_when_kind5_is_deleted() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let note = event(&k, 1, 100, &json!([]), "gone");
+    let kind5 = event(&k, 5, 200, &json!([["e", format!("{}", note.id())]]), "");
+    let written = store
+        .write(&[Arc::clone(&note), Arc::clone(&kind5)])
+        .unwrap();
+    assert_eq!(written.deleted, vec![1]);
+    assert_eq!(
+        store.write(&[Arc::clone(&note)]).unwrap().outcomes,
+        vec![WriteOutcome::Deleted]
+    );
+    // Deleting the kind 5 itself removes its index rows: republish works.
+    assert_eq!(store.delete(&[2]).unwrap(), 1);
+    assert_eq!(
+        store.write(&[Arc::clone(&note)]).unwrap().outcomes,
+        vec![WriteOutcome::Stored { seq: 3 }]
+    );
+}
+
+#[test]
+fn deleted_reported_within_one_batch() {
+    let (_dir, store) = store();
+    let k = key(1);
+    // An event and its deletion in one batch.
+    let note = event(&k, 1, 100, &json!([]), "gone");
+    let del = event(&k, 5, 200, &json!([["e", format!("{}", note.id())]]), "");
+    let written = store.write(&[Arc::clone(&note), Arc::clone(&del)]).unwrap();
+    assert_eq!(
+        written.outcomes,
+        vec![
+            WriteOutcome::Stored { seq: 1 },
+            WriteOutcome::Stored { seq: 2 }
+        ]
+    );
+    assert_eq!(written.deleted, vec![1]);
+    // A replaceable pair in one batch: the loser lands in `deleted`.
+    let v1 = event(&k, 0, 100, &json!([]), "v1");
+    let v2 = event(&k, 0, 200, &json!([]), "v2");
+    let pair = store.write(&[v1, Arc::clone(&v2)]).unwrap();
+    assert_eq!(pair.deleted, vec![3]);
+    let got = collect(
+        &store,
+        Arc::from([Filter::parse("{\"kinds\":[0]}").unwrap()]),
+        4,
+    );
+    assert_eq!(got, vec![v2.json().to_owned()]);
+}
+
+#[test]
+fn expire_removes_due_events_and_respects_limit() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let e1 = event(&k, 1, 100, &json!([["expiration", "150"]]), "a");
+    let e2 = event(&k, 1, 100, &json!([["expiration", "250"]]), "b");
+    let e3 = event(&k, 1, 100, &json!([]), "c");
+    store
+        .write(&[Arc::clone(&e1), Arc::clone(&e2), Arc::clone(&e3)])
+        .unwrap();
+    // Nothing due yet; limit respected; future events left alone.
+    assert_eq!(store.expire(100, 10).unwrap(), 0);
+    assert_eq!(store.expire(200, 1).unwrap(), 1);
+    assert_eq!(store.expire(200, 10).unwrap(), 0);
+    assert_eq!(store.expire(300, 10).unwrap(), 1);
+    let got = collect(&store, Arc::from([Filter::parse("{}").unwrap()]), 3);
+    assert_eq!(got, vec![e3.json().to_owned()]);
+    assert_eq!(
+        export_lines(&store, 0, u64::MAX, false),
+        vec![e3.json().to_owned()]
+    );
+}
+
+#[test]
+fn scan_hides_expired_and_they_do_not_consume_limits() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let expired = event(&k, 1, 200, &json!([["expiration", "300"]]), "old");
+    let live = event(&k, 1, 100, &json!([]), "live");
+    let snap = store
+        .write(&[Arc::clone(&expired), Arc::clone(&live)])
+        .map(|_| store.snapshot().unwrap())
+        .unwrap();
+    // now = 0 disables the cutoff: both visible, newest first.
+    let all = collect_now(&store, Arc::from([Filter::parse("{}").unwrap()]), snap, 0);
+    assert_eq!(all, vec![expired.json().to_owned(), live.json().to_owned()]);
+    // now >= expiration: the expired event is hidden even in storage.
+    let at_now = collect_now(&store, Arc::from([Filter::parse("{}").unwrap()]), snap, 400);
+    assert_eq!(at_now, vec![live.json().to_owned()]);
+    // It does not consume the limit either: newest-first with limit 1
+    // still serves the live event, not the expired one.
+    let limited = collect_now(
+        &store,
+        Arc::from([Filter::parse("{\"limit\":1}").unwrap()]),
+        snap,
+        400,
+    );
+    assert_eq!(limited, vec![live.json().to_owned()]);
+    // Export stays a raw dump: expired events are exported until swept.
+    assert_eq!(export_lines(&store, 0, u64::MAX, false).len(), 2);
 }

@@ -33,7 +33,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber as _;
 
-use crate::channels::{ReaderMsg, ShardMsg, WriteRequest};
+use crate::channels::{ReaderMsg, ShardMsg, WriterMsg};
 use crate::config::Config;
 
 /// How many publish requests the writer queues before backpressuring
@@ -69,7 +69,9 @@ pub enum ServerError {
 pub struct Server {
     state: http::AppState,
     stop_tx: watch::Sender<bool>,
-    writer_tx: mpsc::Sender<WriteRequest>,
+    writer_tx: mpsc::Sender<WriterMsg>,
+    /// Dropping this unblocks the expiry timer's `recv_timeout` at once.
+    expire_stop: std::sync::mpsc::Sender<()>,
     shard_txs: Vec<mpsc::Sender<ShardMsg>>,
     reader_txs: Arc<[std::sync::mpsc::Sender<ReaderMsg>]>,
     threads: Vec<JoinHandle<()>>,
@@ -148,7 +150,7 @@ impl Server {
         }
 
         // Writer.
-        let (writer_tx, writer_rx) = mpsc::channel::<WriteRequest>(WRITER_QUEUE);
+        let (writer_tx, writer_rx) = mpsc::channel::<WriterMsg>(WRITER_QUEUE);
         let writer_shards = shard_txs.clone();
         threads.push(
             std::thread::Builder::new()
@@ -156,6 +158,19 @@ impl Server {
                 .spawn(move || writer::run(&store, writer_rx, &writer_shards))
                 .map_err(ServerError::Spawn)?,
         );
+
+        // Expiry timer: owns a writer sender and the stop receiver so
+        // the writer channel closes when the thread exits.
+        let (expire_stop, expire_stop_rx) = std::sync::mpsc::channel::<()>();
+        {
+            let expire_writer = writer_tx.clone();
+            threads.push(
+                std::thread::Builder::new()
+                    .name("nosfry-expiry".into())
+                    .spawn(move || writer::expire_timer(&expire_writer, &expire_stop_rx))
+                    .map_err(ServerError::Spawn)?,
+            );
+        }
         let conn = connection::Handle {
             writer: writer_tx.clone(),
             shards: Arc::from(shard_txs.as_slice()),
@@ -173,6 +188,7 @@ impl Server {
             },
             stop_tx,
             writer_tx,
+            expire_stop,
             shard_txs,
             reader_txs,
             threads,
@@ -195,6 +211,7 @@ impl Server {
         self.signal_shutdown();
         drop(self.state);
         drop(self.writer_tx);
+        drop(self.expire_stop);
         drop(self.shard_txs);
         drop(self.reader_txs);
         for thread in self.threads {

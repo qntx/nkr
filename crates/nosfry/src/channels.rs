@@ -28,6 +28,15 @@ pub(crate) fn route<T>(slots: &[T], conn: ConnId) -> &T {
 /// One committed write batch: `(seq, event)` for `Stored` events only.
 pub(crate) type Batch = Vec<(u64, Arc<Event>)>;
 
+/// Inbox item for the writer thread.
+#[derive(Debug)]
+pub(crate) enum WriterMsg {
+    /// A verified event to store.
+    Publish(WriteRequest),
+    /// Sweep expired events (NIP-40).
+    Expire,
+}
+
 /// A publish request queued for the single writer thread.
 #[derive(Debug)]
 pub(crate) struct WriteRequest {

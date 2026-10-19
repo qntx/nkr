@@ -273,7 +273,7 @@ proptest! {
     ) {
         let filter = Filter::parse(&serde_json::to_string(&filter_json).unwrap())
             .expect("generated filters are always valid");
-        let packed = PackedEvent::build(&id, &pubkey, created_at, Kind(kind), &tags);
+        let packed = PackedEvent::build(&id, &pubkey, created_at, Kind(kind), 0, &tags);
         let expected = naive_match(&filter_json, &id, &pubkey, created_at, kind, &tags);
         prop_assert_eq!(filter.matches(packed.packed()), expected);
     }
@@ -282,7 +282,7 @@ proptest! {
     fn packed_round_trip(
         (id, pubkey, created_at, kind, tags) in arb_event(),
     ) {
-        let packed = PackedEvent::build(&id, &pubkey, created_at, Kind(kind), &tags);
+        let packed = PackedEvent::build(&id, &pubkey, created_at, Kind(kind), 0, &tags);
         let view = packed.packed();
         prop_assert_eq!(view.id(), id);
         prop_assert_eq!(view.pubkey(), pubkey);
@@ -395,7 +395,7 @@ proptest! {
             }
         }
         prop_assert_eq!(monitors.len(), model.len());
-        let packed = PackedEvent::build(&id, &pubkey, created_at, Kind(kind), &tags);
+        let packed = PackedEvent::build(&id, &pubkey, created_at, Kind(kind), 0, &tags);
         let mut out = Vec::new();
         monitors.matches(packed.packed(), &mut out);
         let got: HashSet<(u8, String, u64)> = out

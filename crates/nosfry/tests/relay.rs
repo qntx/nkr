@@ -562,7 +562,7 @@ async fn nip11_document() {
     for key in ["description", "pubkey", "contact", "icon"] {
         assert!(doc.get(key).is_none(), "{key} must be omitted when empty");
     }
-    assert_eq!(doc["supported_nips"], json!([1, 11]));
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40]));
     assert_eq!(doc["software"], "https://github.com/qntx/nosfry");
     assert_eq!(doc["limitation"]["max_subscriptions"], 200);
     assert_eq!(
@@ -717,4 +717,127 @@ async fn shutdown_with_stuck_client_returns() {
     tokio::time::timeout(Duration::from_secs(15), relay.stop())
         .await
         .expect("serve did not return with a stuck client");
+}
+
+/// Collect the event ids of one REQ until EOSE.
+async fn req_ids(ws: &mut yawc::TcpWebSocket, sub: &str, filter: &str) -> Vec<String> {
+    send_text(ws, &req_wire(sub, filter)).await;
+    let mut got = Vec::new();
+    loop {
+        let frame = json(&recv_text(ws, T).await);
+        match frame[0].as_str().unwrap() {
+            "EVENT" => got.push(frame[2]["id"].as_str().unwrap().to_owned()),
+            "EOSE" => return got,
+            other => panic!("unexpected frame {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn nip09_delete_by_id_hides_and_blocks() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let k = key(30);
+    let note = common::event(&k, 1, now(), &json!([]), "gone");
+    let note_id = json(note.json())["id"].as_str().unwrap().to_owned();
+    send_text(&mut ws, &event_wire(&note)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[2], true);
+
+    let kind5 = common::event(&k, 5, now(), &json!([["e", note_id]]), "");
+    send_text(&mut ws, &event_wire(&kind5)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[2], true);
+
+    // The deleted event no longer matches a REQ; the kind 5 remains.
+    let got = req_ids(&mut ws, "d1", "{}").await;
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0], json(kind5.json())["id"].as_str().unwrap());
+
+    // Republishing the deleted id is blocked.
+    send_text(&mut ws, &event_wire(&note)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[0], "OK");
+    assert_eq!(ok[2], false);
+    assert!(ok[3].as_str().unwrap().starts_with("blocked:"));
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn nip09_delete_by_address() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let k = key(31);
+    let pk = format!("{}", k.x_only_public_key().0);
+    let v1 = common::event(&k, 30_023, now(), &json!([["d", "art"]]), "v1");
+    let v1_id = json(v1.json())["id"].as_str().unwrap().to_owned();
+    send_text(&mut ws, &event_wire(&v1)).await;
+    let _ok = recv_text(&mut ws, T).await;
+
+    let kind5 = common::event(&k, 5, now(), &json!([["a", format!("30023:{pk}:art")]]), "");
+    send_text(&mut ws, &event_wire(&kind5)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[2], true);
+
+    let got = req_ids(&mut ws, "a1", "{\"kinds\":[30023]}").await;
+    assert!(got.is_empty(), "addressable event still visible: {got:?}");
+
+    // Same-address republish at an older timestamp is blocked; a newer
+    // version is accepted.
+    send_text(&mut ws, &event_wire(&v1)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[2], false);
+    assert!(ok[3].as_str().unwrap().starts_with("blocked:"));
+    let v2 = common::event(&k, 30_023, now() + 1, &json!([["d", "art"]]), "v2");
+    send_text(&mut ws, &event_wire(&v2)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[2], true, "newer version rejected: {ok}");
+    let _ = v1_id;
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn nip40_expired_event_rejected_on_ingest() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(
+        &key(32),
+        1,
+        now(),
+        &json!([["expiration", (now() - 10).to_string()]]),
+        "stale",
+    );
+    send_text(&mut ws, &event_wire(&ev)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[0], "OK");
+    assert_eq!(ok[2], false);
+    assert!(ok[3].as_str().unwrap().starts_with("invalid:"));
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn nip40_expiring_event_hidden_after_expiry() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(
+        &key(33),
+        1,
+        now(),
+        &json!([["expiration", (now() + 2).to_string()]]),
+        "short-lived",
+    );
+    let ev_id = json(ev.json())["id"].as_str().unwrap().to_owned();
+    send_text(&mut ws, &event_wire(&ev)).await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[2], true);
+
+    // Visible before expiry.
+    let got = req_ids(&mut ws, "x1", "{\"kinds\":[1]}").await;
+    assert_eq!(got, vec![ev_id.clone()]);
+
+    // Past the expiration the same REQ hides it — before any sweep.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let got = req_ids(&mut ws, "x2", "{\"kinds\":[1]}").await;
+    assert!(got.is_empty(), "expired event still served: {got:?}");
+    relay.stop().await;
 }

@@ -10,6 +10,7 @@ use secp256k1::schnorr::{self, Signature};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::deletion::DeletionTarget;
 use crate::hex;
 use crate::kind::{Kind, KindClass};
 use crate::packed::{PackedEvent, PackedRef};
@@ -107,6 +108,10 @@ pub enum EventError {
     /// BIP-340 verification failed.
     #[error("signature verification failed")]
     Sig,
+    /// The first `expiration` tag lacks an ASCII-decimal `u64` value
+    /// of at least 100 (NIP-40).
+    #[error("malformed expiration tag")]
+    MalformedExpiration,
 }
 
 impl EventError {
@@ -124,6 +129,7 @@ pub struct UnverifiedEvent<'a> {
     pubkey: PublicKey,
     created_at: u64,
     kind: Kind,
+    expiration: Option<u64>,
     tags: Vec<Vec<Cow<'a, str>>>,
     content: Cow<'a, str>,
     sig: [u8; 64],
@@ -161,9 +167,14 @@ impl<'a> UnverifiedEvent<'a> {
         Ok(ev)
     }
 
-    /// Structural-only parse used by the client-message layer, where the
-    /// limit policy is not yet in scope.
-    pub(crate) fn parse_structural(json: &'a str) -> Result<Self, EventError> {
+    /// Structure-only parse without size limits, for re-reading stored
+    /// canonical JSON whose configured limits may have changed since the
+    /// event was accepted.
+    ///
+    /// # Errors
+    ///
+    /// [`EventError`] on any malformed field.
+    pub fn parse_structural(json: &'a str) -> Result<Self, EventError> {
         let raw: RawEvent<'a> = serde_json::from_str(json)?;
         let id =
             hex::decode_32(&raw.id).ok_or(EventError::Field("id", "64 lowercase hex chars"))?;
@@ -174,6 +185,7 @@ impl<'a> UnverifiedEvent<'a> {
         if raw.created_at > 9_007_199_254_740_991 {
             return Err(EventError::Field("created_at", "integer <= 2^53 - 1"));
         }
+        let mut expiration = None;
         for tag in &raw.tags {
             let Some(name) = tag.first() else {
                 return Err(EventError::Field(
@@ -190,12 +202,16 @@ impl<'a> UnverifiedEvent<'a> {
                     "e/p first values of 64 lowercase hex chars",
                 ));
             }
+            if name.as_ref() == "expiration" && expiration.is_none() {
+                expiration = Some(parse_expiration(tag)?);
+            }
         }
         Ok(Self {
             id: EventId(id),
             pubkey: PublicKey(pubkey),
             created_at: raw.created_at,
             kind: Kind(raw.kind),
+            expiration,
             tags: raw.tags,
             content: raw.content,
             sig,
@@ -226,6 +242,47 @@ impl<'a> UnverifiedEvent<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The author public key.
+    #[must_use]
+    pub const fn pubkey(&self) -> PublicKey {
+        self.pubkey
+    }
+
+    /// The NIP-40 `expiration` unix time, `None` when absent.
+    #[must_use]
+    pub const fn expiration(&self) -> Option<u64> {
+        self.expiration
+    }
+
+    /// The NIP-01 replaceable/addressable storage key derived from
+    /// kind, pubkey, and the first `d` tag (empty for replaceable
+    /// kinds); `None` for regular and ephemeral kinds.
+    #[must_use]
+    pub fn address(&self) -> Option<[u8; 32]> {
+        match self.kind.class() {
+            KindClass::Regular | KindClass::Ephemeral => None,
+            KindClass::Replaceable => Some(address_hash(self.kind, &self.pubkey, &[])),
+            KindClass::Addressable => {
+                let d = self
+                    .tags
+                    .iter()
+                    .find(|tag| tag.first().is_some_and(|name| name.as_ref() == "d"))
+                    .and_then(|tag| tag.get(1))
+                    .map_or(&[][..], |value| value.as_bytes());
+                Some(address_hash(self.kind, &self.pubkey, d))
+            }
+        }
+    }
+
+    /// The NIP-09 deletion targets of a kind-5 event: every `e` id and
+    /// every `a` `"<kind>:<author>:<d>"` naming a replaceable or
+    /// addressable kind of this author (malformed and foreign-author
+    /// values are skipped). Empty for other kinds.
+    #[must_use]
+    pub fn deletion_targets(&self) -> Vec<DeletionTarget> {
+        crate::deletion::targets(self.kind, &self.pubkey, &self.tags)
     }
 
     /// The claimed event id.
@@ -287,30 +344,20 @@ impl<'a> UnverifiedEvent<'a> {
         let pubkey = XOnlyPublicKey::from_byte_array(self.pubkey.0).map_err(|_| EventError::Sig)?;
         schnorr::verify(&sig, &computed, &pubkey).map_err(|_| EventError::Sig)?;
 
-        let address = match self.kind.class() {
-            KindClass::Regular | KindClass::Ephemeral => None,
-            KindClass::Replaceable => Some(address_hash(self.kind, &self.pubkey, &[])),
-            KindClass::Addressable => {
-                let d = self
-                    .tags
-                    .iter()
-                    .find(|tag| tag.first().is_some_and(|name| name.as_ref() == "d"))
-                    .and_then(|tag| tag.get(1))
-                    .map_or(&[][..], |value| value.as_bytes());
-                Some(address_hash(self.kind, &self.pubkey, d))
-            }
-        };
         let packed = PackedEvent::build(
             &self.id,
             &self.pubkey,
             self.created_at,
             self.kind,
+            self.expiration.unwrap_or(0),
             &self.tags,
         );
         Ok(Event {
             packed,
             json: json.into_boxed_str(),
-            address,
+            address: self.address(),
+            expiration: self.expiration,
+            deletion_targets: self.deletion_targets(),
         })
     }
 }
@@ -333,6 +380,8 @@ pub struct Event {
     packed: PackedEvent,
     json: Box<str>,
     address: Option<[u8; 32]>,
+    expiration: Option<u64>,
+    deletion_targets: Vec<DeletionTarget>,
 }
 
 impl Event {
@@ -378,6 +427,18 @@ impl Event {
     #[must_use]
     pub const fn address(&self) -> Option<[u8; 32]> {
         self.address
+    }
+
+    /// The NIP-40 `expiration` unix time, `None` when absent.
+    #[must_use]
+    pub const fn expiration(&self) -> Option<u64> {
+        self.expiration
+    }
+
+    /// The NIP-09 deletion targets; empty unless kind 5.
+    #[must_use]
+    pub fn deletion_targets(&self) -> &[DeletionTarget] {
+        &self.deletion_targets
     }
 }
 
@@ -427,6 +488,19 @@ pub fn address_hash(kind: Kind, pubkey: &PublicKey, d: &[u8]) -> [u8; 32] {
 #[must_use]
 pub fn cmp_newest_first(a: (u64, &EventId), b: (u64, &EventId)) -> Ordering {
     b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1))
+}
+
+/// The NIP-40 `expiration` tag's second element: an ASCII-decimal
+/// `u64` of at least 100 (the `0` packed sentinel stays free).
+fn parse_expiration(tag: &[Cow<'_, str>]) -> Result<u64, EventError> {
+    let Some(value) = tag.get(1) else {
+        return Err(EventError::MalformedExpiration);
+    };
+    let decimal = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+    match decimal.then(|| value.parse::<u64>()) {
+        Some(Ok(expiration)) if expiration >= 100 => Ok(expiration),
+        _ => Err(EventError::MalformedExpiration),
+    }
 }
 
 /// Whether `new` supersedes `old` as the stored replaceable/addressable
@@ -562,5 +636,101 @@ mod tests {
         preimage.extend_from_slice(&pk.0);
         preimage.extend_from_slice(b"post");
         assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(&preimage)));
+    }
+
+    #[test]
+    fn expiration_first_tag_wins_and_packs() {
+        let expiration = 1_700_000_000;
+        let tags = vec![
+            vec!["expiration".into(), expiration.to_string()],
+            vec!["expiration".into(), "bogus".into()],
+        ];
+        let json = sign_json(1, 1000, &tags, "x");
+        let unverified = UnverifiedEvent::parse(&json, &EventLimits::default()).expect("parse");
+        assert_eq!(unverified.expiration(), Some(expiration));
+        let event = unverified.verify(&EventLimits::default()).expect("verify");
+        assert_eq!(event.expiration(), Some(expiration));
+        assert_eq!(
+            event.packed().expiration(),
+            expiration,
+            "packed header must equal the parsed expiration"
+        );
+    }
+
+    #[test]
+    fn expiration_malformed_rejected() {
+        for tags in [
+            vec![vec!["expiration".into()]],
+            vec![vec!["expiration".into(), "abc".into()]],
+            vec![vec!["expiration".into(), "+200".into()]],
+            vec![vec!["expiration".into(), "1_000".into()]],
+            vec![vec!["expiration".into(), "99".into()]],
+            // A malformed first tag is not rescued by a valid second.
+            vec![
+                vec!["expiration".into(), "bogus".into()],
+                vec!["expiration".into(), "1000".into()],
+            ],
+        ] {
+            let error =
+                UnverifiedEvent::parse(&sign_json(1, 1000, &tags, "x"), &EventLimits::default())
+                    .expect_err("malformed expiration must be rejected");
+            assert_eq!(
+                error.reason(),
+                "invalid: malformed expiration tag",
+                "{tags:?}"
+            );
+        }
+        assert_eq!(sign(1, 1000, &[], "x").expiration(), None);
+        assert_eq!(sign(1, 1000, &[], "x").packed().expiration(), 0);
+    }
+
+    #[test]
+    fn deletion_targets_e_and_a_tags() {
+        let deleted_id = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        let pk = pubkey();
+        let pk_hex = pk.to_string();
+        let tags = vec![
+            vec!["e".into(), deleted_id.clone()],
+            vec!["e".into(), deleted_id.clone()], // duplicate collapses
+            vec!["e".into(), other.clone()],
+            vec!["a".into(), format!("30023:{pk_hex}:article")],
+            vec!["a".into(), format!("0:{pk_hex}:")], // replaceable, empty d
+            vec!["a".into(), format!("30023:{pk_hex}:d:with:colons")],
+            // Skipped: foreign author, non-replaceable kind, malformed.
+            vec!["a".into(), format!("30023:{}:x", "ef".repeat(32))],
+            vec!["a".into(), format!("1:{pk_hex}:x")],
+            vec!["a".into(), "not-an-address".into()],
+            vec!["a".into(), format!("30023:{pk_hex}")],
+            vec!["a".into(), format!("xyz:{pk_hex}:d")],
+        ];
+        let json = sign_json(5, 1000, &tags, "del");
+        let unverified = UnverifiedEvent::parse(&json, &EventLimits::default()).expect("parse");
+        let mut want = vec![
+            DeletionTarget::Event(EventId::from_hex(&deleted_id).expect("hex")),
+            DeletionTarget::Event(EventId::from_hex(&other).expect("hex")),
+            DeletionTarget::Address(address_hash(Kind(30_023), &pk, b"article")),
+            DeletionTarget::Address(address_hash(Kind(0), &pk, b"")),
+            DeletionTarget::Address(address_hash(Kind(30_023), &pk, b"d:with:colons")),
+        ];
+        want.sort_unstable();
+        let targets = unverified.deletion_targets();
+        assert_eq!(targets, want);
+        let event = unverified.verify(&EventLimits::default()).expect("verify");
+        assert_eq!(event.deletion_targets(), targets.as_slice());
+    }
+
+    #[test]
+    fn deletion_targets_empty_unless_kind_5() {
+        let pk = pubkey();
+        let tags = vec![
+            vec!["e".into(), "ab".repeat(32)],
+            vec!["a".into(), format!("30023:{pk}:x")],
+        ];
+        let json = sign_json(1, 1000, &tags, "x");
+        let unverified = UnverifiedEvent::parse(&json, &EventLimits::default()).expect("parse");
+        assert_eq!(unverified.deletion_targets(), Vec::<DeletionTarget>::new());
+        let event = unverified.verify(&EventLimits::default()).expect("verify");
+        assert_eq!(event.deletion_targets(), &[]);
     }
 }

@@ -6,16 +6,24 @@
 //!
 //! | db | key | value |
 //! |---|---|---|
-//! | meta | `b"format"` / `b"next_seq"` | u32 / u64 |
-//! | events | seq | packed record |
-//! | payloads | seq | canonical JSON |
-//! | ix_id | id | seq |
-//! | ix_time | created_at ‖ seq | id |
-//! | ix_pubkey | pubkey ‖ created_at ‖ seq | — |
-//! | ix_kind | kind ‖ created_at ‖ seq | — |
-//! | ix_pubkey_kind | pubkey ‖ kind ‖ created_at ‖ seq | — |
-//! | ix_tag | name ‖ len ‖ packed value ‖ created_at ‖ seq | — |
-//! | ix_replace | `Event::address` | seq |
+//! | `meta` | `b"format"` / `b"next_seq"` | u32 / u64 |
+//! | `events` | `seq` | packed record |
+//! | `payloads` | `seq` | canonical JSON |
+//! | `ix_id` | `id` | `seq` |
+//! | `ix_time` | `created_at` ‖ `seq` | `id` |
+//! | `ix_pubkey` | `pubkey` ‖ `created_at` ‖ `seq` | — |
+//! | `ix_kind` | `kind` ‖ `created_at` ‖ `seq` | — |
+//! | `ix_pubkey_kind` | `pubkey` ‖ `kind` ‖ `created_at` ‖ `seq` | — |
+//! | `ix_tag` | `name` ‖ `len` ‖ packed value ‖ `created_at` ‖ `seq` | — |
+//! | `ix_replace` | `Event::address` | `seq` |
+//! | `ix_expiration` | `expiration` ‖ `seq` | — |
+//! | `ix_deletion` | event `id` ‖ `author` ‖ kind-5 `seq` | — |
+//! | `ix_replace_deletion` | `address` ‖ kind-5 `created_at` ‖ kind-5 `seq` | — |
+//!
+//! The last three index the event carrying the metadata: an expiring
+//! event owns its `ix_expiration` row, a kind-5 event owns its
+//! `ix_deletion`/`ix_replace_deletion` rows, so deleting the carrier
+//! removes the metadata (and lifts a deletion block) with it.
 #![cfg_attr(
     test,
     allow(
@@ -31,7 +39,8 @@ use std::sync::Arc;
 use heed::CompactionOption;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
-use nosfry_core::event::{Event, supersedes};
+use nosfry_core::deletion::DeletionTarget;
+use nosfry_core::event::{Event, EventId, PublicKey, UnverifiedEvent, supersedes};
 use nosfry_core::packed::PackedRef;
 
 mod scan;
@@ -39,7 +48,7 @@ mod scan;
 pub use scan::{Progress, Scan};
 
 /// On-disk format version, stored under the `format` meta key.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 type BytesDb = Database<Bytes, Bytes>;
 type Reader<'a> = RoTxn<'a, WithoutTls>;
@@ -79,6 +88,18 @@ pub enum WriteOutcome {
     Superseded,
     /// Ephemeral kind; nothing written.
     Ephemeral,
+    /// A stored same-author kind-5 event deleted (or blocks) this event.
+    Deleted,
+}
+
+/// The result of one [`Store::write`] transaction.
+#[derive(Debug, Default)]
+pub struct Written {
+    /// One outcome per input event, in arrival order.
+    pub outcomes: Vec<WriteOutcome>,
+    /// Seqs removed inside the transaction: replaced predecessors and
+    /// NIP-09 targets (possibly stored and removed in this same batch).
+    pub deleted: Vec<u64>,
 }
 
 /// Store failures.
@@ -121,18 +142,25 @@ pub(crate) enum Index {
     Tag,
     /// `ix_replace`: `address` → `seq`.
     Replace,
+    /// `ix_expiration`: `expiration` ‖ `seq`.
+    Expiration,
+    /// `ix_deletion`: `id` ‖ `author` ‖ `seq` (`e` targets only; the
+    /// row belongs to the kind-5 event carrying it).
+    Deletion,
+    /// `ix_replace_deletion`: `address` ‖ `created_at` ‖ `seq` of the
+    /// kind-5 event carrying it.
+    ReplaceDeletion,
 }
 
-/// Derive every index entry of an event from its packed record and
-/// sequence number. Insert and delete share this so they cannot diverge.
-///
-/// `address` is the event's replaceable/addressable key
-/// ([`Event::address`]); on the delete path it is the address under which
-/// the old event was found — the packed record alone cannot reproduce it
-/// when the `d` value exceeds the 255-byte packed limit.
+/// Derive every index entry of an event from its packed record, the
+/// metadata that cannot be recovered from it (`address`, `expiration`,
+/// `deletion_targets`), and its sequence number. Insert and delete
+/// share this so they cannot diverge.
 fn index_entries(
     packed: PackedRef<'_>,
     address: Option<[u8; 32]>,
+    expiration: u64,
+    deletion_targets: &[DeletionTarget],
     seq: u64,
     out: &mut Vec<(Index, Vec<u8>, Vec<u8>)>,
 ) {
@@ -180,6 +208,32 @@ fn index_entries(
     if let Some(address) = address {
         out.push((Index::Replace, address.to_vec(), seqb.to_vec()));
     }
+
+    if expiration != 0 {
+        let mut expiration_key = Vec::with_capacity(16);
+        expiration_key.extend_from_slice(&expiration.to_be_bytes());
+        expiration_key.extend_from_slice(&seqb);
+        out.push((Index::Expiration, expiration_key, Vec::new()));
+    }
+
+    for target in deletion_targets {
+        match target {
+            DeletionTarget::Event(id) => {
+                let mut deletion_key = Vec::with_capacity(72);
+                deletion_key.extend_from_slice(&id.0);
+                deletion_key.extend_from_slice(&pk);
+                deletion_key.extend_from_slice(&seqb);
+                out.push((Index::Deletion, deletion_key, Vec::new()));
+            }
+            DeletionTarget::Address(addr) => {
+                let mut replace_key = Vec::with_capacity(48);
+                replace_key.extend_from_slice(addr);
+                replace_key.extend_from_slice(&ca);
+                replace_key.extend_from_slice(&seqb);
+                out.push((Index::ReplaceDeletion, replace_key, Vec::new()));
+            }
+        }
+    }
 }
 
 /// The LMDB store.
@@ -196,6 +250,9 @@ pub struct Store {
     ix_pubkey_kind: BytesDb,
     ix_tag: BytesDb,
     ix_replace: BytesDb,
+    ix_expiration: BytesDb,
+    ix_deletion: BytesDb,
+    ix_replace_deletion: BytesDb,
 }
 
 impl Store {
@@ -242,6 +299,9 @@ impl Store {
         let ix_pubkey_kind = open_or_create("ix_pubkey_kind")?;
         let ix_tag = open_or_create("ix_tag")?;
         let ix_replace = open_or_create("ix_replace")?;
+        let ix_expiration = open_or_create("ix_expiration")?;
+        let ix_deletion = open_or_create("ix_deletion")?;
+        let ix_replace_deletion = open_or_create("ix_replace_deletion")?;
         if let Some(bytes) = meta.get(&wtxn, b"format")? {
             let found = u32::from_be_bytes(
                 bytes
@@ -271,6 +331,9 @@ impl Store {
             ix_pubkey_kind,
             ix_tag,
             ix_replace,
+            ix_expiration,
+            ix_deletion,
+            ix_replace_deletion,
         })
     }
 
@@ -280,33 +343,50 @@ impl Store {
     ///
     /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
     /// broken index invariant.
-    pub fn write(&self, events: &[Arc<Event>]) -> Result<Vec<WriteOutcome>, StoreError> {
+    pub fn write(&self, events: &[Arc<Event>]) -> Result<Written, StoreError> {
         let mut txn = self.env.write_txn()?;
         let mut next_seq = self.next_seq(&txn)?;
-        let mut outcomes = Vec::with_capacity(events.len());
+        let mut written = Written {
+            outcomes: Vec::with_capacity(events.len()),
+            deleted: Vec::new(),
+        };
         for event in events {
-            outcomes.push(self.apply(&mut txn, event, &mut next_seq)?);
+            let outcome = self.apply(&mut txn, event, &mut next_seq, &mut written.deleted)?;
+            written.outcomes.push(outcome);
         }
         self.meta
             .put(&mut txn, b"next_seq", &next_seq.to_be_bytes())?;
         txn.commit()?;
-        Ok(outcomes)
+        Ok(written)
     }
 
     /// Apply one event inside the write transaction: ephemeral and
-    /// duplicate ids are skipped, a losing replace is `Superseded`, and
-    /// a winner deletes its predecessor before the insert.
+    /// duplicate ids are skipped, a NIP-09-blocked event is `Deleted`, a
+    /// losing replace is `Superseded`, a winner deletes its predecessor
+    /// before the insert, and a stored kind 5 deletes its targets.
     fn apply(
         &self,
         txn: &mut RwTxn<'_>,
         event: &Arc<Event>,
         next_seq: &mut u64,
+        deleted: &mut Vec<u64>,
     ) -> Result<WriteOutcome, StoreError> {
         if event.kind().is_ephemeral() {
             return Ok(WriteOutcome::Ephemeral);
         }
         if self.ix_id.get(txn, &event.id().0)?.is_some() {
             return Ok(WriteOutcome::Duplicate);
+        }
+        // NIP-09: an id covered by a stored same-author kind 5 stays
+        // deleted; a kind 5 itself is never blocked.
+        if event.kind().0 != 5 && self.has_prefix(txn, Index::Deletion, &deletion_prefix(event))? {
+            return Ok(WriteOutcome::Deleted);
+        }
+        // NIP-09: an `a` deletion blocks equal-or-older versions.
+        if let Some(address) = event.address()
+            && self.replace_deleted(txn, &address, event.created_at())?
+        {
+            return Ok(WriteOutcome::Deleted);
         }
         if let Some(address) = event.address()
             && let Some((old_seq, old_bytes)) = self.stored_version(txn, &address)?
@@ -318,14 +398,126 @@ impl Store {
             ) {
                 return Ok(WriteOutcome::Superseded);
             }
-            self.delete(txn, old, old_seq, &address)?;
+            if self.delete_seq(txn, old_seq)? {
+                deleted.push(old_seq);
+            }
         }
         let seq = *next_seq;
         *next_seq = next_seq
             .checked_add(1)
             .ok_or(StoreError::Corrupt("seq overflow"))?;
         self.insert(txn, event, seq)?;
+        if event.kind().0 == 5 {
+            self.apply_deletions(txn, event, deleted)?;
+        }
         Ok(WriteOutcome::Stored { seq })
+    }
+
+    /// Apply every target of a stored kind-5 `event` (NIP-09). Targets
+    /// are processed after the kind 5 itself is inserted.
+    fn apply_deletions(
+        &self,
+        txn: &mut RwTxn<'_>,
+        event: &Event,
+        deleted: &mut Vec<u64>,
+    ) -> Result<(), StoreError> {
+        for target in event.deletion_targets() {
+            match target {
+                DeletionTarget::Event(id) => {
+                    self.delete_event_target(txn, id, &event.pubkey(), deleted)?;
+                }
+                DeletionTarget::Address(address) => {
+                    self.delete_address_target(
+                        txn,
+                        address,
+                        event.created_at(),
+                        &event.pubkey(),
+                        deleted,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete the `e`-tagged event `id` when it is `author`'s own and
+    /// not itself a kind 5 (NIP-09: a deletion request cannot delete a
+    /// deletion request).
+    fn delete_event_target(
+        &self,
+        txn: &mut RwTxn<'_>,
+        id: &EventId,
+        author: &PublicKey,
+        deleted: &mut Vec<u64>,
+    ) -> Result<(), StoreError> {
+        let Some(seqb) = self.ix_id.get(txn, &id.0)? else {
+            return Ok(());
+        };
+        let seq = decode_seq(seqb)?;
+        let deletable = {
+            let Some(bytes) = self.events.get(txn, &seq.to_be_bytes())? else {
+                return Ok(());
+            };
+            let packed = PackedRef::new(bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
+            packed.pubkey() == *author && packed.kind().0 != 5
+        };
+        if deletable && self.delete_seq(txn, seq)? {
+            deleted.push(seq);
+        }
+        Ok(())
+    }
+
+    /// Delete the stored version at `address` when it is `author`'s own
+    /// and `created_at <= deleted_at` (the kind-5 timestamp).
+    fn delete_address_target(
+        &self,
+        txn: &mut RwTxn<'_>,
+        address: &[u8; 32],
+        deleted_at: u64,
+        author: &PublicKey,
+        deleted: &mut Vec<u64>,
+    ) -> Result<(), StoreError> {
+        let Some(seqb) = self.ix_replace.get(txn, address)? else {
+            return Ok(());
+        };
+        let seq = decode_seq(seqb)?;
+        let deletable = {
+            let Some(bytes) = self.events.get(txn, &seq.to_be_bytes())? else {
+                return Ok(());
+            };
+            let packed = PackedRef::new(bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
+            packed.pubkey() == *author && packed.created_at() <= deleted_at
+        };
+        if deletable && self.delete_seq(txn, seq)? {
+            deleted.push(seq);
+        }
+        Ok(())
+    }
+
+    /// Whether `index` has any key starting with `prefix`.
+    fn has_prefix(&self, txn: &RwTxn<'_>, index: Index, prefix: &[u8]) -> Result<bool, StoreError> {
+        Ok(self
+            .db(index)
+            .get_greater_than_or_equal_to(txn, prefix)?
+            .is_some_and(|(key, _)| key.starts_with(prefix)))
+    }
+
+    /// Whether a kind-5 `a` deletion at `created_at` or later covers
+    /// `address` — blocking equal-or-older versions of it.
+    fn replace_deleted(
+        &self,
+        txn: &RwTxn<'_>,
+        address: &[u8; 32],
+        created_at: u64,
+    ) -> Result<bool, StoreError> {
+        let mut from = Vec::with_capacity(48);
+        from.extend_from_slice(address);
+        from.extend_from_slice(&created_at.to_be_bytes());
+        from.extend_from_slice(&0u64.to_be_bytes());
+        Ok(self
+            .ix_replace_deletion
+            .get_greater_than_or_equal_to(txn, &from)?
+            .is_some_and(|(key, _)| key.starts_with(address)))
     }
 
     /// The `(seq, packed bytes)` of the stored event `ix_replace` points
@@ -454,7 +646,65 @@ impl Store {
             Index::PubkeyKind => &self.ix_pubkey_kind,
             Index::Tag => &self.ix_tag,
             Index::Replace => &self.ix_replace,
+            Index::Expiration => &self.ix_expiration,
+            Index::Deletion => &self.ix_deletion,
+            Index::ReplaceDeletion => &self.ix_replace_deletion,
         }
+    }
+
+    /// Delete `seqs` still present, in one write transaction; returns
+    /// the deleted count (admin path).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
+    /// broken index invariant.
+    pub fn delete(&self, seqs: &[u64]) -> Result<u64, StoreError> {
+        let mut txn = self.env.write_txn()?;
+        let mut count = 0;
+        for &seq in seqs {
+            if self.delete_seq(&mut txn, seq)? {
+                count += 1;
+            }
+        }
+        txn.commit()?;
+        Ok(count)
+    }
+
+    /// Delete every event whose NIP-40 `expiration` is `<= now`, at
+    /// most `limit` of them, in one write transaction; returns the
+    /// deleted count.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
+    /// broken index invariant.
+    pub fn expire(&self, now: u64, limit: usize) -> Result<usize, StoreError> {
+        let mut txn = self.env.write_txn()?;
+        let mut seqs = Vec::with_capacity(limit.min(4096));
+        let iter = self.ix_expiration.iter(&txn)?;
+        for entry in iter.take(limit) {
+            let (key, _) = entry?;
+            let expiration: &[u8; 8] = key
+                .first_chunk::<8>()
+                .ok_or(StoreError::Corrupt("bad ix_expiration key"))?;
+            if u64::from_be_bytes(*expiration) > now {
+                break;
+            }
+            let seq: &[u8; 8] = key
+                .get(8..)
+                .and_then(|s| s.try_into().ok())
+                .ok_or(StoreError::Corrupt("bad ix_expiration key"))?;
+            seqs.push(u64::from_be_bytes(*seq));
+        }
+        let mut count = 0;
+        for seq in seqs {
+            if self.delete_seq(&mut txn, seq)? {
+                count += 1;
+            }
+        }
+        txn.commit()?;
+        Ok(count)
     }
 
     fn insert(&self, txn: &mut RwTxn<'_>, event: &Event, seq: u64) -> Result<(), StoreError> {
@@ -463,31 +713,66 @@ impl Store {
         self.payloads
             .put(txn, &seq.to_be_bytes(), event.json().as_bytes())?;
         let mut entries = Vec::new();
-        index_entries(event.packed(), event.address(), seq, &mut entries);
+        index_entries(
+            event.packed(),
+            event.address(),
+            event.expiration().unwrap_or(0),
+            event.deletion_targets(),
+            seq,
+            &mut entries,
+        );
         for (index, key, value) in entries {
             self.db(index).put(txn, &key, &value)?;
         }
         Ok(())
     }
 
-    /// Remove every key belonging to `packed`/`seq`. `address` is the
-    /// `ix_replace` key the old event was found under.
-    fn delete(
-        &self,
-        txn: &mut RwTxn<'_>,
-        packed: PackedRef<'_>,
-        seq: u64,
-        address: &[u8; 32],
-    ) -> Result<(), StoreError> {
+    /// Remove every record and index key of `seq`; `false` when it is
+    /// already gone. Index keys are derived from the stored canonical
+    /// JSON — the packed record alone cannot reproduce an `address`,
+    /// `e`, or `a` value longer than 255 bytes.
+    fn delete_seq(&self, txn: &mut RwTxn<'_>, seq: u64) -> Result<bool, StoreError> {
+        let seqb = seq.to_be_bytes();
         let mut entries = Vec::new();
-        index_entries(packed, Some(*address), seq, &mut entries);
-        for (index, key, _) in entries {
-            self.db(index).delete(txn, &key)?;
+        {
+            let Some(json) = self.payloads.get(txn, &seqb)? else {
+                return Ok(false);
+            };
+            let json = std::str::from_utf8(json)
+                .map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?;
+            let unverified = UnverifiedEvent::parse_structural(json)
+                .map_err(|_| StoreError::Corrupt("stored payload fails structural parse"))?;
+            let packed_bytes = self
+                .events
+                .get(txn, &seqb)?
+                .ok_or(StoreError::Corrupt("payload without packed record"))?;
+            let packed =
+                PackedRef::new(packed_bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
+            index_entries(
+                packed,
+                unverified.address(),
+                unverified.expiration().unwrap_or(0),
+                &unverified.deletion_targets(),
+                seq,
+                &mut entries,
+            );
         }
-        self.events.delete(txn, &seq.to_be_bytes())?;
-        self.payloads.delete(txn, &seq.to_be_bytes())?;
-        Ok(())
+        for (index, key, _) in &entries {
+            self.db(*index).delete(txn, key)?;
+        }
+        self.events.delete(txn, &seqb)?;
+        self.payloads.delete(txn, &seqb)?;
+        Ok(true)
     }
+}
+
+/// The `ix_deletion` lookup prefix `id ‖ pubkey` for an incoming event.
+fn deletion_prefix(event: &Event) -> [u8; 64] {
+    let mut prefix = [0u8; 64];
+    let (id, pubkey) = prefix.split_at_mut(32);
+    id.copy_from_slice(&event.id().0);
+    pubkey.copy_from_slice(&event.pubkey().0);
+    prefix
 }
 
 fn decode_seq(bytes: &[u8]) -> Result<u64, StoreError> {
@@ -563,7 +848,7 @@ mod tests {
         let new = event(&signer, 0, 200, &json!([["t", "x"]]), "new");
         let outcomes = store.write(&[Arc::clone(&old), new]).unwrap();
         assert_eq!(
-            outcomes,
+            outcomes.outcomes,
             vec![
                 WriteOutcome::Stored { seq: 1 },
                 WriteOutcome::Stored { seq: 2 }
@@ -587,11 +872,112 @@ mod tests {
             store.ix_kind,
             store.ix_pubkey_kind,
             store.ix_tag,
+            store.ix_expiration,
+            store.ix_deletion,
+            store.ix_replace_deletion,
         ] {
             for entry in db.iter(&txn).unwrap() {
                 let (key, _) = entry.unwrap();
                 assert_ne!(key[key.len() - 8..], old_seq, "stale index key {key:?}");
             }
         }
+    }
+
+    /// Every seq-suffixed index must be empty of `seq`; `ix_id` and
+    /// `ix_replace` are point lookups checked separately by the caller.
+    fn assert_seq_gone(store: &Store, seq: u64) {
+        let seqb = seq.to_be_bytes();
+        let txn = store.read_txn().unwrap();
+        assert!(store.events.get(&txn, &seqb).unwrap().is_none());
+        assert!(store.payloads.get(&txn, &seqb).unwrap().is_none());
+        for db in [
+            store.ix_time,
+            store.ix_pubkey,
+            store.ix_kind,
+            store.ix_pubkey_kind,
+            store.ix_tag,
+            store.ix_expiration,
+            store.ix_deletion,
+            store.ix_replace_deletion,
+        ] {
+            for entry in db.iter(&txn).unwrap() {
+                let (key, _) = entry.unwrap();
+                assert_ne!(key[key.len() - 8..], seqb, "stale index key {key:?}");
+            }
+        }
+    }
+
+    /// An NIP-09 delete removes every index key of an expiring
+    /// addressable target, including the lifecycle databases.
+    #[test]
+    fn deletion_removes_all_index_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+        let signer = key(1);
+        let pk = format!("{}", signer.x_only_public_key().0);
+        let target = event(
+            &signer,
+            30_023,
+            100,
+            &json!([["d", "art"], ["expiration", "999999999"], ["t", "x"]]),
+            "v",
+        );
+        let kind5 = event(
+            &signer,
+            5,
+            200,
+            &json!([
+                ["e", format!("{}", target.id())],
+                ["a", format!("30023:{pk}:art")]
+            ]),
+            "",
+        );
+        let written = store
+            .write(&[Arc::clone(&target), Arc::clone(&kind5)])
+            .unwrap();
+        assert_eq!(written.deleted, vec![1]);
+        assert_seq_gone(&store, 1);
+        let txn = store.read_txn().unwrap();
+        assert!(store.ix_id.get(&txn, &target.id().0).unwrap().is_none());
+        assert!(
+            store
+                .ix_replace
+                .get(&txn, &target.address().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        drop(txn);
+        // Deleting the kind 5 removes its own lifecycle index rows.
+        assert_eq!(store.delete(&[2]).unwrap(), 1);
+        assert_seq_gone(&store, 2);
+    }
+
+    /// `expire` removes every index key of the swept events, and the
+    /// `ix_replace` entry of a long `d` survives nowhere.
+    #[test]
+    fn expire_removes_all_index_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+        let signer = key(1);
+        let long_d = "d".repeat(300);
+        let target = event(
+            &signer,
+            30_002,
+            100,
+            &json!([["d", long_d], ["expiration", "150"], ["t", "x"]]),
+            "v",
+        );
+        store.write(&[Arc::clone(&target)]).unwrap();
+        assert_eq!(store.expire(200, 10).unwrap(), 1);
+        assert_seq_gone(&store, 1);
+        let txn = store.read_txn().unwrap();
+        assert!(store.ix_id.get(&txn, &target.id().0).unwrap().is_none());
+        assert!(
+            store
+                .ix_replace
+                .get(&txn, &target.address().unwrap())
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -56,12 +56,13 @@ pub struct PackedEvent(Box<[u8]>);
 
 impl PackedEvent {
     /// Build the packed record for an event. Tags that cannot be packed are
-    /// skipped; a valid `expiration` first value (NIP-40) fills the header.
+    /// skipped; `expiration` fills the header (`0` = absent, NIP-40).
     pub fn build<I, T, S>(
         id: &EventId,
         pubkey: &PublicKey,
         created_at: u64,
         kind: Kind,
+        expiration: u64,
         tags: I,
     ) -> Self
     where
@@ -74,23 +75,14 @@ impl PackedEvent {
         out.extend_from_slice(&pubkey.0);
         out.extend_from_slice(&created_at.to_le_bytes());
         out.extend_from_slice(&kind.0.to_le_bytes());
-        let expiration_pos = out.len();
-        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&expiration.to_le_bytes());
 
-        let mut expiration = 0u64;
         for tag in tags {
             let els = tag.as_ref();
             let Some(name) = els.first() else {
                 continue;
             };
             let name = name.as_ref();
-            if name == "expiration" {
-                expiration = els
-                    .get(1)
-                    .and_then(|v| v.as_ref().parse::<u64>().ok())
-                    .unwrap_or(expiration);
-                continue;
-            }
             if name.len() != 1 {
                 continue;
             }
@@ -104,10 +96,6 @@ impl PackedEvent {
             out.push(name);
             out.push(u8::try_from(value.as_bytes().len()).unwrap_or(u8::MAX));
             out.extend_from_slice(value.as_bytes());
-        }
-
-        if let Some(slot) = out.get_mut(expiration_pos..expiration_pos + 8) {
-            slot.copy_from_slice(&expiration.to_le_bytes());
         }
         Self(out.into_boxed_slice())
     }

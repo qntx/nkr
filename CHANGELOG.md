@@ -12,6 +12,23 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- NIP-09 event deletion: kind-5 `e` tags delete the author's own events
+  by id and `a` tags delete the author's own replaceable/addressable
+  events at an address (versions with `created_at` not newer than the
+  deletion request). Republishing a deleted event or address is
+  rejected with `blocked: deleted by its author`; deleting the kind 5
+  itself lifts the block. Deleting a deletion request has no effect.
+- NIP-40 event expiration: the first `expiration` tag is validated at
+  ingest (missing, non-decimal, or sub-100 values are rejected) and an
+  already-expired event is refused with `invalid: event has expired`.
+  Stored events are hidden from every `REQ` at their timestamp and
+  swept by the writer on a 10-second timer.
+- `Store::delete` (delete by seq) and `Store::expire` (sweep expired
+  events, capped per call) in `nosfry-lmdb`; `WriteOutcome::Deleted`
+  reports a blocked republish.
+- `nosfry delete [--dry-run] <filter-json>` deletes every stored event
+  matching a `REQ` filter (including already-expired ones) and prints
+  the count; `ImportStats` gains a `blocked` field for blocked imports.
 - Multi-arch container image published to `ghcr.io/qntx/nosfry` on tag
   pushes: distroless non-root runtime, `NOSFRY_CONFIG` pointing at a
   bundled config with `/data` as the database volume.
@@ -33,6 +50,15 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Changed
 
+- The LMDB format version is now 2 (three new lifecycle databases);
+  databases created by 0.1.0 cannot be opened. Since 0.1.0 had no
+  `export`, a 0.1.0 database must be re-imported from its source.
+- `Store::write` returns `Written { outcomes, deleted }`, listing every
+  seq removed inside the same transaction, instead of the bare outcome
+  list.
+- `Scan::new` takes a `now` argument (an event expiring at or before it
+  is hidden and never counted) and its emit callback receives
+  `(seq, json)`.
 - `--config` is a global flag on the `nosfry` binary: it works before
   or after the subcommand, not just on `relay`.
 - All logs go to stderr (previously stdout), keeping stdout clean for

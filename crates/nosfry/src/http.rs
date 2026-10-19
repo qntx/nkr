@@ -158,7 +158,7 @@ pub(crate) fn nip11(config: &Config) -> String {
     let relay = &config.relay;
     let mut doc = json!({
         "name": relay.info.name,
-        "supported_nips": [1, 11],
+        "supported_nips": [1, 9, 11, 40],
         "software": "https://github.com/qntx/nosfry",
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {

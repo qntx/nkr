@@ -41,6 +41,7 @@ fn monitors_matches(c: &mut Criterion) {
         &PublicKey([2; 32]),
         1_700_000_000,
         Kind(1),
+        0,
         Vec::<Vec<String>>::new(),
     );
     let packed = event.packed();

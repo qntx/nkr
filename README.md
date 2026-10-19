@@ -4,9 +4,10 @@
 
 High-performance Nostr relay in Rust, for bare-metal servers and Cloudflare Workers.
 
-Status: 0.1. The native relay serves NIP-01 and NIP-11; the strfry
-feature-parity layer (NIP-09, 40, 42, 45, 70, 77, plugins, metrics) is
-in progress. Linux and macOS are supported.
+Status: 0.1. The native relay serves NIP-01, NIP-09 (event deletion),
+NIP-11, and NIP-40 (event expiration); the remaining strfry
+feature-parity layer (NIP-42, 45, 70, 77, plugins, metrics) is in
+progress. Linux and macOS are supported.
 
 - `nosfry-core` — sans-IO protocol core (`wasm32-unknown-unknown` clean)
 - `nosfry-lmdb` — synchronous LMDB event store (native only)
@@ -76,6 +77,7 @@ write logs to stderr; event output goes to stdout.
 nosfry export [--since <unix>] [--until <unix>] [--reverse] > dump.jsonl
 nosfry import [--show-rejected] < dump.jsonl
 nosfry scan '{"kinds":[1],"limit":10}' [--count]
+nosfry delete [--dry-run] '{"kinds":[1]}'
 nosfry compact <dest-file>
 ```
 
@@ -90,12 +92,15 @@ nosfry compact <dest-file>
   to live subscriptions.
 - `scan` runs a `REQ` filter over the whole database in newest-first
   order; `--count` prints the match count only.
+- `delete` removes every stored event matching a `REQ` filter and
+  prints the deleted count; `--dry-run` prints the count without
+  deleting. Already-expired events still match the filter.
 - `compact` writes a compacted copy of the database to a new file and
   refuses to overwrite an existing one.
 
-`export`, `scan`, and `compact` fail with `no database at <path>` when
-`<db.path>/data.mdb` does not exist; `import` creates the database like
-`relay` does.
+`export`, `scan`, `delete`, and `compact` fail with `no database at
+<path>` when `<db.path>/data.mdb` does not exist; `import` creates the
+database like `relay` does.
 
 ## License
 
