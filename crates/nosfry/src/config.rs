@@ -44,6 +44,9 @@ pub struct Relay {
     pub bind: IpAddr,
     /// Bind port.
     pub port: u16,
+    /// Soft open-file limit to raise to at startup, capped by the hard
+    /// limit (0 = leave unchanged).
+    pub nofiles: u64,
     /// Header carrying the real client IP (empty = socket address).
     pub real_ip_header: String,
     /// Maximum inbound WebSocket payload in bytes.
@@ -116,6 +119,7 @@ impl Default for Relay {
         Self {
             bind: IpAddr::from([127, 0, 0, 1]),
             port: 7_777,
+            nofiles: 1_000_000,
             real_ip_header: String::new(),
             max_websocket_payload_size: 131_072,
             auto_ping_seconds: 55,
@@ -202,5 +206,19 @@ mod tests {
         let text = include_str!("../../../nosfry.example.toml");
         let parsed: Config = toml::from_str(text).unwrap();
         assert_eq!(parsed, Config::default());
+    }
+
+    /// `relay.nofiles` defaults to strfry's `1_000_000`; `0` disables.
+    #[test]
+    fn nofiles_default_and_zero() {
+        assert_eq!(Config::default().relay.nofiles, 1_000_000);
+        let parsed: Config = toml::from_str("[relay]\nnofiles = 0\n").unwrap();
+        assert_eq!(parsed.relay.nofiles, 0);
+    }
+
+    /// Unknown keys stay rejected.
+    #[test]
+    fn unknown_key_rejected() {
+        assert!(toml::from_str::<Config>("[relay]\nbogus = 1\n").is_err());
     }
 }

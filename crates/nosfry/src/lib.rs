@@ -29,6 +29,7 @@ use std::time::Duration;
 use axum::serve::ListenerExt;
 use clap as _;
 use nosfry_lmdb::Store;
+use rlimit as _;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber as _;

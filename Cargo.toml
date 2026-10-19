@@ -48,6 +48,7 @@ toml               = "1.1.6"
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tokio-util         = { version = "0.7.20", features = ["rt"] }
+rlimit             = "0.11.0"
 
 [profile.release]
 codegen-units = 1
