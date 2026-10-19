@@ -115,6 +115,30 @@ async fn shutdown_signal() {
     tokio::signal::ctrl_c().await.ok();
 }
 
+/// Re-read the config file on every SIGHUP and forward it to the
+/// server's reload channel. A parse/validation failure logs the error
+/// and keeps the running configuration.
+#[cfg(unix)]
+async fn reload_on_sighup(path: PathBuf, tx: tokio::sync::watch::Sender<Config>) {
+    let mut hup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(hup) => hup,
+        Err(err) => {
+            tracing::warn!(%err, "SIGHUP handler unavailable");
+            return;
+        }
+    };
+    while hup.recv().await.is_some() {
+        match Config::load(&path) {
+            Ok(config) => drop(tx.send(config)),
+            Err(err) => tracing::error!(
+                %err,
+                path = %path.display(),
+                "config reload failed, keeping the running configuration"
+            ),
+        }
+    }
+}
+
 /// Open an existing database for a read-only command.
 fn open_existing(config: &Config) -> Result<Store, Box<dyn std::error::Error>> {
     if !config.db.path.join("data.mdb").exists() {
@@ -147,7 +171,7 @@ fn is_broken_pipe(mut err: &(dyn std::error::Error + 'static)) -> bool {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&cli.config)?;
     match cli.command {
-        Cmd::Relay => relay(config).await,
+        Cmd::Relay => relay(config, cli.config).await,
         Cmd::Export {
             since,
             until,
@@ -177,14 +201,19 @@ fn raise_nofile_limit(target: u64) {
     }
 }
 
-async fn relay(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn relay(config: Config, path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     raise_nofile_limit(config.relay.nofiles);
     let addr = (config.relay.bind, config.relay.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|err| format!("bind {addr:?}: {err}"))?;
     tracing::info!(?addr, "listening");
-    nosfry::serve(config, listener, shutdown_signal()).await?;
+    let (reload_tx, reload_rx) = tokio::sync::watch::channel(config.clone());
+    #[cfg(unix)]
+    tokio::spawn(reload_on_sighup(path, reload_tx));
+    #[cfg(not(unix))]
+    drop(reload_tx);
+    nosfry::serve(config, listener, shutdown_signal(), reload_rx).await?;
     Ok(())
 }
 

@@ -244,6 +244,56 @@ impl Config {
             no_read_ahead: self.db.no_read_ahead,
         }
     }
+
+    /// Merge a reloaded config into the running one: every restart-only
+    /// field keeps the running value, everything else follows `new`.
+    /// Returns the effective config plus the names of the restart-only
+    /// keys that differed (the server warns about them once per reload).
+    ///
+    /// Restart-only: `[db]`, `relay.bind`, `relay.port`,
+    /// `relay.nofiles`, `relay.metrics` (route registration),
+    /// `relay.query_timeslice_budget_microseconds`, `relay.threads`,
+    /// `relay.limits.max_filter_limit` (reader threads hold it).
+    #[must_use]
+    pub fn reloadable_from(&self, mut new: Self) -> (Self, Vec<&'static str>) {
+        let mut ignored = Vec::new();
+        if new.db != self.db {
+            ignored.push("db");
+            new.db.clone_from(&self.db);
+        }
+        let running = &self.relay;
+        let relay = &mut new.relay;
+        if relay.bind != running.bind {
+            ignored.push("relay.bind");
+            relay.bind = running.bind;
+        }
+        if relay.port != running.port {
+            ignored.push("relay.port");
+            relay.port = running.port;
+        }
+        if relay.nofiles != running.nofiles {
+            ignored.push("relay.nofiles");
+            relay.nofiles = running.nofiles;
+        }
+        if relay.metrics != running.metrics {
+            ignored.push("relay.metrics");
+            relay.metrics = running.metrics;
+        }
+        if relay.query_timeslice_budget_microseconds != running.query_timeslice_budget_microseconds
+        {
+            ignored.push("relay.query_timeslice_budget_microseconds");
+            relay.query_timeslice_budget_microseconds = running.query_timeslice_budget_microseconds;
+        }
+        if relay.threads != running.threads {
+            ignored.push("relay.threads");
+            relay.threads = running.threads;
+        }
+        if relay.limits.max_filter_limit != running.limits.max_filter_limit {
+            ignored.push("relay.limits.max_filter_limit");
+            relay.limits.max_filter_limit = running.limits.max_filter_limit;
+        }
+        (new, ignored)
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +321,51 @@ mod tests {
     #[test]
     fn unknown_key_rejected() {
         assert!(toml::from_str::<Config>("[relay]\nbogus = 1\n").is_err());
+    }
+
+    /// Restart-only fields keep the running value and are reported;
+    /// reloadable fields pass through.
+    #[test]
+    fn reloadable_from() {
+        let running = Config::default();
+        let mut new = Config::default();
+        new.db.path = PathBuf::from("/elsewhere");
+        new.relay.port = 9_999;
+        new.relay.nofiles = 0;
+        new.relay.metrics = true;
+        new.relay.query_timeslice_budget_microseconds = 1;
+        new.relay.threads.readers = 9;
+        new.relay.limits.max_filter_limit = 1;
+        new.relay.info.name = "reloaded".into();
+        new.relay.rate_limits.events_per_second = 5;
+        new.relay.write_policy.plugin = "/bin/true".into();
+        let (merged, ignored) = running.reloadable_from(new);
+        assert_eq!(
+            ignored,
+            [
+                "db",
+                "relay.port",
+                "relay.nofiles",
+                "relay.metrics",
+                "relay.query_timeslice_budget_microseconds",
+                "relay.threads",
+                "relay.limits.max_filter_limit",
+            ]
+        );
+        assert_eq!(merged.db.path, running.db.path);
+        assert_eq!(merged.relay.port, running.relay.port);
+        assert_eq!(merged.relay.info.name, "reloaded");
+        assert_eq!(merged.relay.rate_limits.events_per_second, 5);
+        assert_eq!(merged.relay.write_policy.plugin, "/bin/true");
+    }
+
+    /// An unchanged reload reports nothing.
+    #[test]
+    fn reloadable_from_noop() {
+        let running = Config::default();
+        let (merged, ignored) = running.clone().reloadable_from(running);
+        let expected: [&str; 0] = [];
+        assert_eq!(ignored, expected);
+        assert_eq!(merged, Config::default());
     }
 }

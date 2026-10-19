@@ -21,7 +21,7 @@ use nosfry_core::event::{Event, EventLimits, UnverifiedEvent};
 use secp256k1::{Keypair, SecretKey, schnorr};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 /// Fixed `n`-th test keypair.
 pub fn key(n: u8) -> Keypair {
@@ -95,6 +95,8 @@ pub fn config() -> Config {
 pub struct Relay {
     /// Bound address.
     pub addr: SocketAddr,
+    /// Push a config reload (the SIGHUP path's channel end).
+    reload_tx: watch::Sender<Config>,
     stop: oneshot::Sender<()>,
     handle: tokio::task::JoinHandle<()>,
     /// Keep the store directory alive.
@@ -115,14 +117,20 @@ impl Relay {
             config.db.path = dir.path().to_path_buf();
         }
         let (tx, rx) = oneshot::channel();
+        let (reload_tx, reload_rx) = watch::channel(config.clone());
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            nosfry::serve(config, listener, async {
-                rx.await.ok();
-            })
+            nosfry::serve(
+                config,
+                listener,
+                async {
+                    rx.await.ok();
+                },
+                reload_rx,
+            )
             .await
             .unwrap();
         });
@@ -135,10 +143,17 @@ impl Relay {
         }
         Self {
             addr,
+            reload_tx,
             stop: tx,
             handle,
             _dir: dir,
         }
+    }
+
+    /// Send a config through the reload channel (what SIGHUP does in
+    /// the binary).
+    pub fn reload(&self, config: Config) {
+        self.reload_tx.send(config).unwrap();
     }
 
     /// A websocket client connection.

@@ -75,6 +75,16 @@ down`; CLOSE is never charged.
   path reloads when its mtime changes; any failure rejects the event
   with `error: internal error` and restarts the process for the next
   event. `nosfry import` does not invoke the plugin.
+- Configuration hot reload (unix): SIGHUP makes the binary re-read its
+  config file and apply it live — a parse error is logged and the
+  running configuration is kept. Session limits and connection options
+  apply to new connections and new publishes; `max_connections` /
+  `max_connections_per_ip` and the write-policy plugin take effect for
+  every connection at once. Restart-only keys (`[db]`, `relay.bind`,
+  `relay.port`, `relay.nofiles`, `relay.metrics`, `relay.threads`,
+  `relay.query_timeslice_budget_microseconds`,
+  `relay.limits.max_filter_limit`) keep their startup values and are
+  logged as ignored.
 
 ### Changed
 
@@ -93,6 +103,11 @@ down`; CLOSE is never charged.
 - A write-policy `reject` with an empty or absent `msg` answers
   `blocked: rejected by write policy` instead of strfry's bare empty
   message, because NIP-01 expects a prefixed rejection reason.
+- `nosfry::serve` takes a `watch::Receiver<Config>` reload channel; the
+  binary sends each config loaded on SIGHUP. Server state readers now
+  go through `watch::Receiver<Arc<Live>>` instead of `Arc<Config>` —
+  `ConnectionLimiter`'s caps are atomics, and `client_ip` /
+  `try_acquire` already take the mandatory `IpAddr`.
 - The LMDB format version is now 2 (three new lifecycle databases);
   databases created by 0.1.0 cannot be opened. Since 0.1.0 had no
   `export`, a 0.1.0 database must be re-imported from its source.
