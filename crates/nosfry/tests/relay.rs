@@ -841,3 +841,154 @@ async fn nip40_expiring_event_hidden_after_expiry() {
     assert!(got.is_empty(), "expired event still served: {got:?}");
     relay.stop().await;
 }
+
+/// A client holding a TCP connection without finishing its request
+/// head is dropped once the header-read deadline passes (slowloris).
+#[tokio::test]
+async fn incomplete_request_headers_time_out() {
+    let relay = Relay::start().await;
+    let mut tcp = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    // A partial request line and one header, never completed.
+    tcp.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    let start = Instant::now();
+    let mut buf = [0u8; 64];
+    let read = tokio::time::timeout(Duration::from_secs(12), tcp.read(&mut buf)).await;
+    match read {
+        Ok(Ok(0) | Err(..)) => {}
+        Ok(Ok(n)) => panic!("server kept a stalled request head alive: {n} bytes read"),
+        Err(..) => panic!("header-read deadline never fired"),
+    }
+    assert!(
+        start.elapsed() >= Duration::from_secs(9),
+        "connection closed early: {:?}",
+        start.elapsed()
+    );
+    relay.stop().await;
+}
+
+/// A client-sent (masked) frame; `first` carries FIN/RSV/opcode.
+fn masked_frame(first: u8, payload: &[u8]) -> Vec<u8> {
+    let mask = [0x11, 0x22, 0x33, 0x44];
+    let mut frame = vec![first];
+    match payload.len() {
+        0..=125 => frame.push(0x80 | u8::try_from(payload.len()).unwrap()),
+        126..=65535 => {
+            frame.push(0x80 | 0x7E);
+            frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        }
+        n => {
+            frame.push(0x80 | 0x7F);
+            frame.extend_from_slice(&u64::try_from(n).unwrap().to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(&mask);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    frame
+}
+
+/// Read raw (unmasked) server frames into `(opcode, payload)` pairs.
+async fn read_server_frames(tcp: &mut tokio::net::TcpStream) -> Vec<(u8, Vec<u8>)> {
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let mut frames = Vec::new();
+    let mut i = 0;
+    while i + 2 <= buf.len() {
+        let opcode = buf[i] & 0x0f;
+        let (len, hdr) = match buf[i + 1] & 0x7f {
+            126 if i + 4 <= buf.len() => {
+                (usize::from(u16::from_be_bytes([buf[i + 2], buf[i + 3]])), 4)
+            }
+            127 if i + 10 <= buf.len() => (
+                usize::try_from(u64::from_be_bytes(buf[i + 2..i + 10].try_into().unwrap()))
+                    .unwrap(),
+                10,
+            ),
+            n @ 0..=125 => (usize::from(n), 2),
+            _ => break,
+        };
+        if i + hdr + len > buf.len() {
+            break;
+        }
+        frames.push((opcode, buf[i + hdr..i + hdr + len].to_vec()));
+        i += hdr + len;
+    }
+    frames
+}
+
+/// With the default config permessage-deflate is off: a client offering
+/// it gets no extension header back, and a compressed (RSV1) frame is a
+/// protocol error.
+#[tokio::test]
+async fn compression_not_negotiated_and_rsv1_rejected() {
+    let relay = Relay::start().await;
+    let mut tcp = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+        relay.addr
+    );
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = tcp.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "upgrade failed: {response:?}");
+        response.extend_from_slice(&chunk[..n]);
+    }
+    assert!(response.starts_with(b"HTTP/1.1 101"), "{response:?}");
+    let head = String::from_utf8_lossy(&response).to_lowercase();
+    assert!(
+        !head.contains("sec-websocket-extensions"),
+        "compression negotiated despite being off: {head}"
+    );
+
+    // A compressed frame (FIN|RSV1|text) must close the connection,
+    // not be processed. yawc queues a 1002 close frame but drops the
+    // socket without flushing it, so EOF is the observable signal.
+    tcp.write_all(&masked_frame(0xC1, b"hi")).await.unwrap();
+    let mut close_code = None;
+    tokio::time::timeout(T, async {
+        for (opcode, payload) in read_server_frames(&mut tcp).await {
+            if opcode == 0x8 && payload.len() >= 2 {
+                close_code = Some(u16::from_be_bytes([payload[0], payload[1]]));
+            }
+        }
+    })
+    .await
+    .expect("RSV1 frame did not close the connection");
+    assert!(close_code.is_none() || close_code == Some(1002));
+    relay.stop().await;
+}
+
+/// Automatic pongs flush on inbound pings: 1000 back-to-back pings get
+/// their pongs without waiting for other outbound traffic.
+#[tokio::test]
+async fn pings_are_answered_while_idle() {
+    const N: u64 = 1_000;
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    for i in 0..N {
+        ws.send(yawc::frame::Frame::ping(i.to_le_bytes().to_vec()))
+            .await
+            .unwrap();
+    }
+    let mut pongs = 0u64;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pongs < N {
+            let frame = ws.next().await.expect("connection closed");
+            match frame.opcode() {
+                yawc::OpCode::Pong => pongs += 1,
+                yawc::OpCode::Ping => ws.send(yawc::frame::Frame::pong(Vec::new())).await.unwrap(),
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("pongs did not arrive");
+    assert_eq!(pongs, N);
+    relay.stop().await;
+}

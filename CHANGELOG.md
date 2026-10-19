@@ -67,6 +67,29 @@ The format is based on [Keep a Changelog]; this project follows
   or after the subcommand, not just on `relay`.
 - All logs go to stderr (previously stdout), keeping stdout clean for
   `export` and `scan` output.
+- `ServerError::Serve` is renamed to `ServerError::Shutdown`: it now
+  wraps the `JoinError` of the worker-shutdown task (it previously
+  wrapped `std::io::Error`).
+
+### Security
+
+- `relay.compression.enabled` now defaults to `false`: yawc bounds the
+  compressed frame size, not the inflated one, so a permessage-deflate
+  message could decompress hundreds of times past
+  `max_websocket_payload_size`. Enable it only for trusted clients.
+- `real_ip_header` now trusts the *last* comma-separated value parsed
+  as an `IpAddr` (the entry written by the proxy in front), falling
+  back to the socket peer on missing or unparsable values — the first
+  value is client-controlled.
+- The HTTP listener now enforces a 10-second request-header read
+  deadline (`axum::serve` installed no timer, so slowloris connections
+  were held indefinitely) via an explicit hyper HTTP/1 accept loop
+  with graceful shutdown.
+- Inbound pings now flush their pong under the normal write deadline:
+  a stalled pong write ends the connection instead of letting yawc's
+  `obligated_sends` queue grow.
+- Reader scans alternate between new and resumed queues, so a sustained
+  stream of new `REQ`s can no longer starve long-running scans.
 
 ## [0.1.0] - 2026-10-19
 

@@ -47,7 +47,9 @@ pub struct Relay {
     /// Soft open-file limit to raise to at startup, capped by the hard
     /// limit (0 = leave unchanged).
     pub nofiles: u64,
-    /// Header carrying the real client IP (empty = socket address).
+    /// Header carrying the real client IP; its last comma-separated
+    /// value is trusted, so set it only behind a proxy that sets or
+    /// appends the header (empty = socket address).
     pub real_ip_header: String,
     /// Maximum inbound WebSocket payload in bytes.
     pub max_websocket_payload_size: usize,
@@ -81,7 +83,10 @@ pub struct Threads {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Compression {
-    /// Negotiate permessage-deflate.
+    /// Negotiate permessage-deflate. Off by default: yawc only bounds
+    /// the *compressed* frame sizes, so a small frame can inflate far
+    /// beyond `max_websocket_payload_size` — enable it only for trusted
+    /// clients.
     pub enabled: bool,
     /// Keep the LZ77 sliding window between messages.
     pub sliding_window: bool,
@@ -145,7 +150,7 @@ impl Default for Threads {
 impl Default for Compression {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             sliding_window: true,
         }
     }

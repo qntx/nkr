@@ -26,12 +26,18 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use axum::serve::ListenerExt;
+use axum::body::Body;
+use axum::extract::ConnectInfo;
 use clap as _;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use nosfry_lmdb::Store;
 use rlimit as _;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+use tower::ServiceExt as _;
 use tracing_subscriber as _;
 
 use crate::channels::{ReaderMsg, ShardMsg, WriterMsg};
@@ -57,9 +63,9 @@ pub enum ServerError {
     /// TOML parse failure.
     #[error("config: {0}")]
     Config(#[from] toml::de::Error),
-    /// The HTTP listener failed.
-    #[error("serve: {0}")]
-    Serve(#[source] std::io::Error),
+    /// The worker shutdown task failed.
+    #[error("worker shutdown: {0}")]
+    Shutdown(#[source] tokio::task::JoinError),
     /// A worker thread failed to start.
     #[error("thread spawn failed: {0}")]
     Spawn(#[source] std::io::Error),
@@ -221,12 +227,113 @@ impl Server {
     }
 }
 
+/// Read deadline for a complete HTTP request head: a client holding a
+/// connection without finishing its headers is dropped (slowloris).
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether an `accept` error belongs to one dying connection and can be
+/// skipped. Anything else (e.g. `EMFILE`) is logged and the accept loop
+/// backs off for a second, as `axum::serve` does.
+fn is_connection_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Accept HTTP/1 connections until `shutdown` resolves, serving each
+/// with a header-read deadline `axum::serve` cannot set. In-flight
+/// connections get `graceful_shutdown` once `http_stop` fires.
+async fn accept_loop(
+    listener: &TcpListener,
+    router: &axum::Router,
+    shutdown: impl Future<Output = ()>,
+    http_stop_rx: &watch::Receiver<()>,
+    http_tracker: &tokio_util::task::TaskTracker,
+) {
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        let (tcp, peer) = tokio::select! {
+            res = listener.accept() => match res {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    if !is_connection_error(&err) {
+                        tracing::error!(%err, "accept error");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    continue;
+                }
+            },
+            () = &mut shutdown => break,
+        };
+        spawn_connection(tcp, peer, router, http_stop_rx, http_tracker);
+    }
+}
+
+/// Serve one accepted socket with the header-read deadline, tracked by
+/// `http_tracker` and gracefully shut down when `http_stop` fires.
+fn spawn_connection(
+    tcp: tokio::net::TcpStream,
+    peer: std::net::SocketAddr,
+    router: &axum::Router,
+    http_stop_rx: &watch::Receiver<()>,
+    http_tracker: &tokio_util::task::TaskTracker,
+) {
+    if let Err(err) = tcp.set_nodelay(true) {
+        tracing::warn!(%err, "failed to set TCP_NODELAY");
+    }
+    let service = TowerToHyperService::new(router.clone().into_service().map_request(
+        move |mut req: hyper::Request<Incoming>| {
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req.map(Body::new)
+        },
+    ));
+    let conn = http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(HEADER_READ_TIMEOUT)
+        .serve_connection(TokioIo::new(tcp), service)
+        .with_upgrades();
+    let mut conn = Box::pin(conn);
+    let mut conn_stop = http_stop_rx.clone();
+    http_tracker.spawn(async move {
+        tokio::select! {
+            res = conn.as_mut() => {
+                if let Err(err) = res {
+                    tracing::debug!(%err, "connection error");
+                }
+                return;
+            }
+            _ = conn_stop.changed() => {}
+        }
+        conn.as_mut().graceful_shutdown();
+        if let Err(err) = conn.as_mut().await {
+            tracing::debug!(%err, "connection error");
+        }
+    });
+}
+
+/// Close a task tracker and await it with the shutdown deadline.
+async fn wait_for(tracker: &tokio_util::task::TaskTracker, what: &str) {
+    tracker.close();
+    if tokio::time::timeout(Duration::from_secs(10), tracker.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            remaining = tracker.len(),
+            "shutdown deadline hit with {what}"
+        );
+    }
+}
+
 /// Run the relay until `shutdown` resolves.
 ///
 /// # Errors
 ///
-/// [`ServerError::Store`], [`ServerError::Spawn`], or
-/// [`ServerError::Serve`] on listener/serve failure.
+/// [`ServerError::Store`] or [`ServerError::Spawn`] on startup, or
+/// [`ServerError::Shutdown`] when the worker-join task fails.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
@@ -235,37 +342,37 @@ pub async fn serve(
     let server = Server::new(config)?;
     let stop = server.stop_tx.clone();
     let tracker = server.state.conn.tracker.clone();
-    axum::serve(
-        listener.tap_io(|tcp: &mut tokio::net::TcpStream| {
-            if let Err(err) = tcp.set_nodelay(true) {
-                tracing::warn!(%err, "failed to set TCP_NODELAY");
-            }
-        }),
-        server
-            .router()
-            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    // HTTP/1 only, with a header-read deadline `axum::serve` cannot set.
+    // `http_stop` asks every in-flight connection to shut down
+    // gracefully; `http_tracker` awaits them.
+    let (http_stop, http_stop_rx) = watch::channel(());
+    let http_tracker = tokio_util::task::TaskTracker::new();
+    let router = server.router();
+    accept_loop(
+        &listener,
+        &router,
+        async move {
+            shutdown.await;
+            stop.send_replace(true);
+        },
+        &http_stop_rx,
+        &http_tracker,
     )
-    .with_graceful_shutdown(async move {
-        shutdown.await;
-        stop.send_replace(true);
-    })
-    .await
-    .map_err(ServerError::Serve)?;
+    .await;
+    // The router holds an AppState (writer/shard senders): drop it so
+    // `server.stop()`'s channel teardown can complete.
+    drop(router);
+    // Gracefully close in-flight HTTP connections (idle keep-alive and
+    // mid-read conns end promptly), bounded by the shutdown deadline.
+    drop(http_stop_rx);
+    http_stop.send_replace(());
+    wait_for(&http_tracker, "open HTTP connections").await;
     // Stop accepting new connection tasks, then give live ones a
     // deadline to close (the watch signal already went out).
-    tracker.close();
-    if tokio::time::timeout(Duration::from_secs(10), tracker.wait())
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            remaining = tracker.len(),
-            "shutdown deadline hit with open connections"
-        );
-    }
+    wait_for(&tracker, "open connections").await;
     // Joining worker threads blocks; keep it off the runtime.
     tokio::task::spawn_blocking(move || server.stop())
         .await
-        .map_err(|e| ServerError::Serve(std::io::Error::other(e)))?;
+        .map_err(ServerError::Shutdown)?;
     Ok(())
 }

@@ -29,6 +29,11 @@ At startup the relay raises its soft open-file limit to `relay.nofiles`
 `LimitNOFILE=` and `docker --ulimit nofile=` are only needed to lift the
 hard limit above its default (systemd/containerd: 524288).
 
+`relay.compression.enabled` (permessage-deflate) is off by default:
+yawc bounds the *compressed* frame size, not the inflated one, so a
+compressed message can decompress far past `max_websocket_payload_size`
+— enable it only for trusted clients.
+
 ### systemd
 
 ```ini
