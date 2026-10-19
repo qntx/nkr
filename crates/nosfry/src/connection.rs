@@ -3,6 +3,7 @@
 //! scan control to the reader).
 
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +19,7 @@ use yawc::{Frame, HttpWebSocket, OpCode};
 
 use crate::channels::{ConnId, Out, Outbound, ShardMsg, WriteRequest, WriterMsg, route};
 use crate::metrics::Metrics;
+use crate::policy::{Decision, WritePolicy};
 
 /// Per-connection state handed down from the server.
 #[derive(Debug, Clone)]
@@ -35,6 +37,8 @@ pub(crate) struct Handle {
     pub(crate) max_pending_outbound: usize,
     /// Process-wide counters.
     pub(crate) metrics: Arc<Metrics>,
+    /// Write-policy plugin (`None` when unconfigured).
+    pub(crate) policy: Option<WritePolicy>,
     /// Broadcast shutdown signal.
     pub(crate) shutdown: watch::Receiver<bool>,
     /// Tracks every live connection task for the shutdown deadline.
@@ -70,6 +74,8 @@ enum WriteError {
 struct Connection<'a> {
     /// Connection id; the shard routing key.
     conn: ConnId,
+    /// The client's IP address (for the write-policy plugin).
+    peer: IpAddr,
     /// Server-wide state.
     handle: &'a Handle,
     /// This connection's monitor shard (register/remove plus the scan
@@ -85,12 +91,13 @@ struct Connection<'a> {
 }
 
 impl<'a> Connection<'a> {
-    fn new(handle: &'a Handle) -> (Self, mpsc::UnboundedReceiver<Out>) {
+    fn new(handle: &'a Handle, peer: IpAddr) -> (Self, mpsc::UnboundedReceiver<Out>) {
         let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         let (out, out_rx) = Outbound::new(handle.max_pending_outbound);
         (
             Self {
                 conn,
+                peer,
                 handle,
                 shard: route(&handle.shards, conn).clone(),
                 session: Session::new(Arc::clone(&handle.limits)),
@@ -189,10 +196,40 @@ impl<'a> Connection<'a> {
         }
     }
 
-    /// Broadcast an ephemeral event or queue a stored write; the writer
-    /// pushes the `OK` onto this connection's `Outbound` itself.
+    /// Ask the write-policy plugin and answer the client when it
+    /// vetoes. `false` means the event stops here: `reject` answers
+    /// `OK false` (`blocked: rejected by write policy` when the plugin
+    /// leaves `msg` empty; strfry would send a bare empty message),
+    /// `shadowReject` answers `OK true` without storing or
+    /// broadcasting.
+    async fn policy_accepts(&self, event: &nosfry_core::event::Event) -> bool {
+        let Some(policy) = &self.handle.policy else {
+            return true;
+        };
+        let (ok, message) = match policy.check(event, self.peer).await {
+            Decision::Accept => return true,
+            Decision::Reject(m) if m.is_empty() => {
+                (false, "blocked: rejected by write policy".to_owned())
+            }
+            Decision::Reject(m) => (false, m),
+            Decision::ShadowReject(m) => (true, m),
+        };
+        self.out.push(Out::Frame {
+            sub: None,
+            verb: RelayVerb::Ok,
+            text: ok_frame(&event.id(), ok, &message),
+        });
+        false
+    }
+
+    /// Run the write-policy plugin (when configured), then broadcast an
+    /// ephemeral event or queue a stored write; the writer pushes the
+    /// `OK` onto this connection's `Outbound` itself.
     async fn publish(&self, event: Arc<nosfry_core::event::Event>) {
         self.handle.metrics.event(u16::from(event.kind()));
+        if !self.policy_accepts(&event).await {
+            return;
+        }
         if event.kind().is_ephemeral() {
             self.broadcast(&event).await;
             self.out.push(Out::Frame {
@@ -422,8 +459,8 @@ impl<'a> Connection<'a> {
 }
 
 /// Run one WebSocket connection until close, error, or shutdown.
-pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle) {
-    let (mut conn, mut out_rx) = Connection::new(handle);
+pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle, peer: IpAddr) {
+    let (mut conn, mut out_rx) = Connection::new(handle, peer);
     let mut ping = tokio::time::interval(handle.ping_interval);
     let mut last_inbound = Instant::now();
     let mut shutdown = handle.shutdown.clone();

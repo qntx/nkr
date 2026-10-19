@@ -27,8 +27,7 @@ fn ip_key(ip: IpAddr) -> IpKey {
 }
 
 /// Caps on simultaneous connections, shared by every accepted socket.
-/// A cap of 0 means unlimited for that dimension; `None` addresses
-/// count toward the total only.
+/// A cap of 0 means unlimited for that dimension.
 #[derive(Debug)]
 pub(crate) struct ConnectionLimiter {
     /// Live connections, counted even when `max_total` is unlimited.
@@ -61,8 +60,8 @@ impl ConnectionLimiter {
 
     /// Count one new connection; `None` when a cap is reached. The
     /// mutex only ever guards a map update, never an `.await`.
-    pub(crate) fn try_acquire(self: &Arc<Self>, ip: Option<IpAddr>) -> Option<ConnectionPermit> {
-        let key = ip.map(ip_key).filter(|_| self.max_per_ip != 0);
+    pub(crate) fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnectionPermit> {
+        let key = (self.max_per_ip != 0).then(|| ip_key(ip));
         if key.is_some_and(|key| !self.take_ip(key)) {
             return None;
         }
@@ -168,7 +167,7 @@ mod tests {
     #[test]
     fn acquire_release_and_map_cleanup() {
         let limiter = Arc::new(ConnectionLimiter::new(0, 2));
-        let ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let first = limiter.try_acquire(ip).unwrap();
         let second = limiter.try_acquire(ip).unwrap();
         assert!(limiter.try_acquire(ip).is_none(), "third exceeds the cap");
@@ -187,7 +186,7 @@ mod tests {
     #[test]
     fn empty_map_after_last_release() {
         let limiter = Arc::new(ConnectionLimiter::new(0, 2));
-        let ip = Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         drop(limiter.try_acquire(ip).unwrap());
         assert!(
             limiter.per_ip.lock().unwrap().is_empty(),
@@ -196,13 +195,14 @@ mod tests {
     }
 
     #[test]
-    fn total_cap_and_none_ip() {
+    fn total_cap() {
         let limiter = Arc::new(ConnectionLimiter::new(1, 0));
-        let any = limiter.try_acquire(None).unwrap();
-        let ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        assert!(limiter.try_acquire(ip).is_none(), "total cap reached");
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let any = limiter.try_acquire(ip).unwrap();
+        let other = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert!(limiter.try_acquire(other).is_none(), "total cap reached");
         drop(any);
-        assert!(limiter.try_acquire(ip).is_some(), "total freed");
+        assert!(limiter.try_acquire(other).is_some(), "total freed");
         // `max_per_ip = 0` tracks no map entries at all.
         assert!(limiter.per_ip.lock().unwrap().is_empty());
     }

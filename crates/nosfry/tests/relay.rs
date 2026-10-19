@@ -1234,3 +1234,371 @@ async fn metrics_count_rejected_upgrades() {
     assert_eq!(metric_value(&body, "nosfry_connections"), Some(1), "{body}");
     relay.stop().await;
 }
+
+// Write-policy plugin tests: real `/bin/sh -c` scripts in tempdirs.
+
+/// The `sed` extraction every test plugin shares: `event.id` is the
+/// first field of the canonical event JSON.
+const PLUGIN_SED: &str =
+    r#"id=$(printf '%s' "$line" | sed -n 's/.*"event":{"id":"\([0-9a-f]\{64\}\)".*/\1/p')"#;
+
+/// A `while read` plugin loop running `body` once per request line.
+fn loop_plugin(body: &str) -> String {
+    format!("while IFS= read -r line; do\n  {PLUGIN_SED}\n  {body}\ndone\n")
+}
+
+/// Write a POSIX `sh` plugin into a tempdir. `/bin/sh -c <path>`
+/// execs the file, so it needs the exec bit; the returned dir keeps
+/// it alive.
+fn write_plugin(script: &str) -> (tempfile::TempDir, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.sh");
+    std::fs::write(&path, script).unwrap();
+    make_executable(&path);
+    (dir, path.to_str().unwrap().to_owned())
+}
+
+/// `chmod +x` for plugin files.
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+/// Relay config with the write-policy plugin enabled.
+fn policy_config(plugin: &str, timeout_seconds: u64) -> nosfry::config::Config {
+    let mut config = common::config();
+    config.relay.write_policy = nosfry::config::WritePolicy {
+        plugin: plugin.to_owned(),
+        timeout_seconds,
+    };
+    config
+}
+
+/// Receive one frame and assert it is `["OK", <event id>, ...]`.
+async fn recv_ok(ws: &mut yawc::TcpWebSocket, event: &nosfry_core::event::Event) -> Value {
+    let ok = json(&recv_text(ws, T).await);
+    assert_eq!(ok[0], "OK", "{ok}");
+    assert_eq!(ok[1], event.id().to_string(), "{ok}");
+    ok
+}
+
+#[tokio::test]
+async fn write_policy_accept_stores_and_delivers() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"printf '{"id":"%s","action":"accept"}\n' "$id""#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut sub = relay.connect().await;
+    send_text(&mut sub, &req_wire("s", r#"{"kinds":[1]}"#)).await;
+    assert_eq!(json(&recv_text(&mut sub, T).await), json!(["EOSE", "s"]));
+
+    let mut pub_ws = relay.connect().await;
+    let ev = common::event(&key(7), 1, now(), &json!([]), "hi");
+    send_text(&mut pub_ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut pub_ws, &ev).await[2], true);
+
+    let live = json(&recv_text(&mut sub, T).await);
+    assert_eq!(live[0], "EVENT");
+    assert_eq!(live[2]["id"], ev.id().to_string());
+
+    let mut query = relay.connect().await;
+    send_text(
+        &mut query,
+        &req_wire("q", &format!(r#"{{"ids":["{}"]}}"#, ev.id())),
+    )
+    .await;
+    assert_eq!(
+        json(&recv_text(&mut query, T).await)[2]["id"],
+        ev.id().to_string()
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_reject_message_and_default() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"case "$line" in
+    *'"kind":2'*) printf '{"id":"%s","action":"reject"}\n' "$id" ;;
+    *) printf '{"id":"%s","action":"reject","msg":"blocked: spam"}\n' "$id" ;;
+  esac"#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut ws = relay.connect().await;
+
+    let ev = common::event(&key(7), 1, now(), &json!([]), "spam");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    let ok = recv_ok(&mut ws, &ev).await;
+    assert_eq!(
+        ok,
+        json!(["OK", ev.id().to_string(), false, "blocked: spam"])
+    );
+
+    // An absent `msg` falls back to the NIP-01 default reason.
+    let ev = common::event(&key(7), 2, now(), &json!([]), "quiet");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    let ok = recv_ok(&mut ws, &ev).await;
+    assert_eq!(
+        ok,
+        json!([
+            "OK",
+            ev.id().to_string(),
+            false,
+            "blocked: rejected by write policy"
+        ])
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_shadow_reject() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"printf '{"id":"%s","action":"shadowReject","msg":"shh"}\n' "$id""#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut sub = relay.connect().await;
+    send_text(&mut sub, &req_wire("s", r#"{"kinds":[1]}"#)).await;
+    assert_eq!(json(&recv_text(&mut sub, T).await), json!(["EOSE", "s"]));
+
+    let mut pub_ws = relay.connect().await;
+    let ev = common::event(&key(7), 1, now(), &json!([]), "ghost");
+    send_text(&mut pub_ws, &event_wire(&ev)).await;
+    assert_eq!(
+        recv_ok(&mut pub_ws, &ev).await,
+        json!(["OK", ev.id().to_string(), true, "shh"])
+    );
+
+    // Not broadcast to the live subscriber and not stored.
+    let mut text_frame = None;
+    drop(
+        tokio::time::timeout(Duration::from_millis(400), async {
+            while let Some(frame) = sub.next().await {
+                if frame.opcode() == yawc::OpCode::Text {
+                    text_frame = Some(String::from_utf8_lossy(frame.payload()).into_owned());
+                }
+            }
+        })
+        .await,
+    );
+    assert!(
+        text_frame.is_none(),
+        "shadow-rejected event reached a subscriber: {text_frame:?}"
+    );
+    let ids = req_ids(&mut pub_ws, "q", r#"{"kinds":[1]}"#).await;
+    assert!(ids.is_empty(), "{ids:?}");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_ephemeral_rejected_not_broadcast() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"case "$line" in
+    *'"kind":20000'*) printf '{"id":"%s","action":"reject","msg":"blocked: eph"}\n' "$id" ;;
+    *) printf '{"id":"%s","action":"accept"}\n' "$id" ;;
+  esac"#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut sub = relay.connect().await;
+    send_text(&mut sub, &req_wire("s", r#"{"kinds":[20000,20001]}"#)).await;
+    assert_eq!(json(&recv_text(&mut sub, T).await), json!(["EOSE", "s"]));
+
+    let mut pub_ws = relay.connect().await;
+    let rejected = common::event(&key(8), 20_000, now(), &json!([]), "no");
+    send_text(&mut pub_ws, &event_wire(&rejected)).await;
+    let ok = recv_ok(&mut pub_ws, &rejected).await;
+    assert_eq!(
+        ok,
+        json!(["OK", rejected.id().to_string(), false, "blocked: eph"])
+    );
+
+    let accepted = common::event(&key(8), 20_001, now(), &json!([]), "yes");
+    send_text(&mut pub_ws, &event_wire(&accepted)).await;
+    assert_eq!(recv_ok(&mut pub_ws, &accepted).await[2], true);
+
+    // Single-stream ordering: had the rejected event been broadcast
+    // it would precede the accepted one.
+    let live = json(&recv_text(&mut sub, T).await);
+    assert_eq!(live[0], "EVENT");
+    assert_eq!(live[2]["id"], accepted.id().to_string());
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_timeout_then_fresh_process() {
+    let (dir, plugin) = write_plugin("exec sleep 60\n");
+    let relay = Relay::start_with(policy_config(&plugin, 1)).await;
+    let mut ws = relay.connect().await;
+
+    let ev = common::event(&key(7), 1, now(), &json!([]), "slow");
+    let started = Instant::now();
+    send_text(&mut ws, &event_wire(&ev)).await;
+    let ok = recv_ok(&mut ws, &ev).await;
+    assert_eq!(
+        ok,
+        json!(["OK", ev.id().to_string(), false, "error: internal error"])
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+
+    // Fix the plugin at the same path: the next event spawns a fresh
+    // process running the new script.
+    std::fs::write(
+        dir.path().join("policy.sh"),
+        loop_plugin(r#"printf '{"id":"%s","action":"accept"}\n' "$id""#),
+    )
+    .unwrap();
+    let ev = common::event(&key(7), 1, now(), &json!([]), "fixed");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_eof_recovers_with_fresh_process() {
+    let (_dir, plugin) = write_plugin(&format!(
+        "IFS= read -r line\n  {PLUGIN_SED}\n  \
+         printf '{{\"id\":\"%s\",\"action\":\"accept\"}}\\n' \"$id\"\n"
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut ws = relay.connect().await;
+
+    // The plugin answers once and exits; the next event discovers the
+    // dead child and is rejected, the one after spawns a fresh plugin.
+    let ev = common::event(&key(7), 1, now(), &json!([]), "one");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    let ev = common::event(&key(7), 1, now(), &json!([]), "two");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(
+        recv_ok(&mut ws, &ev).await,
+        json!(["OK", ev.id().to_string(), false, "error: internal error"])
+    );
+    let ev = common::event(&key(7), 1, now(), &json!([]), "three");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_noise_line_skipped() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"echo "plugin startup noise"
+  printf '{"id":"%s","action":"accept"}\n' "$id""#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(&key(7), 1, now(), &json!([]), "hi");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_id_mismatch_is_internal_error() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"printf '{"id":"0000000000000000000000000000000000000000000000000000000000000000","action":"accept"}\n'"#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(&key(7), 1, now(), &json!([]), "hi");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(
+        recv_ok(&mut ws, &ev).await,
+        json!(["OK", ev.id().to_string(), false, "error: internal error"])
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_mtime_reload() {
+    let (dir, plugin) = write_plugin(&loop_plugin(
+        r#"printf '{"id":"%s","action":"accept"}\n' "$id""#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(&key(7), 1, now(), &json!([]), "before");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+
+    // Rewriting a no-space plugin command reloads it on the next event.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    std::fs::write(
+        dir.path().join("policy.sh"),
+        loop_plugin(r#"printf '{"id":"%s","action":"reject","msg":"blocked: reloaded"}\n' "$id""#),
+    )
+    .unwrap();
+    let ev = common::event(&key(7), 1, now(), &json!([]), "after");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(
+        recv_ok(&mut ws, &ev).await,
+        json!(["OK", ev.id().to_string(), false, "blocked: reloaded"])
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_request_line_shape() {
+    /// The plugin protocol's wire shape, for assertions.
+    #[derive(serde::Deserialize)]
+    struct PluginRequest<'a> {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(borrow)]
+        event: &'a serde_json::value::RawValue,
+        #[serde(rename = "receivedAt")]
+        received_at: u64,
+        #[serde(rename = "sourceType")]
+        source_type: String,
+        #[serde(rename = "sourceInfo")]
+        source_info: String,
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let seen = dir.path().join("requests.jsonl");
+    let plugin = dir.path().join("policy.sh");
+    std::fs::write(
+        &plugin,
+        format!(
+            "while IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{}'\n  \
+             {PLUGIN_SED}\n  \
+             printf '{{\"id\":\"%s\",\"action\":\"accept\"}}\\n' \"$id\"\ndone\n",
+            seen.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&plugin);
+    let relay = Relay::start_with(policy_config(plugin.to_str().unwrap(), 10)).await;
+    let mut ws = relay.connect().await;
+    let before = now();
+    let ev = common::event(&key(7), 1, now(), &json!([]), "probe");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    relay.stop().await;
+
+    let line = std::fs::read_to_string(&seen).unwrap();
+    let request: PluginRequest<'_> = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(request.kind, "new");
+    // The event is embedded raw: byte-identical to the canonical JSON.
+    assert_eq!(request.event.get(), ev.json());
+    assert!(request.received_at >= before && request.received_at <= now());
+    assert_eq!(request.source_type, "IP4");
+    assert_eq!(request.source_info, "127.0.0.1");
+}
+
+#[tokio::test]
+async fn write_policy_does_not_block_shutdown() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"printf '{"id":"%s","action":"accept"}\n' "$id""#,
+    ));
+    let relay = Relay::start_with(policy_config(&plugin, 10)).await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(&key(7), 1, now(), &json!([]), "hi");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    // `stop` joins `serve()`; a stuck policy task would hang this.
+    tokio::time::timeout(T, relay.stop()).await.unwrap();
+}

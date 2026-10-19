@@ -73,6 +73,15 @@ events_burst      = 100
 reqs_per_second   = 20
 reqs_burst        = 100
 
+[relay.write_policy]
+# strfry-compatible write-policy plugin: each verified event is sent
+# to `/bin/sh -c <plugin>` as one JSON line and the plugin answers
+# accept/reject/shadowReject. Empty disables the plugin.
+plugin = ""
+# Seconds the plugin has to answer before the event is rejected with
+# `error: internal error` and the plugin process is restarted.
+timeout_seconds = 10
+
 [relay.threads]
 # Stored-scan reader threads.
 readers = 3

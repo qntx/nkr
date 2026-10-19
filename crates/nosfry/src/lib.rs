@@ -19,6 +19,7 @@ mod connection;
 mod http;
 mod limiter;
 mod metrics;
+mod policy;
 mod reader;
 mod shard;
 mod writer;
@@ -181,6 +182,12 @@ impl Server {
             );
         }
         let metrics = Arc::new(metrics::Metrics::new());
+        let policy = (!config.relay.write_policy.plugin.is_empty()).then(|| {
+            policy::WritePolicy::new(
+                &config.relay.write_policy.plugin,
+                Duration::from_secs(config.relay.write_policy.timeout_seconds),
+            )
+        });
         let conn = connection::Handle {
             writer: writer_tx.clone(),
             shards: Arc::from(shard_txs.as_slice()),
@@ -188,6 +195,7 @@ impl Server {
             ping_interval: Duration::from_secs(config.relay.auto_ping_seconds),
             max_pending_outbound: config.relay.max_pending_outbound_bytes,
             metrics: Arc::clone(&metrics),
+            policy,
             shutdown: stop_rx,
             tracker: tokio_util::task::TaskTracker::new(),
         };

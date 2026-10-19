@@ -77,6 +77,8 @@ pub struct Relay {
     pub threads: Threads,
     /// WebSocket compression.
     pub compression: Compression,
+    /// Write-policy plugin.
+    pub write_policy: WritePolicy,
     /// NIP-11 relay information.
     pub info: Info,
 }
@@ -103,6 +105,30 @@ pub struct Compression {
     pub enabled: bool,
     /// Keep the LZ77 sliding window between messages.
     pub sliding_window: bool,
+}
+
+/// `[relay.write_policy]` — strfry-compatible write-policy plugin.
+///
+/// Plugins written for strfry run unchanged: each verified event is
+/// sent to `/bin/sh -c <plugin>` as one JSON line and the plugin's
+/// `accept`/`reject`/`shadowReject` answer decides its fate.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WritePolicy {
+    /// The plugin command (empty = off). A command without spaces is
+    /// a path and reloads when the file's mtime changes.
+    pub plugin: String,
+    /// Seconds the plugin has to answer each request.
+    pub timeout_seconds: u64,
+}
+
+impl Default for WritePolicy {
+    fn default() -> Self {
+        Self {
+            plugin: String::new(),
+            timeout_seconds: 10,
+        }
+    }
 }
 
 /// `[relay.info]` — NIP-11 document fields.
@@ -150,6 +176,7 @@ impl Default for Relay {
             rate_limits: RateLimits::default(),
             threads: Threads::default(),
             compression: Compression::default(),
+            write_policy: WritePolicy::default(),
             info: Info::default(),
         }
     }
