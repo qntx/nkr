@@ -12,6 +12,7 @@
     )
 )]
 
+pub mod admin;
 mod channels;
 pub mod config;
 mod connection;

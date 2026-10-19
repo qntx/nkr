@@ -26,7 +26,7 @@ use std::time::Duration;
 use common::{event, key};
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
-use nosfry_lmdb::{Progress, Scan, Store, StoreOptions, WriteOutcome};
+use nosfry_lmdb::{Progress, Scan, Store, StoreError, StoreOptions, WriteOutcome};
 use serde_json::json;
 
 fn store() -> (tempfile::TempDir, Store) {
@@ -391,7 +391,7 @@ fn format_mismatch_rejected() {
     let err = Store::open(dir.path(), &StoreOptions::default()).unwrap_err();
     assert!(matches!(
         err,
-        nosfry_lmdb::StoreError::FormatMismatch {
+        StoreError::FormatMismatch {
             found: 9,
             expected: 1
         }
@@ -436,4 +436,124 @@ fn scan_emits_first_group_before_step_ends() {
         .unwrap();
     assert_eq!(progress, Progress::Pending);
     assert!(emitted > 0, "first step emitted nothing");
+}
+
+/// Run an export, collecting every emitted JSON string.
+fn export_lines(store: &Store, since: u64, until: u64, reverse: bool) -> Vec<String> {
+    let lines = RefCell::new(Vec::new());
+    store
+        .export(since, until, reverse, &mut |json| {
+            lines.borrow_mut().push(json.to_owned());
+            Ok(())
+        })
+        .unwrap();
+    lines.into_inner()
+}
+
+#[test]
+fn export_orders_by_created_at_then_seq() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let e1 = event(&k, 1, 100, &json!([]), "a");
+    let e2 = event(&k, 1, 100, &json!([]), "b");
+    let e3 = event(&k, 1, 200, &json!([]), "c");
+    store
+        .write(&[Arc::clone(&e1), Arc::clone(&e2), Arc::clone(&e3)])
+        .unwrap();
+
+    let asc = export_lines(&store, 0, u64::MAX, false);
+    assert_eq!(asc, [e1.json(), e2.json(), e3.json()], "ascending order");
+
+    let desc = export_lines(&store, 0, u64::MAX, true);
+    assert_eq!(
+        desc,
+        [e3.json(), e2.json(), e1.json()],
+        "descending order; the created_at tie is seq-descending"
+    );
+}
+
+#[test]
+fn export_bounds_are_inclusive() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let e1 = event(&k, 1, 100, &json!([]), "a");
+    let e2 = event(&k, 1, 200, &json!([]), "b");
+    let e3 = event(&k, 1, 300, &json!([]), "c");
+    store
+        .write(&[Arc::clone(&e1), Arc::clone(&e2), Arc::clone(&e3)])
+        .unwrap();
+
+    let count = RefCell::new(0u64);
+    let got = store
+        .export(100, 200, false, &mut |json| {
+            *count.borrow_mut() += 1;
+            assert!(json.contains("\"a\"") || json.contains("\"b\""));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(got, 2);
+    assert_eq!(*count.borrow(), 2);
+
+    assert_eq!(export_lines(&store, 0, 99, false), Vec::<String>::new());
+    assert_eq!(
+        export_lines(&store, 101, 300, false),
+        [e2.json(), e3.json()]
+    );
+}
+
+#[test]
+fn export_propagates_emit_errors() {
+    let (_dir, store) = store();
+    let k = key(1);
+    store.write(&[event(&k, 1, 100, &json!([]), "a")]).unwrap();
+    let err = store
+        .export(0, u64::MAX, false, &mut |_| {
+            Err(std::io::Error::other("synthetic"))
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Io(e) if e.kind() == std::io::ErrorKind::Other));
+}
+
+#[test]
+fn compact_to_round_trip() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let events: Vec<_> = (0..10u64)
+        .map(|i| event(&k, 1, 100 + i, &json!([]), &format!("e{i}")))
+        .collect();
+    store.write(&events).unwrap();
+
+    let staging = tempfile::tempdir().unwrap();
+    let dest = staging.path().join("compact.mdb");
+    store.compact_to(&dest).unwrap();
+    assert!(dest.is_file(), "compact_to wrote a single file");
+
+    let fresh = tempfile::tempdir().unwrap();
+    std::fs::rename(&dest, fresh.path().join("data.mdb")).unwrap();
+    let copy = Store::open(fresh.path(), &StoreOptions::default()).unwrap();
+
+    assert_eq!(
+        export_lines(&store, 0, u64::MAX, false),
+        export_lines(&copy, 0, u64::MAX, false),
+        "compacted copy exports identically"
+    );
+    assert_eq!(
+        export_lines(&store, 0, u64::MAX, true),
+        export_lines(&copy, 0, u64::MAX, true)
+    );
+}
+
+#[test]
+fn compact_to_refuses_existing_dest() {
+    let (_dir, store) = store();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let dest = dest_dir.path().join("data.mdb");
+    std::fs::write(&dest, b"existing").unwrap();
+
+    let err = store.compact_to(&dest).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+        "expected AlreadyExists, got {err}"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"existing", "dest untouched");
 }

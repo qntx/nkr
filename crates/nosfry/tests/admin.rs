@@ -1,0 +1,377 @@
+//! Administration commands: import/export/scan/compact over a store.
+
+#![allow(
+    unused_crate_dependencies,
+    reason = "each test binary uses a subset of the workspace dependencies"
+)]
+#![allow(
+    clippy::tests_outside_test_module,
+    reason = "each file is a single integration test"
+)]
+#![allow(
+    unsafe_code,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests may panic"
+)]
+
+mod common;
+
+use std::io::{Cursor, Write};
+use std::process::{Command, Stdio};
+
+use common::{event, key};
+use nosfry::admin::{AdminError, ImportStats, export, import, scan};
+use nosfry_core::event::{Event, EventLimits};
+use nosfry_core::filter::Filter;
+use nosfry_lmdb::{Store, StoreOptions};
+use serde_json::json;
+
+const MAX_LINE: usize = 4096;
+
+fn store() -> (tempfile::TempDir, Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+    (dir, store)
+}
+
+/// Canonical JSON line of an event Arc.
+fn line(event: &Event) -> String {
+    event.json().to_owned()
+}
+
+/// A line whose signature does not verify (zeros).
+fn bad_sig_line() -> String {
+    let mut line = line(&event(&key(9), 1, 100, &json!([]), "bad-sig"));
+    // `..."sig":"<128 hex>"}`: zero the signature out.
+    line.truncate(line.len() - 130);
+    line.push_str(&"0".repeat(128));
+    line.push_str("\"}");
+    line
+}
+
+fn export_bytes(store: &Store) -> Vec<u8> {
+    let mut out = Vec::new();
+    export(store, 0, u64::MAX, false, &mut out).unwrap();
+    out
+}
+
+#[test]
+fn import_mixed_corpus_stats() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let good = [
+        line(&event(&k, 1, 100, &json!([]), "n1")),
+        line(&event(&k, 1, 200, &json!([]), "n2")),
+        line(&event(&k, 1, 300, &json!([]), "n3")),
+        line(&event(&k, 6, 300, &json!([]), "repost")),
+        line(&event(&k, 0, 500, &json!([]), "newer")),
+        line(&event(&k, 0, 400, &json!([]), "older")),
+        line(&event(&k, 25000, 300, &json!([]), "ephemeral")),
+        // Far outside any relay time window: imports must still accept.
+        line(&event(&k, 1, 1_000, &json!([]), "ancient")),
+    ];
+    let corpus = [
+        good[0].clone(),
+        good[1].clone(),
+        String::new(),
+        good[2].clone(),
+        good[3].clone(),
+        good[4].clone(),
+        good[5].clone(),
+        good[6].clone(),
+        good[7].clone(),
+        bad_sig_line(),
+        "{\"id\":\"broken\"".to_owned(),
+        "x".repeat(MAX_LINE + 100),
+    ]
+    .join("\n");
+
+    let stats = import(
+        &store,
+        &EventLimits::default(),
+        MAX_LINE,
+        Cursor::new(corpus),
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        stats,
+        ImportStats {
+            processed: 11,
+            added: 6,
+            duplicates: 0,
+            superseded: 1,
+            ephemeral: 1,
+            rejected: 3,
+        }
+    );
+
+    let mut out = Vec::new();
+    let count = export(&store, 0, u64::MAX, false, &mut out).unwrap();
+    assert_eq!(count, 6);
+    let exported = String::from_utf8(out).unwrap();
+    for expected in &good[0..5] {
+        assert!(exported.contains(expected), "missing {expected}");
+    }
+    assert!(exported.contains(&good[7]), "ancient event stored");
+    assert!(
+        !exported.contains(&good[5]),
+        "superseded replaceable not stored"
+    );
+    assert!(!exported.contains(&good[6]), "ephemeral not stored");
+}
+
+#[test]
+fn export_import_export_is_byte_identical() {
+    let (_dir_a, a) = store();
+    let k = key(2);
+    let events: Vec<_> = (0..50u64)
+        .map(|i| {
+            let kind = match i % 4 {
+                0 => 1,
+                1 => 2,
+                2 => 6,
+                _ => 7,
+            };
+            event(&k, kind, 1_000 + i, &json!([]), &format!("e{i}"))
+        })
+        .collect();
+    a.write(&events).unwrap();
+    let dump = export_bytes(&a);
+
+    let (_dir_b, b) = store();
+    let stats = import(
+        &b,
+        &EventLimits::default(),
+        MAX_LINE,
+        Cursor::new(&dump),
+        false,
+    )
+    .unwrap();
+    assert_eq!(stats.added, 50);
+    assert_eq!(stats.rejected, 0);
+    assert_eq!(export_bytes(&b), dump);
+}
+
+#[test]
+fn reimport_reports_all_duplicates() {
+    let (_dir, a) = store();
+    let k = key(3);
+    let events: Vec<_> = (0..10u64)
+        .map(|i| event(&k, 1, 1_000 + i, &json!([]), &format!("e{i}")))
+        .collect();
+    a.write(&events).unwrap();
+    let dump = export_bytes(&a);
+
+    let stats = import(
+        &a,
+        &EventLimits::default(),
+        MAX_LINE,
+        Cursor::new(&dump),
+        false,
+    )
+    .unwrap();
+    assert_eq!(stats.added, 0);
+    assert_eq!(stats.duplicates, 10);
+    assert_eq!(stats.processed, 10);
+}
+
+#[test]
+fn scan_filters_limits_and_counts() {
+    let (_dir, store) = store();
+    let k = key(4);
+    let notes: Vec<_> = (0..600u64)
+        .map(|i| event(&k, 1, 10_000 + i, &json!([]), &format!("n{i}")))
+        .collect();
+    let reposts: Vec<_> = (0..50u64)
+        .map(|i| event(&k, 7, 10_000 + i, &json!([]), &format!("r{i}")))
+        .collect();
+    store.write(&notes).unwrap();
+    store.write(&reposts).unwrap();
+
+    let mut limited_out = Vec::new();
+    let limited = scan(
+        &store,
+        Filter::parse("{\"kinds\":[1],\"limit\":3}").unwrap(),
+        false,
+        &mut limited_out,
+    )
+    .unwrap();
+    assert_eq!(limited, 3);
+    let lines: Vec<&str> = std::str::from_utf8(&limited_out).unwrap().lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0], notes[599].json(), "newest first");
+    assert_eq!(lines[2], notes[597].json());
+
+    let mut all_out = Vec::new();
+    let all = scan(
+        &store,
+        Filter::parse("{\"kinds\":[1]}").unwrap(),
+        false,
+        &mut all_out,
+    )
+    .unwrap();
+    assert_eq!(all, 600, "no relay max_filter_limit cap");
+    assert_eq!(std::str::from_utf8(&all_out).unwrap().lines().count(), 600);
+
+    let mut count_out = Vec::new();
+    let counted = scan(
+        &store,
+        Filter::parse("{\"kinds\":[1,7]}").unwrap(),
+        true,
+        &mut count_out,
+    )
+    .unwrap();
+    assert_eq!(counted, 650);
+    assert!(count_out.is_empty(), "count mode writes no events");
+}
+
+/// A writer that starts failing after `budget` bytes.
+struct FailAfter {
+    budget: usize,
+}
+
+impl Write for FailAfter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.budget == 0 {
+            return Err(std::io::Error::other("synthetic"));
+        }
+        let n = self.budget.min(buf.len());
+        self.budget -= n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn scan_propagates_write_error_on_final_step() {
+    let (_dir, store) = store();
+    let k = key(6);
+    store.write(&[event(&k, 1, 100, &json!([]), "x")]).unwrap();
+    // The whole result fits in one step, so the write error lands in
+    // the same `step` that returns `Progress::Done`.
+    let mut out = FailAfter { budget: 4 };
+    let err = scan(
+        &store,
+        Filter::parse("{\"kinds\":[1]}").unwrap(),
+        false,
+        &mut out,
+    )
+    .unwrap_err();
+    assert!(matches!(err, AdminError::Io(_)), "expected Io, got {err}");
+}
+
+#[test]
+fn cli_end_to_end() {
+    let bin = env!("CARGO_BIN_EXE_nosfry");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let config = dir.path().join("nosfry.toml");
+    std::fs::write(&config, format!("[db]\npath = \"{}\"\n", db.display())).unwrap();
+
+    let k = key(5);
+    let events = [
+        line(&event(&k, 1, 100, &json!([]), "one")),
+        line(&event(&k, 1, 200, &json!([]), "two")),
+        line(&event(&k, 7, 300, &json!([]), "three")),
+    ];
+    let input_path = dir.path().join("in.jsonl");
+    std::fs::write(&input_path, format!("{}\n", events.join("\n"))).unwrap();
+
+    let import_out = Command::new(bin)
+        .args(["--config", config.to_str().unwrap(), "import"])
+        .stdin(Stdio::from(std::fs::File::open(&input_path).unwrap()))
+        .output()
+        .unwrap();
+    assert!(
+        import_out.status.success(),
+        "import: {}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+    assert!(import_out.stdout.is_empty(), "import stdout must be empty");
+    assert!(!import_out.stderr.is_empty(), "logs go to stderr");
+
+    let export_out = Command::new(bin)
+        .args(["--config", config.to_str().unwrap(), "export"])
+        .output()
+        .unwrap();
+    assert!(
+        export_out.status.success(),
+        "export: {}",
+        String::from_utf8_lossy(&export_out.stderr)
+    );
+    let stdout = String::from_utf8(export_out.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "stdout is exactly the stored JSON lines: {stdout}"
+    );
+    for line in &lines {
+        let json: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(json["id"].is_string());
+    }
+    assert_eq!(stdout, format!("{}\n", events.join("\n")));
+    assert!(
+        String::from_utf8_lossy(&export_out.stderr).contains("export done"),
+        "logs go to stderr"
+    );
+
+    let scan_out = Command::new(bin)
+        .args([
+            "scan",
+            "--count",
+            "{\"kinds\":[1]}",
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        scan_out.status.success(),
+        "scan: {}",
+        String::from_utf8_lossy(&scan_out.stderr)
+    );
+    assert_eq!(String::from_utf8(scan_out.stdout).unwrap(), "2\n");
+
+    let dest = dir.path().join("compact.mdb");
+    let compact_out = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "compact",
+            dest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        compact_out.status.success(),
+        "compact: {}",
+        String::from_utf8_lossy(&compact_out.stderr)
+    );
+    assert!(dest.is_file());
+
+    let empty = dir.path().join("empty.toml");
+    std::fs::write(
+        &empty,
+        format!("[db]\npath = \"{}\"\n", dir.path().join("no-db").display()),
+    )
+    .unwrap();
+    let nodb_out = Command::new(bin)
+        .args(["--config", empty.to_str().unwrap(), "export"])
+        .output()
+        .unwrap();
+    assert!(!nodb_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&nodb_out.stderr).contains("no database"),
+        "stderr: {}",
+        String::from_utf8_lossy(&nodb_out.stderr)
+    );
+}
