@@ -44,9 +44,15 @@ clippy-fix:
         --allow-staged \
         -- -D warnings
 
-# Format the code using rustfmt with nightly toolchain
+# Format Rust with nightly rustfmt and TOML with taplo
 fmt:
     cargo +nightly fmt
+    npx --yes @taplo/cli@0.7.0 fmt
+
+# Check Rust and TOML formatting
+fmt-check:
+    cargo +nightly fmt --all -- --check
+    npx --yes @taplo/cli@0.7.0 fmt --check
 
 # Generate documentation for all crates and open it in the browser
 doc:

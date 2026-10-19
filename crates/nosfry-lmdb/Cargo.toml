@@ -1,35 +1,35 @@
 [package]
-name = "nosfry-lmdb"
-description = "Synchronous LMDB event store for the nosfry Nostr relay"
-version.workspace = true
-edition.workspace = true
+name                   = "nosfry-lmdb"
+description            = "Synchronous LMDB event store for the nosfry Nostr relay"
+version.workspace      = true
+edition.workspace      = true
 rust-version.workspace = true
-license.workspace = true
-readme.workspace = true
-repository.workspace = true
-authors.workspace = true
-keywords.workspace = true
-categories.workspace = true
+license.workspace      = true
+readme.workspace       = true
+repository.workspace   = true
+authors.workspace      = true
+keywords.workspace     = true
+categories.workspace   = true
 
 [dependencies]
 nosfry-core.workspace = true
-foldhash.workspace = true
-heed.workspace = true
-thiserror.workspace = true
+foldhash.workspace    = true
+heed.workspace        = true
+thiserror.workspace   = true
 
 [dev-dependencies]
-criterion.workspace = true
+criterion.workspace  = true
 faster-hex.workspace = true
-heed.workspace = true
-proptest.workspace = true
-secp256k1.workspace = true
+heed.workspace       = true
+proptest.workspace   = true
+secp256k1.workspace  = true
 serde_json.workspace = true
-sha2.workspace = true
-tempfile.workspace = true
+sha2.workspace       = true
+tempfile.workspace   = true
 
 [lints]
 workspace = true
 
 [[bench]]
-name = "store"
+name    = "store"
 harness = false

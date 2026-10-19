@@ -66,8 +66,8 @@ sliding_window = true
 
 [relay.info]
 # NIP-11 relay information fields.
-name = "nosfry"
+name        = "nosfry"
 description = ""
-pubkey = ""
-contact = ""
-icon = ""
+pubkey      = ""
+contact     = ""
+icon        = ""

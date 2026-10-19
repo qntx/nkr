@@ -10,6 +10,16 @@ permissions:
   contents: read
 
 jobs:
+  taplo:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: npx --yes @taplo/cli@0.7.0 fmt --check
+
   ci:
     uses: qntx/workflows/.github/workflows/ci-rust.yml@v2
     permissions:

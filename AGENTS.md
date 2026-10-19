@@ -13,6 +13,7 @@
 Local gate before a pull request:
 
 ```bash
+npx --yes @taplo/cli@0.7.0 fmt --check
 cargo +nightly fmt --all -- --check
 cargo +nightly clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
@@ -27,5 +28,7 @@ Run the relay locally:
 ```bash
 cargo run --release -p nosfry -- relay --config nosfry.example.toml
 ```
+
+TOML is formatted by taplo (`.taplo.toml`, aligned `=`); keep `taplo fmt --check` green.
 
 `docs/` is local-only and is never pushed: the whole directory is gitignored; never commit any file under `docs/`. Locally it is a Fumadocs tree: every page needs non-empty `title` and `description` frontmatter and must be listed in its folder's `meta.json`; headings start at `##`, every fenced code block has a language. Verify doc changes with `bunx oxfmt --ignore-path=/dev/null <files>` and `bun validate-docs-tree.ts docs --lint` from a checkout of `qntx/workflows/actions/validate-docs-tree`.
