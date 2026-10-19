@@ -164,8 +164,6 @@ async fn req_limit_and_multi_filter_dedup() {
         send_text(&mut ws, &event_wire(&ev)).await;
         let _ok = recv_text(&mut ws, T).await;
     }
-    // Let the writer broadcast reach the monitor shards first.
-    tokio::time::sleep(Duration::from_millis(200)).await;
     send_text(
         &mut ws,
         &req_wire(
@@ -212,8 +210,18 @@ async fn live_event_after_eose_and_close_stops() {
         json(ev.json()).get("id").unwrap().as_str().unwrap()
     );
 
-    // CLOSE stops delivery.
+    // CLOSE stops delivery. There is no cross-connection ordering, so
+    // barrier on sub_ws first: inbound frames are processed in order,
+    // and the EOSE for the impossible filter proves the CLOSE was
+    // applied in the session before the barrier's scan ran.
     send_text(&mut sub_ws, &close_wire("s")).await;
+    send_text(&mut sub_ws, &req_wire("barrier", "{\"ids\":[]}")).await;
+    loop {
+        let frame = json(&recv_text(&mut sub_ws, T).await);
+        if frame[0] == "EOSE" && frame[1] == "barrier" {
+            break;
+        }
+    }
     let ev2 = common::event(&key(5), 1, now(), &json!([]), "live2");
     send_text(&mut pub_ws, &event_wire(&ev2)).await;
     let _ok = recv_text(&mut pub_ws, T).await;
@@ -222,6 +230,30 @@ async fn live_event_after_eose_and_close_stops() {
         && f.opcode() == yawc::OpCode::Text
     {
         panic!("unexpected delivery after CLOSE: {:?}", f.payload());
+    }
+    relay.stop().await;
+}
+
+/// Read-your-writes: the writer queues each batch on every shard
+/// before pushing the publisher's `OK`, so a `REQ` sent right after
+/// `OK` must find the event in its snapshot and emit it before `EOSE`.
+#[tokio::test]
+async fn req_after_ok_sees_event_before_eose() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    for i in 0..200u32 {
+        let ev = common::event(&key(10), 1, now(), &json!([]), &format!("ryw{i}"));
+        let id = json(ev.json())["id"].as_str().unwrap().to_owned();
+        send_text(&mut ws, &event_wire(&ev)).await;
+        let ok = json(&recv_text(&mut ws, T).await);
+        assert_eq!(ok[0], "OK");
+        assert_eq!(ok[2], true);
+        let sub = format!("s{i}");
+        send_text(&mut ws, &req_wire(&sub, &format!("{{\"ids\":[\"{id}\"]}}"))).await;
+        let frame = json(&recv_text(&mut ws, T).await);
+        assert_eq!(frame[0], "EVENT", "iteration {i}: event must precede EOSE");
+        assert_eq!(frame[2]["id"], id);
+        assert_eq!(json(&recv_text(&mut ws, T).await)[0], "EOSE");
     }
     relay.stop().await;
 }
@@ -317,7 +349,7 @@ async fn ephemeral_live_only() {
 async fn durability_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let config = |path: &std::path::Path| {
-        let mut c = nosfry_server::config::Config::default();
+        let mut c = nosfry::config::Config::default();
         c.db.path = path.to_path_buf();
         c
     };
@@ -345,7 +377,7 @@ async fn durability_across_restart() {
 async fn exactly_once_across_stored_and_live() {
     const PUBLISHERS: usize = 4;
     const PER_PUB: usize = 250;
-    let mut config = nosfry_server::config::Config::default();
+    let mut config = nosfry::config::Config::default();
     config.relay.query_timeslice_budget_microseconds = 1;
     config.relay.limits.max_filter_limit = 5_000;
     let relay = Relay::start_with(config).await;
@@ -448,7 +480,7 @@ async fn exactly_once_across_stored_and_live() {
 
 #[tokio::test]
 async fn too_many_subs_and_unknown_filter_key() {
-    let mut config = nosfry_server::config::Config::default();
+    let mut config = nosfry::config::Config::default();
     config.relay.limits.max_subs_per_connection = 1;
     let relay = Relay::start_with(config).await;
     let mut ws = relay.connect().await;
@@ -473,7 +505,7 @@ async fn too_many_subs_and_unknown_filter_key() {
 
 #[tokio::test]
 async fn oversized_frame_closes_connection() {
-    let mut config = nosfry_server::config::Config::default();
+    let mut config = nosfry::config::Config::default();
     config.relay.max_websocket_payload_size = 1024;
     let relay = Relay::start_with(config).await;
     let mut ws = relay.connect().await;
@@ -535,12 +567,12 @@ async fn nip11_document() {
     assert_eq!(doc["limitation"]["max_subscriptions"], 200);
     assert_eq!(
         doc["limitation"]["max_subid_length"],
-        nosfry::message::SUB_ID_MAX_CHARS as u64
+        nosfry_core::message::SUB_ID_MAX_CHARS as u64
     );
     relay.stop().await;
 
     // Configured fields are emitted verbatim.
-    let mut config = nosfry_server::config::Config::default();
+    let mut config = nosfry::config::Config::default();
     config.relay.info.description = "test relay".to_owned();
     config.relay.info.pubkey = "ab".repeat(32);
     config.relay.info.contact = "admin@example.com".to_owned();
@@ -556,7 +588,7 @@ async fn nip11_document() {
 
 #[tokio::test]
 async fn slow_consumer_is_disconnected() {
-    let mut config = nosfry_server::config::Config::default();
+    let mut config = nosfry::config::Config::default();
     config.relay.max_pending_outbound_bytes = 4096;
     let relay = Relay::start_with(config).await;
     // Fill the store: the scan will push more than 4 KiB of events.
@@ -598,7 +630,7 @@ async fn slow_consumer_is_disconnected() {
 
 #[tokio::test]
 async fn half_open_connection_times_out() {
-    let mut config = nosfry_server::config::Config::default();
+    let mut config = nosfry::config::Config::default();
     config.relay.auto_ping_seconds = 1;
     let relay = Relay::start_with(config).await;
 
@@ -660,7 +692,7 @@ async fn half_open_connection_times_out() {
 
 #[tokio::test]
 async fn shutdown_with_stuck_client_returns() {
-    let mut config = nosfry_server::config::Config::default();
+    let mut config = nosfry::config::Config::default();
     config.relay.auto_ping_seconds = 1;
     let relay = Relay::start_with(config).await;
     // Fill the store so the REQ produces a large outbound backlog.

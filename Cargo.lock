@@ -1177,6 +1177,32 @@ dependencies = [
 name = "nosfry"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "clap",
+ "faster-hex",
+ "foldhash",
+ "futures-util",
+ "nosfry-core",
+ "nosfry-lmdb",
+ "proptest",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "yawc",
+]
+
+[[package]]
+name = "nosfry-core"
+version = "0.1.0"
+dependencies = [
  "criterion",
  "faster-hex",
  "foldhash",
@@ -1197,39 +1223,13 @@ dependencies = [
  "faster-hex",
  "foldhash",
  "heed",
- "nosfry",
+ "nosfry-core",
  "proptest",
  "secp256k1",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
-]
-
-[[package]]
-name = "nosfry-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "faster-hex",
- "foldhash",
- "futures-util",
- "nosfry",
- "nosfry-lmdb",
- "proptest",
- "secp256k1",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "tracing",
- "tracing-subscriber",
- "yawc",
 ]
 
 [[package]]

@@ -10,9 +10,11 @@ The format is based on [Keep a Changelog]; this project follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-19
+
 ### Added
 
-- `nosfry`, the sans-IO protocol core. It has no async, no I/O, no clock,
+- `nosfry-core`, the sans-IO protocol core. It has no async, no I/O, no clock,
   and no randomness, uses `forbid(unsafe_code)`, and builds cleanly for
   `wasm32-unknown-unknown`.
   - `event`: a strict NIP-01 ingest pipeline.
@@ -50,13 +52,15 @@ The format is based on [Keep a Changelog]; this project follows
   - `Scan` runs time-sliced, snapshot-bounded index scans. Each step keeps
     one live iterator per cursor and streams results per completed
     `created_at` group, with cross-filter deduplication.
-- `nosfry-server`, the native relay and its `nosfry` binary.
+- `nosfry`, the native relay crate and binary.
   - **Threads:** one writer (group commits), M monitor shards (live index,
     snapshot authority, and scan control for their connections), and N
     readers, with exactly-once historical and live delivery.
   - **`OK` frames** are pushed by the writer straight onto the
-    connection's outbound queue. Scan results arrive in chunks, and the
-    first frame of each scan is sent alone.
+    connection's outbound queue, after the batch is queued on every
+    shard, so a `REQ` sent after `OK` always snapshots the event. Scan
+    results arrive in chunks, and the first frame of each scan is sent
+    alone.
   - **Backpressure:**
     - every connection has an outbound byte budget, and scans pause
       above a high-water mark;
@@ -80,3 +84,6 @@ The format is based on [Keep a Changelog]; this project follows
   - a Linux container recipe with relay and harness CPU pinning;
   - relayBench and nosfry-bench drivers;
   - the `aggregate.py` summary script.
+
+[Unreleased]: https://github.com/qntx/nosfry/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/qntx/nosfry/releases/tag/v0.1.0

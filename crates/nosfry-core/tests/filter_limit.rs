@@ -22,7 +22,7 @@
 
 mod common;
 
-use nosfry::filter::Filter;
+use nosfry_core::filter::Filter;
 use serde::Deserialize;
 
 /// `(filter JSON substring, why)` — oracle SDK cases the relay resolves

@@ -3,8 +3,8 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use nosfry::event::EventLimits;
-use nosfry::limits::{Limits, ReqLimits};
+use nosfry_core::event::EventLimits;
+use nosfry_core::limits::{Limits, ReqLimits};
 use nosfry_lmdb::StoreOptions;
 use serde::Deserialize;
 
@@ -16,7 +16,7 @@ use crate::ServerError;
 pub struct Config {
     /// Database environment section.
     pub db: Db,
-    /// Event acceptance limits (`nosfry::event::EventLimits` verbatim).
+    /// Event acceptance limits (`nosfry_core::event::EventLimits` verbatim).
     pub events: EventLimits,
     /// Relay behaviour section.
     pub relay: Relay,
@@ -54,7 +54,7 @@ pub struct Relay {
     pub max_pending_outbound_bytes: usize,
     /// Per-slice scan budget in microseconds.
     pub query_timeslice_budget_microseconds: u64,
-    /// REQ limits (`nosfry::limits::ReqLimits` verbatim).
+    /// REQ limits (`nosfry_core::limits::ReqLimits` verbatim).
     pub limits: ReqLimits,
     /// Thread pool sizes.
     pub threads: Threads,
@@ -171,7 +171,7 @@ impl Config {
         Ok(toml::from_str(&text)?)
     }
 
-    /// `nosfry::limits::Limits` assembled from `[events]` + `[relay.limits]`.
+    /// `nosfry_core::limits::Limits` assembled from `[events]` + `[relay.limits]`.
     #[must_use]
     pub const fn limits(&self) -> Limits {
         Limits {

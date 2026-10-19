@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nosfry", "crates/nosfry-lmdb", "crates/nosfry-server"]
+members = ["crates/nosfry", "crates/nosfry-core", "crates/nosfry-lmdb"]
 exclude = ["bench/nosfry-bench"]
 resolver = "3"
 
@@ -8,13 +8,14 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/qntx/nosfry"
 authors = ["QNTX <https://qntx.org>"]
-keywords = ["nostr", "relay", "websocket", "lmdb", "cloudflare"]
+keywords = ["nostr", "relay", "websocket", "lmdb", "server"]
 categories = ["network-programming", "web-programming::websocket"]
 
 [workspace.dependencies]
-nosfry = { path = "crates/nosfry", version = "0.1.0" }
+nosfry-core = { path = "crates/nosfry-core", version = "0.1.0" }
 nosfry-lmdb = { path = "crates/nosfry-lmdb", version = "0.1.0" }
 
 # Serialization / errors

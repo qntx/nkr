@@ -20,8 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use nosfry::event::Event;
-use nosfry::filter::Filter;
+use nosfry_core::event::Event;
+use nosfry_core::filter::Filter;
 use nosfry_lmdb::{Progress, Scan, Store, StoreOptions};
 use serde_json::json;
 

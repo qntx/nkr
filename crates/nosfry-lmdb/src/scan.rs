@@ -5,9 +5,9 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nosfry::event::{EventId, cmp_newest_first};
-use nosfry::filter::Filter;
-use nosfry::packed::PackedRef;
+use nosfry_core::event::{EventId, cmp_newest_first};
+use nosfry_core::filter::Filter;
+use nosfry_core::packed::PackedRef;
 
 use crate::{Index, Reader, Store, StoreError};
 

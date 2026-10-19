@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
-use nosfry::event::{Event, supersedes};
-use nosfry::packed::PackedRef;
+use nosfry_core::event::{Event, supersedes};
+use nosfry_core::packed::PackedRef;
 
 mod scan;
 
@@ -434,7 +434,7 @@ mod tests {
 
     use std::sync::Arc;
 
-    use nosfry::event::{EventLimits, UnverifiedEvent};
+    use nosfry_core::event::{EventLimits, UnverifiedEvent};
     use secp256k1::{Keypair, SecretKey, schnorr};
     use serde_json::json;
     use sha2::{Digest, Sha256};

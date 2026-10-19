@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{event, key};
-use nosfry::event::Event;
-use nosfry::filter::Filter;
+use nosfry_core::event::Event;
+use nosfry_core::filter::Filter;
 use nosfry_lmdb::{Progress, Scan, Store, StoreOptions, WriteOutcome};
 use serde_json::json;
 

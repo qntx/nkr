@@ -17,6 +17,7 @@ jobs:
     with:
       deny: true
       doc: true
+      package-check: true
 
   wasm:
     name: wasm32 check
@@ -25,5 +26,5 @@ jobs:
       contents: read
     with:
       targets: wasm32-unknown-unknown
-      packages: nosfry
+      packages: nosfry-core
       features: --all-features

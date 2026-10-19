@@ -25,9 +25,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{event, key};
-use nosfry::event::{Event, EventId, cmp_newest_first, supersedes};
-use nosfry::filter::Filter;
-use nosfry::kind::KindClass;
+use nosfry_core::event::{Event, EventId, cmp_newest_first, supersedes};
+use nosfry_core::filter::Filter;
+use nosfry_core::kind::KindClass;
 use nosfry_lmdb::{Progress, Scan, Store, StoreOptions, WriteOutcome};
 use proptest::prelude::*;
 use serde_json::json;

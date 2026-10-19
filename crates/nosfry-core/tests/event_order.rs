@@ -22,7 +22,7 @@
 
 mod common;
 
-use nosfry::event::{EventId, cmp_newest_first, supersedes};
+use nosfry_core::event::{EventId, cmp_newest_first, supersedes};
 use serde::Deserialize;
 
 #[derive(Deserialize)]

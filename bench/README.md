@@ -66,7 +66,7 @@ make setup-golpe && make -j10
 
 # one nosfry binary per commit under test
 mkdir -p /bench/bin && git clone /src/nosfry /bench/nosfry-src
-cd /bench/nosfry-src && git checkout <sha> && cargo build --release -p nosfry-server
+cd /bench/nosfry-src && git checkout <sha> && cargo build --release -p nosfry
 cp target/release/nosfry /bench/bin/<name>
 
 # nosfry-bench

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use nosfry::message::ok_frame;
+use nosfry_core::message::ok_frame;
 use nosfry_lmdb::{Store, WriteOutcome};
 use tokio::sync::mpsc;
 
@@ -23,9 +23,13 @@ const fn ok_reply(outcome: WriteOutcome) -> (bool, &'static str) {
 }
 
 /// Writer thread main loop: block for the first request, drain up to
-/// [`BATCH_CAP`], commit once, push each request's `OK` straight onto
-/// its connection's outbound queue, and broadcast the batch to every
-/// shard. Exits when every sender is dropped.
+/// [`BATCH_CAP`], commit once, queue the batch on every shard, then
+/// push each request's `OK` straight onto its connection's outbound
+/// queue. Exits when every sender is dropped.
+///
+/// Ordering invariant: every shard has the batch queued before any
+/// `OK` is sent, so a `REQ` issued after `OK` always snapshots the
+/// event (read-your-writes before `EOSE`).
 pub(crate) fn run(
     store: &Store,
     mut rx: mpsc::Receiver<WriteRequest>,
@@ -39,7 +43,7 @@ pub(crate) fn run(
                 Err(_) => break,
             }
         }
-        let events: Vec<Arc<nosfry::event::Event>> =
+        let events: Vec<Arc<nosfry_core::event::Event>> =
             reqs.iter().map(|r| Arc::clone(&r.event)).collect();
         let outcomes = match store.write(&events) {
             Ok(outcomes) => outcomes,
@@ -55,12 +59,10 @@ pub(crate) fn run(
             }
         };
         let mut batch: Batch = Vec::new();
+        let mut replies = Vec::with_capacity(reqs.len());
         for (req, (outcome, event)) in reqs.into_iter().zip(outcomes.into_iter().zip(events)) {
             let (accepted, message) = ok_reply(outcome);
-            req.out.push(Out::Frame {
-                sub: None,
-                text: ok_frame(&event.id(), accepted, message),
-            });
+            replies.push((req.out, ok_frame(&event.id(), accepted, message)));
             if let WriteOutcome::Stored { seq } = outcome {
                 batch.push((seq, event));
             }
@@ -70,6 +72,9 @@ pub(crate) fn run(
             for shard in shards {
                 drop(shard.blocking_send(ShardMsg::Batch(Arc::clone(&batch))));
             }
+        }
+        for (out, text) in replies {
+            out.push(Out::Frame { sub: None, text });
         }
     }
 }

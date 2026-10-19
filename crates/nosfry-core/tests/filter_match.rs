@@ -23,10 +23,10 @@
 
 mod common;
 
-use nosfry::event::{EventId, PublicKey};
-use nosfry::filter::Filter;
-use nosfry::kind::Kind;
-use nosfry::packed::PackedEvent;
+use nosfry_core::event::{EventId, PublicKey};
+use nosfry_core::filter::Filter;
+use nosfry_core::kind::Kind;
+use nosfry_core::packed::PackedEvent;
 use serde::{Deserialize, Serialize};
 
 /// `(filter JSON substring, why)` — cases the relay rejects where the

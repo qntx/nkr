@@ -28,7 +28,7 @@
 
 mod common;
 
-use nosfry::message::{ClientMessage, SubId, closed_frame, eose_frame, event_frame};
+use nosfry_core::message::{ClientMessage, SubId, closed_frame, eose_frame, event_frame};
 use serde::Deserialize;
 
 /// `(raw substring, why)` — each pattern identifies exactly one case.

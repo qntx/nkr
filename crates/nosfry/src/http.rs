@@ -166,7 +166,7 @@ pub(crate) fn nip11(config: &Config) -> String {
             "max_subscriptions": relay.limits.max_subs_per_connection,
             "max_limit": relay.limits.max_filter_limit,
             "default_limit": relay.limits.max_filter_limit,
-            "max_subid_length": nosfry::message::SUB_ID_MAX_CHARS,
+            "max_subid_length": nosfry_core::message::SUB_ID_MAX_CHARS,
             "max_event_tags": config.events.max_num_tags,
             "created_at_lower_limit": config.events.reject_events_older_than_seconds,
             "created_at_upper_limit": config.events.reject_events_newer_than_seconds,

@@ -22,7 +22,7 @@
 
 mod common;
 
-use nosfry::kind::{Kind, KindClass};
+use nosfry_core::kind::{Kind, KindClass};
 use serde::Deserialize;
 
 #[allow(

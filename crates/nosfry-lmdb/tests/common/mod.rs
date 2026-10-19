@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use nosfry::event::{Event, EventLimits, UnverifiedEvent};
+use nosfry_core::event::{Event, EventLimits, UnverifiedEvent};
 use secp256k1::{Keypair, SecretKey, schnorr};
 use serde_json::json;
 use sha2::{Digest, Sha256};
