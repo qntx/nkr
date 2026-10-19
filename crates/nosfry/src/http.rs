@@ -15,6 +15,7 @@ use yawc::{IncomingUpgrade, Options};
 
 use crate::config::Config;
 use crate::connection;
+use crate::limiter::ConnectionLimiter;
 
 /// Everything a connection handler needs.
 #[derive(Debug, Clone)]
@@ -23,6 +24,8 @@ pub(crate) struct AppState {
     pub(crate) config: Arc<Config>,
     /// Connection dispatch.
     pub(crate) conn: connection::Handle,
+    /// Simultaneous-connection caps.
+    pub(crate) limiter: Arc<ConnectionLimiter>,
     /// Pre-serialized NIP-11 document; static for the process lifetime.
     pub(crate) nip11: Bytes,
 }
@@ -120,13 +123,21 @@ async fn websocket(
     } else {
         options
     };
+    // The cap is charged before the upgrade; `None` (no address)
+    // counts toward the total only. Rejections log at debug: a
+    // hostile peer may hammer the cap and must not flood the log.
+    let ip = client_ip(state, &parts.headers, peer);
+    let Some(permit) = state.limiter.try_acquire(ip) else {
+        tracing::debug!(?ip, "connection cap reached");
+        return Some((StatusCode::TOO_MANY_REQUESTS, "too many connections").into_response());
+    };
     let Ok((response, fut)) = upgrade.upgrade(options) else {
         return Some(StatusCode::BAD_REQUEST.into_response());
     };
     let handle = state.conn.clone();
-    let ip = client_ip(state, &parts.headers, peer);
     let tracker = handle.tracker.clone();
     tracker.spawn(async move {
+        let _permit = permit;
         match fut.await {
             Ok(mut ws) => {
                 tracing::debug!(?ip, "connection open");
@@ -215,6 +226,7 @@ mod tests {
         AppState {
             nip11: Bytes::new(),
             config: Arc::new(config),
+            limiter: Arc::new(ConnectionLimiter::new(0, 0)),
             conn: connection::Handle {
                 writer: tokio::sync::mpsc::channel(1).0,
                 shards: Arc::from(vec![]),

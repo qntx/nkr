@@ -17,6 +17,7 @@ mod channels;
 pub mod config;
 mod connection;
 mod http;
+mod limiter;
 mod reader;
 mod shard;
 mod writer;
@@ -190,8 +191,12 @@ impl Server {
         Ok(Self {
             state: http::AppState {
                 nip11: http::nip11(&config).into(),
-                config,
                 conn,
+                limiter: Arc::new(limiter::ConnectionLimiter::new(
+                    config.relay.max_connections,
+                    config.relay.max_connections_per_ip,
+                )),
+                config,
             },
             stop_tx,
             writer_tx,

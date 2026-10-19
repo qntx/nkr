@@ -76,6 +76,21 @@ pub fn close_wire(sub_id: &str) -> String {
     format!("[\"CLOSE\",\"{sub_id}\"]")
 }
 
+/// Shared test config: rate limits and the per-IP connection cap are
+/// disabled so traffic-heavy tests are not throttled; tests that need
+/// them set the fields back explicitly.
+pub fn config() -> Config {
+    let mut config = Config::default();
+    config.relay.rate_limits = nosfry_core::limits::RateLimits {
+        events_per_second: 0,
+        events_burst: 0,
+        reqs_per_second: 0,
+        reqs_burst: 0,
+    };
+    config.relay.max_connections_per_ip = 0;
+    config
+}
+
 /// Running test relay.
 pub struct Relay {
     /// Bound address.
@@ -89,7 +104,7 @@ pub struct Relay {
 impl Relay {
     /// Start a relay with the default config on a tempdir store.
     pub async fn start() -> Self {
-        Self::start_with(Config::default()).await
+        Self::start_with(config()).await
     }
 
     /// Start with a caller-adjusted config; the `db.path` inside it is

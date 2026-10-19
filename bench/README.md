@@ -100,6 +100,11 @@ Each `<name>` is a binary in `/bench/bin`; strfry always runs alongside.
   5,000 idle connections (plain and deflate). Each scenario starts against
   a fresh relay and database, and the relay order rotates on every rep.
 
+`nosfry-relay.sh` disables the rate limits and the per-IP connection cap
+in the generated config: the scenarios run thousands of subscribers from
+one IP and flood ingest over a single connection, and the benchmark
+measures the engine, not the limiter.
+
 The durability comparison adds a measurement-only build, never shipped,
 that opens LMDB with `EnvFlags::NO_META_SYNC` in `Store::open`. This
 reproduces the `MDB_NOMETASYNC` strfry effectively runs with: rasgueadb

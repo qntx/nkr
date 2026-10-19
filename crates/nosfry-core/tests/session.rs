@@ -37,8 +37,13 @@ fn session() -> Session {
 }
 
 fn feed(session: &mut Session, now: u64, text: &str) -> Vec<Command> {
+    feed_ms(session, now * 1000, text)
+}
+
+/// `feed` at millisecond resolution, for the rate-limit tests.
+fn feed_ms(session: &mut Session, now_ms: u64, text: &str) -> Vec<Command> {
     let mut out = Vec::new();
-    session.on_text(now, text, &mut out);
+    session.on_text(now_ms, text, &mut out);
     out
 }
 
@@ -398,4 +403,109 @@ fn expired_event_is_rejected_invalid() {
     let tags = format!("[[\"expiration\",\"{}\"]]", now + 100);
     let out = feed(&mut s, now, &signed_event_tags(now, 1, &tags, "fresh"));
     assert!(matches!(out.last(), Some(Command::Publish(_))), "{out:?}");
+}
+
+/// Session with caller-chosen rate limits over the default `Limits`.
+fn session_with_rate(rate: nosfry_core::limits::RateLimits) -> Session {
+    Session::new(Arc::new(Limits {
+        rate,
+        ..Limits::default()
+    }))
+}
+
+#[test]
+fn event_burst_exhausts_and_refills() {
+    let mut s = session();
+    let t = 1_000u64;
+    let text = signed_event(1_700_000_000, 1, "gm");
+    // The burst of 100 passes; message 101 is rate-limited.
+    for _ in 0..100 {
+        feed_ms(&mut s, t, &text);
+    }
+    let out = feed_ms(&mut s, t, &text);
+    let frames = sends(&out);
+    assert_eq!(frames.len(), 1);
+    assert!(
+        frames[0].contains("\"OK\"") && frames[0].contains("rate-limited: slow down"),
+        "{}",
+        frames[0]
+    );
+    // +1000 ms at 20 events/s refills exactly 20 takes.
+    for _ in 0..20 {
+        let out = feed_ms(&mut s, t + 1_000, &text);
+        assert!(
+            !sends(&out).iter().any(|f| f.contains("rate-limited:")),
+            "{out:?}"
+        );
+    }
+    let out = feed_ms(&mut s, t + 1_000, &text);
+    assert!(
+        sends(&out)[0].contains("rate-limited: slow down"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn ephemeral_events_share_the_bucket() {
+    let mut s = session();
+    let t = 1_000u64;
+    let stored = signed_event(1_700_000_000, 1, "gm");
+    for _ in 0..100 {
+        feed_ms(&mut s, t, &stored);
+    }
+    let ephemeral = signed_event(1_700_000_000, 20_000, "gm");
+    let out = feed_ms(&mut s, t, &ephemeral);
+    assert!(
+        sends(&out)[0].contains("rate-limited: slow down"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn req_over_limit_is_closed_rate_limited() {
+    let mut s = session();
+    let t = 1_000u64;
+    for _ in 0..100 {
+        feed_ms(&mut s, t, "[\"REQ\",\"a\",{}]");
+    }
+    let out = feed_ms(&mut s, t, "[\"REQ\",\"a\",{}]");
+    let frames = sends(&out);
+    assert!(
+        frames[0].starts_with("[\"CLOSED\",\"a\",\"rate-limited: slow down\"")
+            || frames[0].contains("rate-limited: slow down"),
+        "{}",
+        frames[0]
+    );
+    // CLOSE is never charged: it still unsubscribes on an empty bucket.
+    let out = feed_ms(&mut s, t, "[\"CLOSE\",\"a\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::Unsubscribe { .. }]),
+        "{out:?}"
+    );
+    // Unsupported verbs are not charged either.
+    let out = feed_ms(&mut s, t, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    assert!(sends(&out)[0].contains("unsupported:"), "{out:?}");
+}
+
+#[test]
+fn zero_rate_per_second_disables() {
+    let rate = nosfry_core::limits::RateLimits {
+        events_per_second: 0,
+        events_burst: 0,
+        reqs_per_second: 0,
+        reqs_burst: 0,
+    };
+    let mut s = session_with_rate(rate);
+    let text = signed_event(1_700_000_000, 1, "gm");
+    for _ in 0..200 {
+        let out = feed_ms(&mut s, 1_700_000_000_000, &text);
+        assert!(matches!(out.as_slice(), [Command::Publish(_)]), "{out:?}");
+    }
+    for _ in 0..200 {
+        let out = feed_ms(&mut s, 1_000, "[\"REQ\",\"a\",{}]");
+        assert!(
+            !sends(&out).iter().any(|f| f.contains("rate-limited:")),
+            "{out:?}"
+        );
+    }
 }
