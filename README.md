@@ -53,6 +53,18 @@ events, `nosfry_connections` reports the live WebSocket count,
 `nosfry_rate_limited_total{verb}` rate-limit refusals. The endpoint is
 unauthenticated — keep it behind a reverse proxy or firewall.
 
+`[relay.write_policy]` runs a strfry-compatible write-policy plugin:
+plugins written for strfry run unchanged. Every verified event is sent
+to `/bin/sh -c <plugin>` as one JSON line
+(`{"type":"new","event":...,"receivedAt":...,"sourceType":"IP4"|"IP6","sourceInfo":"<ip>"}`)
+and the plugin's `accept`/`reject`/`shadowReject` answer decides
+whether the event is stored and broadcast, refused with `OK false`, or
+acknowledged but silently dropped. `timeout_seconds` (default 10)
+bounds each answer; on timeout or a plugin error the event is rejected
+with `error: internal error` and a fresh plugin process serves the next
+event. A plugin configured as a bare path is reloaded automatically
+when the file's mtime changes.
+
 ### systemd
 
 ```ini

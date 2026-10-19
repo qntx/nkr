@@ -67,6 +67,14 @@ down`; CLOSE is never charged.
   `nosfry_connections`, `nosfry_connections_rejected_total`, and
   `nosfry_rate_limited_total{verb}`, all on fixed label sets from
   lock-free counters.
+- `[relay.write_policy]`: a strfry-compatible write-policy plugin
+  (`plugin`, `timeout_seconds` = 10). Each verified event is sent to
+  `/bin/sh -c <plugin>` as one JSON line carrying the raw event, the
+  receive time, and the client's IP (`IP4`/`IP6`); the plugin answers
+  `accept`, `reject`, or `shadowReject`. A plugin configured as a bare
+  path reloads when its mtime changes; any failure rejects the event
+  with `error: internal error` and restarts the process for the next
+  event. `nosfry import` does not invoke the plugin.
 
 ### Changed
 
@@ -78,6 +86,13 @@ down`; CLOSE is never charged.
 - `MessageError` variants carry the recognized `ClientVerb`
   (`MessageError::verb()`), and `FilterVerb` is superseded by
   `ClientVerb`.
+- `client_ip` returns `IpAddr` (the peer is mandatory now) and
+  `ConnectionLimiter::try_acquire` takes `IpAddr` instead of
+  `Option<IpAddr>`; a missing `ConnectInfo` in the HTTP handler is an
+  internal error (500).
+- A write-policy `reject` with an empty or absent `msg` answers
+  `blocked: rejected by write policy` instead of strfry's bare empty
+  message, because NIP-01 expects a prefixed rejection reason.
 - The LMDB format version is now 2 (three new lifecycle databases);
   databases created by 0.1.0 cannot be opened. Since 0.1.0 had no
   `export`, a 0.1.0 database must be re-imported from its source.
