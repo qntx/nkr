@@ -51,9 +51,20 @@ The format is based on [Keep a Changelog]; this project follows
   `ix_time`) and `Store::compact_to` (compacted environment copy) in
   `nosfry-lmdb`.
 - `nosfry::admin`, the library API behind the administration commands.
+- Per-connection token-bucket rate limits (`[relay.rate_limits]`,
+  20 events/s and 20 REQs/s with a burst of 100 each; a `*_per_second`
+  of 0 disables that bucket). Over-limit EVENTs are answered `OK false
+  rate-limited: slow down`, over-limit REQs `CLOSED rate-limited: slow
+  down`; CLOSE is never charged.
+- Connection caps: `[relay] max_connections` (default 0 = unlimited)
+  and `max_connections_per_ip` (default 128) refuse over-cap upgrades
+  with `429 Too Many Requests`. IPv4 counts per address, IPv4-mapped
+  IPv6 folds to IPv4, other IPv6 groups per /64 prefix.
 
 ### Changed
 
+- `Session::on_text` takes the current unix time in **milliseconds**
+  (previously seconds), needed for millisecond-accurate rate buckets.
 - The LMDB format version is now 2 (three new lifecycle databases);
   databases created by 0.1.0 cannot be opened. Since 0.1.0 had no
   `export`, a 0.1.0 database must be re-imported from its source.

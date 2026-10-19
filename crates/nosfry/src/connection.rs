@@ -48,10 +48,10 @@ const BATCH_MAX_BYTES: usize = 256 * 1024;
 /// How long a best-effort close frame may block the shutdown path.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn now() -> u64 {
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+        .map_or(0, |d| d.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 /// A batched socket write that failed.
@@ -120,7 +120,7 @@ impl<'a> Connection<'a> {
                     return true;
                 };
                 let mut commands = Vec::new();
-                self.session.on_text(now(), text, &mut commands);
+                self.session.on_text(now_ms(), text, &mut commands);
                 for cmd in commands {
                     self.command(cmd).await;
                 }

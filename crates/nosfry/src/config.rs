@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use nosfry_core::event::EventLimits;
-use nosfry_core::limits::{Limits, ReqLimits};
+use nosfry_core::limits::{Limits, RateLimits, ReqLimits};
 use nosfry_lmdb::StoreOptions;
 use serde::Deserialize;
 
@@ -57,10 +57,18 @@ pub struct Relay {
     pub auto_ping_seconds: u64,
     /// Pending outbound bytes above which the connection is closed.
     pub max_pending_outbound_bytes: usize,
+    /// Maximum simultaneous WebSocket connections (0 = unlimited).
+    pub max_connections: usize,
+    /// Maximum simultaneous WebSocket connections per client IP
+    /// (0 = unlimited). IPv4 counts per address; IPv6 per /64.
+    pub max_connections_per_ip: usize,
     /// Per-slice scan budget in microseconds.
     pub query_timeslice_budget_microseconds: u64,
     /// REQ limits (`nosfry_core::limits::ReqLimits` verbatim).
     pub limits: ReqLimits,
+    /// Per-connection EVENT/REQ rate limits
+    /// (`nosfry_core::limits::RateLimits` verbatim).
+    pub rate_limits: RateLimits,
     /// Thread pool sizes.
     pub threads: Threads,
     /// WebSocket compression.
@@ -83,10 +91,11 @@ pub struct Threads {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Compression {
-    /// Negotiate permessage-deflate. Off by default: yawc only bounds
-    /// the *compressed* frame sizes, so a small frame can inflate far
-    /// beyond `max_websocket_payload_size` — enable it only for trusted
-    /// clients.
+    /// Negotiate permessage-deflate. Off by default: yawc bounds the
+    /// *compressed* frame sizes only, so a small frame can inflate far
+    /// beyond `max_websocket_payload_size`
+    /// (<https://github.com/infinitefield/yawc/issues/55>) — enable it
+    /// only for trusted clients.
     pub enabled: bool,
     /// Keep the LZ77 sliding window between messages.
     pub sliding_window: bool,
@@ -129,8 +138,11 @@ impl Default for Relay {
             max_websocket_payload_size: 131_072,
             auto_ping_seconds: 55,
             max_pending_outbound_bytes: 33_554_432,
+            max_connections: 0,
+            max_connections_per_ip: 128,
             query_timeslice_budget_microseconds: 10_000,
             limits: ReqLimits::default(),
+            rate_limits: RateLimits::default(),
             threads: Threads::default(),
             compression: Compression::default(),
             info: Info::default(),
@@ -180,12 +192,14 @@ impl Config {
         Ok(toml::from_str(&text)?)
     }
 
-    /// `nosfry_core::limits::Limits` assembled from `[events]` + `[relay.limits]`.
+    /// `nosfry_core::limits::Limits` assembled from `[events]`,
+    /// `[relay.limits]`, and `[relay.rate_limits]`.
     #[must_use]
     pub const fn limits(&self) -> Limits {
         Limits {
             event: self.events,
             req: self.relay.limits,
+            rate: self.relay.rate_limits,
         }
     }
 

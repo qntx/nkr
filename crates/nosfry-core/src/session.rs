@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::event::{Event, UnverifiedEvent};
 use crate::filter::Filter;
-use crate::limits::Limits;
+use crate::limits::{Limits, TokenBucket};
 use crate::message::{
     ClientMessage, FilterVerb, MessageError, Reason, SubId, closed_frame, neg_err_frame,
     notice_frame, ok_frame,
@@ -50,16 +50,26 @@ pub struct Session {
     limits: Arc<Limits>,
     subs: HashMap<SubId, u64, foldhash::fast::RandomState>,
     next_generation: u64,
+    /// EVENT token bucket (`None` when the rate limit is disabled).
+    event_bucket: Option<TokenBucket>,
+    /// REQ token bucket (`None` when the rate limit is disabled).
+    req_bucket: Option<TokenBucket>,
 }
 
 impl Session {
     /// New session under the given limits.
     #[must_use]
     pub fn new(limits: Arc<Limits>) -> Self {
+        let event_bucket = (limits.rate.events_per_second > 0)
+            .then(|| TokenBucket::new(limits.rate.events_per_second, limits.rate.events_burst));
+        let req_bucket = (limits.rate.reqs_per_second > 0)
+            .then(|| TokenBucket::new(limits.rate.reqs_per_second, limits.rate.reqs_burst));
         Self {
             limits,
             subs: HashMap::with_hasher(foldhash::fast::RandomState::default()),
             next_generation: 1,
+            event_bucket,
+            req_bucket,
         }
     }
 
@@ -84,7 +94,10 @@ impl Session {
     }
 
     /// Feed one text frame; append the resulting commands to `out`.
-    pub fn on_text(&mut self, now: u64, text: &str, out: &mut Vec<Command>) {
+    /// `now_ms` is the current unix time in milliseconds: the session
+    /// derives seconds for `created_at` checks and uses milliseconds
+    /// for the rate-limit buckets.
+    pub fn on_text(&mut self, now_ms: u64, text: &str, out: &mut Vec<Command>) {
         let message = match ClientMessage::parse(text) {
             Ok(message) => message,
             Err(MessageError::Event { id, source }) => {
@@ -108,9 +121,35 @@ impl Session {
                 return;
             }
         };
+        // Charge the rate-limit buckets right after a successful parse,
+        // before any other work: an over-limit client is throttled no
+        // matter what its message would have done.
         match message {
-            ClientMessage::Event(unverified) => self.on_event(now, unverified, out),
-            ClientMessage::Req { sub_id, filters } => self.on_req(sub_id, filters, out),
+            ClientMessage::Event(unverified) => {
+                if let Some(bucket) = &mut self.event_bucket
+                    && !bucket.take(now_ms)
+                {
+                    out.push(Command::Send(ok_frame(
+                        &unverified.id(),
+                        false,
+                        &Reason::RateLimited.message("slow down"),
+                    )));
+                    return;
+                }
+                self.on_event(now_ms / 1000, unverified, out);
+            }
+            ClientMessage::Req { sub_id, filters } => {
+                if let Some(bucket) = &mut self.req_bucket
+                    && !bucket.take(now_ms)
+                {
+                    out.push(Command::Send(closed_frame(
+                        &sub_id,
+                        &Reason::RateLimited.message("slow down"),
+                    )));
+                    return;
+                }
+                self.on_req(sub_id, filters, out);
+            }
             ClientMessage::Close { sub_id } => {
                 if self.subs.remove(&sub_id).is_some() {
                     out.push(Command::Unsubscribe { sub_id });

@@ -42,6 +42,11 @@ max_websocket_payload_size = 131072
 auto_ping_seconds = 55
 # Pending outbound bytes above which a connection is closed (1008).
 max_pending_outbound_bytes = 33554432
+# Maximum simultaneous WebSocket connections (0 = unlimited).
+max_connections = 0
+# Maximum simultaneous WebSocket connections per client IP (0 =
+# unlimited). IPv4 counts per address; IPv6 per /64 prefix.
+max_connections_per_ip = 128
 # Per-slice stored-scan budget in microseconds.
 query_timeslice_budget_microseconds = 10000
 
@@ -56,6 +61,15 @@ max_filter_limit = 500
 max_tags_per_filter = 3
 # Limit cap for COUNT responses.
 
+[relay.rate_limits]
+# Per-connection token buckets; over-limit EVENTs get `OK false
+# rate-limited:`, over-limit REQs get `CLOSED rate-limited:`. A
+# *_per_second of 0 disables that bucket.
+events_per_second = 20
+events_burst      = 100
+reqs_per_second   = 20
+reqs_burst        = 100
+
 [relay.threads]
 # Stored-scan reader threads.
 readers = 3
@@ -63,9 +77,10 @@ readers = 3
 monitors = 3
 
 [relay.compression]
-# Negotiate permessage-deflate. Off by default: the inflated size of an
-# inbound message is not bounded by max_websocket_payload_size, so
-# enable it only for trusted clients.
+# Negotiate permessage-deflate. Off by default: the inflated size of
+# an inbound message is not bounded by max_websocket_payload_size
+# (https://github.com/infinitefield/yawc/issues/55), so enable it only
+# for trusted clients.
 enabled = false
 # Keep the LZ77 sliding window between messages (false = no context
 # takeover either direction).

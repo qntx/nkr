@@ -349,7 +349,7 @@ async fn ephemeral_live_only() {
 async fn durability_across_restart() {
     let dir = tempfile::tempdir().unwrap();
     let config = |path: &std::path::Path| {
-        let mut c = nosfry::config::Config::default();
+        let mut c = common::config();
         c.db.path = path.to_path_buf();
         c
     };
@@ -377,7 +377,7 @@ async fn durability_across_restart() {
 async fn exactly_once_across_stored_and_live() {
     const PUBLISHERS: usize = 4;
     const PER_PUB: usize = 250;
-    let mut config = nosfry::config::Config::default();
+    let mut config = common::config();
     config.relay.query_timeslice_budget_microseconds = 1;
     config.relay.limits.max_filter_limit = 5_000;
     let relay = Relay::start_with(config).await;
@@ -480,7 +480,7 @@ async fn exactly_once_across_stored_and_live() {
 
 #[tokio::test]
 async fn too_many_subs_and_unknown_filter_key() {
-    let mut config = nosfry::config::Config::default();
+    let mut config = common::config();
     config.relay.limits.max_subs_per_connection = 1;
     let relay = Relay::start_with(config).await;
     let mut ws = relay.connect().await;
@@ -505,7 +505,7 @@ async fn too_many_subs_and_unknown_filter_key() {
 
 #[tokio::test]
 async fn oversized_frame_closes_connection() {
-    let mut config = nosfry::config::Config::default();
+    let mut config = common::config();
     config.relay.max_websocket_payload_size = 1024;
     let relay = Relay::start_with(config).await;
     let mut ws = relay.connect().await;
@@ -572,7 +572,7 @@ async fn nip11_document() {
     relay.stop().await;
 
     // Configured fields are emitted verbatim.
-    let mut config = nosfry::config::Config::default();
+    let mut config = common::config();
     config.relay.info.description = "test relay".to_owned();
     config.relay.info.pubkey = "ab".repeat(32);
     config.relay.info.contact = "admin@example.com".to_owned();
@@ -588,7 +588,7 @@ async fn nip11_document() {
 
 #[tokio::test]
 async fn slow_consumer_is_disconnected() {
-    let mut config = nosfry::config::Config::default();
+    let mut config = common::config();
     config.relay.max_pending_outbound_bytes = 4096;
     let relay = Relay::start_with(config).await;
     // Fill the store: the scan will push more than 4 KiB of events.
@@ -630,7 +630,7 @@ async fn slow_consumer_is_disconnected() {
 
 #[tokio::test]
 async fn half_open_connection_times_out() {
-    let mut config = nosfry::config::Config::default();
+    let mut config = common::config();
     config.relay.auto_ping_seconds = 1;
     let relay = Relay::start_with(config).await;
 
@@ -692,7 +692,7 @@ async fn half_open_connection_times_out() {
 
 #[tokio::test]
 async fn shutdown_with_stuck_client_returns() {
-    let mut config = nosfry::config::Config::default();
+    let mut config = common::config();
     config.relay.auto_ping_seconds = 1;
     let relay = Relay::start_with(config).await;
     // Fill the store so the REQ produces a large outbound backlog.
@@ -991,4 +991,119 @@ async fn pings_are_answered_while_idle() {
     .expect("pongs did not arrive");
     assert_eq!(pongs, N);
     relay.stop().await;
+}
+
+/// Raw HTTP/1.1 WebSocket upgrade attempt; returns the response
+/// status line ("HTTP/1.1 101 ..." / "... 429 ..."). The connection
+/// is dropped right after the status line is read.
+async fn upgrade_status(addr: std::net::SocketAddr) -> String {
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(
+        b"GET / HTTP/1.1\r\nHost: nosfry\r\nUpgrade: websocket\r\n\
+          Connection: upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+          Sec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut buf = [0u8; 512];
+    let n = tcp.read(&mut buf).await.unwrap();
+    String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn connection_cap_per_ip() {
+    let mut config = common::config();
+    config.relay.max_connections_per_ip = 2;
+    let relay = Relay::start_with(config).await;
+    let ws1 = relay.connect().await;
+    let ws2 = relay.connect().await;
+    // A third upgrade from the same IP is refused before the upgrade.
+    let status = upgrade_status(relay.addr).await;
+    assert!(status.contains("429"), "{status}");
+    // Freeing a slot admits the next connection. The release happens
+    // when the server task observes the close, so poll briefly.
+    drop(ws1);
+    let mut status = String::new();
+    for _ in 0..30 {
+        status = upgrade_status(relay.addr).await;
+        if status.contains("101") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(status.contains("101"), "{status}");
+    drop(ws2);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn connection_cap_total() {
+    let mut config = common::config();
+    config.relay.max_connections = 1;
+    let relay = Relay::start_with(config).await;
+    let _ws1 = relay.connect().await;
+    let status = upgrade_status(relay.addr).await;
+    assert!(status.contains("429"), "{status}");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn event_rate_limit_is_per_connection() {
+    let mut config = common::config();
+    config.relay.rate_limits = nosfry_core::limits::RateLimits::default();
+    let relay = Relay::start_with(config).await;
+
+    // Client A floods 500 events: past the 100-event burst the OKs
+    // turn `rate-limited:` while the connection stays open.
+    let mut a = relay.connect().await;
+    let base = now();
+    for i in 0..500u64 {
+        let ev = common::event(&key(30), 1, base, &json!([]), &format!("a{i}"));
+        send_text(&mut a, &event_wire(&ev)).await;
+    }
+    let (mut accepted, mut limited) = (0usize, 0usize);
+    for _ in 0..500 {
+        let ok = recv_text(&mut a, T).await;
+        if ok.contains("rate-limited: slow down") {
+            limited += 1;
+        } else {
+            accepted += 1;
+        }
+    }
+    assert!(limited > 0, "500 events never hit the rate limit");
+    assert!(
+        accepted <= 150,
+        "burst is 100 plus ~20/s refill while reading: {accepted}"
+    );
+
+    // Client B on its own connection keeps a full-rate bucket: it
+    // publishes and receives `OK true` and its live subscriber gets
+    // the event inside a second.
+    let mut b = relay.connect().await;
+    send_text(&mut b, &req_wire("sub", "{\"kinds\":[1]}")).await;
+    let ev_b = common::event(&key(31), 1, now(), &json!([]), "b");
+    let id_b = json(ev_b.json())["id"].clone();
+    send_text(&mut b, &event_wire(&ev_b)).await;
+    let (mut saw_ok, mut saw_event) = (false, false);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !(saw_ok && saw_event) {
+            let frame = ws_recv(&mut b).await;
+            match frame[0].as_str() {
+                Some("OK") => saw_ok = frame[2].as_bool() == Some(true),
+                Some("EVENT") => saw_event = frame[2]["id"] == id_b,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("client B was not served within 1s");
+    relay.stop().await;
+}
+
+async fn ws_recv(ws: &mut yawc::TcpWebSocket) -> Value {
+    json(&recv_text(ws, T).await)
 }

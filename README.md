@@ -30,9 +30,19 @@ At startup the relay raises its soft open-file limit to `relay.nofiles`
 hard limit above its default (systemd/containerd: 524288).
 
 `relay.compression.enabled` (permessage-deflate) is off by default:
-yawc bounds the *compressed* frame size, not the inflated one, so a
-compressed message can decompress far past `max_websocket_payload_size`
-— enable it only for trusted clients.
+yawc bounds the *compressed* frame size, not the inflated one
+([infinitefield/yawc#55]), so a compressed message can decompress far
+past `max_websocket_payload_size` — enable it only for trusted
+clients.
+
+`relay.rate_limits` throttles each connection with EVENT and REQ token
+buckets (default 20/s, burst 100); over-limit EVENTs get `OK false
+rate-limited:`, over-limit REQs get `CLOSED rate-limited:`. A
+`*_per_second` of 0 disables that bucket. `relay.max_connections`
+caps total WebSocket connections and `relay.max_connections_per_ip`
+(default 128) caps them per client IP — IPv6 is grouped per /64; an
+over-cap upgrade is refused with `429 Too Many Requests` before the
+handshake.
 
 ### systemd
 
