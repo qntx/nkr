@@ -19,7 +19,7 @@ use yawc::{Frame, HttpWebSocket, OpCode};
 
 use crate::channels::{ConnId, Out, Outbound, ShardMsg, WriteRequest, WriterMsg, route};
 use crate::metrics::Metrics;
-use crate::policy::{Decision, WritePolicy};
+use crate::policy::Decision;
 
 /// Per-connection state handed down from the server.
 #[derive(Debug, Clone)]
@@ -29,16 +29,11 @@ pub(crate) struct Handle {
     /// Monitor shard inboxes, indexed by `conn % shards.len()`; the
     /// shard owns the reader routing for scans.
     pub(crate) shards: Arc<[mpsc::Sender<ShardMsg>]>,
-    /// Session limits.
-    pub(crate) limits: Arc<nosfry_core::limits::Limits>,
-    /// Ping interval.
-    pub(crate) ping_interval: Duration,
-    /// Outbound byte budget.
-    pub(crate) max_pending_outbound: usize,
+    /// Live-reloadable state: limits/outbound budget are read once
+    /// per connection, the write policy at every publish.
+    pub(crate) live: watch::Receiver<Arc<crate::Live>>,
     /// Process-wide counters.
     pub(crate) metrics: Arc<Metrics>,
-    /// Write-policy plugin (`None` when unconfigured).
-    pub(crate) policy: Option<WritePolicy>,
     /// Broadcast shutdown signal.
     pub(crate) shutdown: watch::Receiver<bool>,
     /// Tracks every live connection task for the shutdown deadline.
@@ -85,6 +80,8 @@ struct Connection<'a> {
     session: Session,
     /// This connection's outbound queue.
     out: Outbound,
+    /// Ping interval, fixed at connect time.
+    ping_interval: Duration,
     /// Reusable drained-batch buffer (`VecDeque` keeps FIFO order and
     /// its capacity across batches without a `drain` loop).
     batch: VecDeque<Out>,
@@ -93,15 +90,19 @@ struct Connection<'a> {
 impl<'a> Connection<'a> {
     fn new(handle: &'a Handle, peer: IpAddr) -> (Self, mpsc::UnboundedReceiver<Out>) {
         let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
-        let (out, out_rx) = Outbound::new(handle.max_pending_outbound);
+        // Limits and the outbound budget are fixed at connect time;
+        // reloads apply to the next connection.
+        let live = handle.live.borrow().clone();
+        let (out, out_rx) = Outbound::new(live.config.relay.max_pending_outbound_bytes);
         (
             Self {
                 conn,
                 peer,
                 handle,
                 shard: route(&handle.shards, conn).clone(),
-                session: Session::new(Arc::clone(&handle.limits)),
+                session: Session::new(Arc::clone(&live.limits)),
                 out,
+                ping_interval: Duration::from_secs(live.config.relay.auto_ping_seconds),
                 batch: VecDeque::new(),
             },
             out_rx,
@@ -161,7 +162,7 @@ impl<'a> Connection<'a> {
     /// flush; `false` means the connection ends.
     async fn pong(&self, ws: &mut HttpWebSocket) -> bool {
         let flushed = tokio::time::timeout(
-            self.handle.ping_interval,
+            self.ping_interval,
             futures_util::future::poll_fn(|cx| {
                 futures_util::Sink::poll_ready(std::pin::Pin::new(&mut *ws), cx)
             }),
@@ -203,7 +204,10 @@ impl<'a> Connection<'a> {
     /// `shadowReject` answers `OK true` without storing or
     /// broadcasting.
     async fn policy_accepts(&self, event: &nosfry_core::event::Event) -> bool {
-        let Some(policy) = &self.handle.policy else {
+        // The policy is re-read per event so a config reload takes
+        // effect on the next publish on every connection.
+        let live = self.handle.live.borrow().clone();
+        let Some(policy) = &live.policy else {
             return true;
         };
         let (ok, message) = match policy.check(event, self.peer).await {
@@ -326,7 +330,7 @@ impl<'a> Connection<'a> {
             self.out.written(msg.accounted_bytes());
         }
         // One deadline covers every surviving feed plus the flush.
-        let result = tokio::time::timeout(self.handle.ping_interval, async {
+        let result = tokio::time::timeout(self.ping_interval, async {
             while let Some(msg) = batch.pop_front() {
                 self.feed(ws, msg).await.map_err(WriteError::Socket)?;
             }
@@ -426,11 +430,11 @@ impl<'a> Connection<'a> {
     /// Ping tick: close an idle connection (1001), else send a ping.
     /// `false` means the connection ends.
     async fn keepalive(&self, ws: &mut HttpWebSocket, last_inbound: Instant) -> bool {
-        if last_inbound.elapsed() > self.handle.ping_interval.saturating_mul(2) {
+        if last_inbound.elapsed() > self.ping_interval.saturating_mul(2) {
             self.closing(ws, CloseCode::Away, &[]).await;
             return false;
         }
-        match tokio::time::timeout(self.handle.ping_interval, ws.send(Frame::ping(&[][..]))).await {
+        match tokio::time::timeout(self.ping_interval, ws.send(Frame::ping(&[][..]))).await {
             Ok(Ok(())) => true,
             Ok(Err(err)) => {
                 tracing::debug!(%err, conn = self.conn, "ping failed");
@@ -461,7 +465,7 @@ impl<'a> Connection<'a> {
 /// Run one WebSocket connection until close, error, or shutdown.
 pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle, peer: IpAddr) {
     let (mut conn, mut out_rx) = Connection::new(handle, peer);
-    let mut ping = tokio::time::interval(handle.ping_interval);
+    let mut ping = tokio::time::interval(conn.ping_interval);
     let mut last_inbound = Instant::now();
     let mut shutdown = handle.shutdown.clone();
 

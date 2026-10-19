@@ -27,7 +27,9 @@ fn ip_key(ip: IpAddr) -> IpKey {
 }
 
 /// Caps on simultaneous connections, shared by every accepted socket.
-/// A cap of 0 means unlimited for that dimension.
+/// A cap of 0 means unlimited for that dimension. Both caps are
+/// atomics so a config reload updates them for every connection at
+/// once; connections already above a lowered cap are not closed.
 #[derive(Debug)]
 pub(crate) struct ConnectionLimiter {
     /// Live connections, counted even when `max_total` is unlimited.
@@ -36,9 +38,9 @@ pub(crate) struct ConnectionLimiter {
     /// is nonzero.
     per_ip: Mutex<HashMap<IpKey, usize, foldhash::fast::RandomState>>,
     /// Maximum `total` (0 = unlimited).
-    max_total: usize,
+    max_total: AtomicUsize,
     /// Maximum per `IpKey` (0 = unlimited and untracked).
-    max_per_ip: usize,
+    max_per_ip: AtomicUsize,
 }
 
 impl ConnectionLimiter {
@@ -47,9 +49,16 @@ impl ConnectionLimiter {
         Self {
             total: AtomicUsize::new(0),
             per_ip: Mutex::new(HashMap::with_hasher(foldhash::fast::RandomState::default())),
-            max_total,
-            max_per_ip,
+            max_total: AtomicUsize::new(max_total),
+            max_per_ip: AtomicUsize::new(max_per_ip),
         }
+    }
+
+    /// Update both caps after a config reload. Two relaxed stores can
+    /// briefly mix old and new — harmless for admission control.
+    pub(crate) fn update_caps(&self, max_total: usize, max_per_ip: usize) {
+        self.max_total.store(max_total, Ordering::Relaxed);
+        self.max_per_ip.store(max_per_ip, Ordering::Relaxed);
     }
 
     /// Live connections right now (the `nosfry_connections` gauge);
@@ -61,7 +70,7 @@ impl ConnectionLimiter {
     /// Count one new connection; `None` when a cap is reached. The
     /// mutex only ever guards a map update, never an `.await`.
     pub(crate) fn try_acquire(self: &Arc<Self>, ip: IpAddr) -> Option<ConnectionPermit> {
-        let key = (self.max_per_ip != 0).then(|| ip_key(ip));
+        let key = (self.max_per_ip.load(Ordering::Relaxed) != 0).then(|| ip_key(ip));
         if key.is_some_and(|key| !self.take_ip(key)) {
             return None;
         }
@@ -81,7 +90,7 @@ impl ConnectionLimiter {
     /// for a counter update only.
     fn take_ip(&self, key: IpKey) -> bool {
         let mut map = self.per_ip.lock().unwrap_or_else(PoisonError::into_inner);
-        if map.get(&key).copied().unwrap_or(0) >= self.max_per_ip {
+        if map.get(&key).copied().unwrap_or(0) >= self.max_per_ip.load(Ordering::Relaxed) {
             return false;
         }
         *map.entry(key).or_default() += 1;
@@ -90,13 +99,14 @@ impl ConnectionLimiter {
 
     /// Take one global slot; `false` at the cap.
     fn take_total(&self) -> bool {
-        if self.max_total == 0 {
+        let max_total = self.max_total.load(Ordering::Relaxed);
+        if max_total == 0 {
             self.total.fetch_add(1, Ordering::Relaxed);
             return true;
         }
         let mut current = self.total.load(Ordering::Relaxed);
         loop {
-            if current >= self.max_total {
+            if current >= max_total {
                 return false;
             }
             match self.total.compare_exchange_weak(

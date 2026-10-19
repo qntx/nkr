@@ -74,10 +74,72 @@ pub enum ServerError {
     Spawn(#[source] std::io::Error),
 }
 
+/// The live-reloadable slice of server state. Every reader clones the
+/// `Arc` out of a `watch` borrow — never holding the borrow across an
+/// `.await` — so a reload never blocks a request. Restart-only fields
+/// (see [`Config::reloadable_from`]) stay frozen at startup values.
+#[derive(Debug)]
+pub(crate) struct Live {
+    /// Effective configuration.
+    pub(crate) config: Arc<Config>,
+    /// Session limits assembled by [`Config::limits`]; new connections
+    /// only — existing sessions keep the limits they started with.
+    pub(crate) limits: Arc<nosfry_core::limits::Limits>,
+    /// Pre-serialized NIP-11 document, rebuilt on each reload.
+    pub(crate) nip11: axum::body::Bytes,
+    /// Active write-policy plugin; read at each publish so a reload
+    /// applies to the next event on every connection.
+    pub(crate) policy: Option<policy::WritePolicy>,
+}
+
+/// Start the write-policy task unless the plugin command is empty.
+fn start_policy(cfg: &config::WritePolicy) -> Option<policy::WritePolicy> {
+    (!cfg.plugin.is_empty())
+        .then(|| policy::WritePolicy::new(&cfg.plugin, Duration::from_secs(cfg.timeout_seconds)))
+}
+
+/// Apply reloaded configs until the `reload` channel closes: merge
+/// through [`Config::reloadable_from`], update the connection caps,
+/// and publish a fresh [`Live`]. The write-policy task is replaced
+/// only when its command or timeout changed.
+async fn reload_loop(
+    mut reload: watch::Receiver<Config>,
+    live_tx: watch::Sender<Arc<Live>>,
+    limiter: Arc<limiter::ConnectionLimiter>,
+    mut live: Arc<Live>,
+) {
+    while reload.changed().await.is_ok() {
+        let incoming = reload.borrow_and_update().clone();
+        let (merged, ignored) = live.config.reloadable_from(incoming);
+        if !ignored.is_empty() {
+            tracing::warn!(?ignored, "restart-only keys ignored on config reload");
+        }
+        let merged = Arc::new(merged);
+        limiter.update_caps(
+            merged.relay.max_connections,
+            merged.relay.max_connections_per_ip,
+        );
+        let policy = if merged.relay.write_policy == live.config.relay.write_policy {
+            live.policy.clone()
+        } else {
+            start_policy(&merged.relay.write_policy)
+        };
+        live = Arc::new(Live {
+            config: Arc::clone(&merged),
+            limits: Arc::new(merged.limits()),
+            nip11: http::nip11(&merged).into(),
+            policy,
+        });
+        live_tx.send_replace(Arc::clone(&live));
+        tracing::info!("configuration reloaded");
+    }
+}
+
 /// A running server: router state plus the worker threads.
 #[derive(Debug)]
 pub struct Server {
     state: http::AppState,
+    live_tx: watch::Sender<Arc<Live>>,
     stop_tx: watch::Sender<bool>,
     writer_tx: mpsc::Sender<WriterMsg>,
     /// Dropping this unblocks the expiry timer's `recv_timeout` at once.
@@ -182,34 +244,31 @@ impl Server {
             );
         }
         let metrics = Arc::new(metrics::Metrics::new());
-        let policy = (!config.relay.write_policy.plugin.is_empty()).then(|| {
-            policy::WritePolicy::new(
-                &config.relay.write_policy.plugin,
-                Duration::from_secs(config.relay.write_policy.timeout_seconds),
-            )
-        });
+        let (live_tx, live_rx) = watch::channel(Arc::new(Live {
+            config: Arc::clone(&config),
+            limits: Arc::new(config.limits()),
+            nip11: http::nip11(&config).into(),
+            policy: start_policy(&config.relay.write_policy),
+        }));
         let conn = connection::Handle {
             writer: writer_tx.clone(),
             shards: Arc::from(shard_txs.as_slice()),
-            limits: Arc::new(config.limits()),
-            ping_interval: Duration::from_secs(config.relay.auto_ping_seconds),
-            max_pending_outbound: config.relay.max_pending_outbound_bytes,
+            live: live_rx.clone(),
             metrics: Arc::clone(&metrics),
-            policy,
             shutdown: stop_rx,
             tracker: tokio_util::task::TaskTracker::new(),
         };
         Ok(Self {
             state: http::AppState {
-                nip11: http::nip11(&config).into(),
+                live: live_rx,
                 conn,
                 metrics,
                 limiter: Arc::new(limiter::ConnectionLimiter::new(
                     config.relay.max_connections,
                     config.relay.max_connections_per_ip,
                 )),
-                config,
             },
+            live_tx,
             stop_tx,
             writer_tx,
             expire_stop,
@@ -345,7 +404,10 @@ async fn wait_for(tracker: &tokio_util::task::TaskTracker, what: &str) {
     }
 }
 
-/// Run the relay until `shutdown` resolves.
+/// Run the relay until `shutdown` resolves. `reload` yields new
+/// configurations (the binary sends on SIGHUP); each one is merged
+/// through [`Config::reloadable_from`] and applied without
+/// interrupting service.
 ///
 /// # Errors
 ///
@@ -355,8 +417,17 @@ pub async fn serve(
     config: Config,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    reload: watch::Receiver<Config>,
 ) -> Result<(), ServerError> {
     let server = Server::new(config)?;
+    // The reload task ends when the sender side drops; it shares
+    // neither the connection tracker nor the shutdown signal.
+    tokio::spawn(reload_loop(
+        reload,
+        server.live_tx.clone(),
+        Arc::clone(&server.state.limiter),
+        server.live_tx.borrow().clone(),
+    ));
     let stop = server.stop_tx.clone();
     let tracker = server.state.conn.tracker.clone();
     // HTTP/1 only, with a header-read deadline `axum::serve` cannot set.

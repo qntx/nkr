@@ -1,7 +1,9 @@
 # nosfry relay configuration — every key shown with its default.
 # Copy to nosfry.toml (or pass --config / set NOSFRY_CONFIG).
+# SIGHUP reloads this file without restarting; sections marked
+# "restart-only" keep their startup values until the next start.
 
-[db]
+[db] # restart-only
 # LMDB environment directory.
 path = "./nosfry-db"
 # Map size in bytes (10 TiB default).
@@ -26,11 +28,11 @@ max_num_tags = 2000
 max_tag_val_size = 1024
 
 [relay]
-# Listen address and port.
+# Listen address and port (restart-only).
 bind = "127.0.0.1"
 port = 7777
 # Raise the soft open-file limit at startup up to this value, capped by
-# the hard limit; 0 leaves it unchanged.
+# the hard limit; 0 leaves it unchanged (restart-only).
 nofiles = 1000000
 # Header carrying the real client IP (empty = socket address). The
 # last comma-separated value is trusted — set this only behind a proxy
@@ -48,9 +50,10 @@ max_connections = 0
 # unlimited). IPv4 counts per address; IPv6 per /64 prefix.
 max_connections_per_ip = 128
 # Serve GET /metrics (Prometheus text exposition format) on the relay
-# port. Unauthenticated — keep it behind a reverse proxy or firewall.
+# port. Unauthenticated — keep it behind a reverse proxy or firewall
+# (restart-only).
 metrics = false
-# Per-slice stored-scan budget in microseconds.
+# Per-slice stored-scan budget in microseconds (restart-only).
 query_timeslice_budget_microseconds = 10000
 
 [relay.limits]
@@ -58,7 +61,8 @@ query_timeslice_budget_microseconds = 10000
 max_req_filter_size = 200
 # Maximum open subscriptions per connection.
 max_subs_per_connection = 200
-# Per-filter limit cap for stored scans.
+# Per-filter limit cap for stored scans (restart-only — readers hold
+# it for the process lifetime).
 max_filter_limit = 500
 # Maximum `#x` conditions per filter.
 max_tags_per_filter = 3
@@ -82,7 +86,7 @@ plugin = ""
 # `error: internal error` and the plugin process is restarted.
 timeout_seconds = 10
 
-[relay.threads]
+[relay.threads] # restart-only
 # Stored-scan reader threads.
 readers = 3
 # Live-monitor shard threads.

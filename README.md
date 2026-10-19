@@ -65,6 +65,21 @@ with `error: internal error` and a fresh plugin process serves the next
 event. A plugin configured as a bare path is reloaded automatically
 when the file's mtime changes.
 
+SIGHUP reloads the configuration file without restarting: the relay
+re-reads it, logs an error and keeps the running configuration on a
+parse failure, and applies everything except the restart-only keys —
+`[db]`, `relay.bind`, `relay.port`, `relay.nofiles`, `relay.metrics`,
+`relay.threads`, `relay.query_timeslice_budget_microseconds`, and
+`relay.limits.max_filter_limit` — which are logged as ignored. Session
+limits and connection options (`events`, `relay.limits`,
+`relay.rate_limits`, payload size, ping interval, outbound budget,
+compression, `real_ip_header`, NIP-11, the write-policy plugin) apply
+to new connections and new publishes; existing connections keep the
+limits they started with, while `max_connections` /
+`max_connections_per_ip` and the write-policy decision take effect for
+every connection at once. `docker kill -s HUP nosfry` reloads inside a
+container.
+
 ### systemd
 
 ```ini
@@ -76,6 +91,7 @@ After=network.target
 User=nosfry
 WorkingDirectory=/var/lib/nosfry
 ExecStart=/usr/local/bin/nosfry --config /etc/nosfry/nosfry.toml relay
+ExecReload=/bin/kill -HUP $MAINPID
 # The relay raises its own soft limit; this lifts the hard limit.
 LimitNOFILE=1000000
 TimeoutStopSec=20

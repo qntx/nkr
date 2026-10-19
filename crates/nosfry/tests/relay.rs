@@ -15,6 +15,7 @@
 
 mod common;
 
+use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{Relay, close_wire, event_wire, key, recv_text, req_wire, send_text};
@@ -1601,4 +1602,231 @@ async fn write_policy_does_not_block_shutdown() {
     assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
     // `stop` joins `serve()`; a stuck policy task would hang this.
     tokio::time::timeout(T, relay.stop()).await.unwrap();
+}
+
+// Config hot-reload tests: `relay.reload(config)` is what the binary
+// sends down the channel on SIGHUP. Each reload also bumps
+// `relay.info.name`, so the NIP-11 document is the deterministic
+// "reload applied" marker for the tests below.
+
+/// Poll `check` until it holds or ~5 s pass (reload is applied by a
+/// background task).
+async fn wait_until<F, Fut>(mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = bool>,
+{
+    for _ in 0..100 {
+        if check().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// `relay.info.name` as served by NIP-11 right now.
+async fn nip11_name(addr: std::net::SocketAddr) -> String {
+    nip11_body(&http_get(addr, "/").await)["name"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// A base config with the marker `name` set, so `wait_until` can
+/// detect that this exact reload was applied.
+fn reload_config(marker: &str) -> nosfry::config::Config {
+    let mut config = common::config();
+    config.relay.info.name = String::from(marker);
+    config
+}
+
+#[tokio::test]
+async fn reload_updates_nip11() {
+    let relay = Relay::start().await;
+    assert_eq!(nip11_name(relay.addr).await, "nosfry");
+    relay.reload(reload_config("hot reload"));
+    assert!(
+        wait_until(|| async { nip11_name(relay.addr).await == "hot reload" }).await,
+        "NIP-11 never picked up the reload"
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn reload_enables_policy_on_existing_connection() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"printf '{"id":"%s","action":"reject","msg":"blocked: nope"}\n' "$id""#,
+    ));
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+
+    let ev = common::event(&key(7), 1, now(), &json!([]), "before");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+
+    // Enable the rejecting plugin: the next event on THIS already-open
+    // connection is refused.
+    let mut config = reload_config("policy on");
+    config.relay.write_policy.plugin = plugin.clone();
+    relay.reload(config);
+    assert!(wait_until(|| async { nip11_name(relay.addr).await == "policy on" }).await);
+    let ev = common::event(&key(7), 1, now(), &json!([]), "during");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(
+        recv_ok(&mut ws, &ev).await,
+        json!(["OK", ev.id().to_string(), false, "blocked: nope"])
+    );
+
+    // Disable it again: the same connection accepts right away.
+    relay.reload(reload_config("policy off"));
+    assert!(wait_until(|| async { nip11_name(relay.addr).await == "policy off" }).await);
+    let ev = common::event(&key(7), 1, now(), &json!([]), "after");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn reload_lowers_per_ip_cap() {
+    let mut config = common::config();
+    config.relay.max_connections_per_ip = 5;
+    let relay = Relay::start_with(config).await;
+    let mut first = relay.connect().await;
+    let _second = relay.connect().await;
+
+    let mut config = reload_config("cap lowered");
+    config.relay.max_connections_per_ip = 2;
+    relay.reload(config);
+    assert!(wait_until(|| async { nip11_name(relay.addr).await == "cap lowered" }).await);
+
+    // The next upgrade is refused; connections already above the
+    // lowered cap stay open and usable.
+    let status = upgrade_status(relay.addr).await;
+    assert!(status.contains("429"), "{status}");
+    let ev = common::event(&key(7), 1, now(), &json!([]), "still alive");
+    send_text(&mut first, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut first, &ev).await[2], true);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn reload_rate_limits_apply_to_new_connections() {
+    // `common::config()` disables the buckets; a reload enables a
+    // strict one. The existing connection keeps its unlimited
+    // session; a fresh connection is limited.
+    let relay = Relay::start().await;
+    let mut old_ws = relay.connect().await;
+
+    let mut config = reload_config("limits on");
+    config.relay.rate_limits = nosfry_core::limits::RateLimits {
+        events_per_second: 1,
+        events_burst: 1,
+        reqs_per_second: 0,
+        reqs_burst: 0,
+    };
+    relay.reload(config);
+    assert!(wait_until(|| async { nip11_name(relay.addr).await == "limits on" }).await);
+
+    for content in ["a", "b", "c"] {
+        let ev = common::event(&key(7), 1, now(), &json!([]), content);
+        send_text(&mut old_ws, &event_wire(&ev)).await;
+        assert_eq!(recv_ok(&mut old_ws, &ev).await[2], true, "{content}");
+    }
+
+    let mut new_ws = relay.connect().await;
+    let ev = common::event(&key(8), 1, now(), &json!([]), "first");
+    send_text(&mut new_ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut new_ws, &ev).await[2], true);
+    let ev = common::event(&key(8), 1, now(), &json!([]), "second");
+    send_text(&mut new_ws, &event_wire(&ev)).await;
+    assert_eq!(
+        recv_ok(&mut new_ws, &ev).await,
+        json!(["OK", ev.id().to_string(), false, "rate-limited: slow down"])
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn reload_port_change_is_ignored() {
+    let relay = Relay::start().await;
+    let mut config = reload_config("port changed");
+    config.relay.port = 1;
+    relay.reload(config);
+    assert!(wait_until(|| async { nip11_name(relay.addr).await == "port changed" }).await);
+    // Restart-only fields are kept: the relay still serves on the
+    // original port.
+    let mut ws = relay.connect().await;
+    let ev = common::event(&key(7), 1, now(), &json!([]), "hi");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    relay.stop().await;
+}
+
+/// The binary re-reads its config file on SIGHUP: a broken file logs
+/// an error and keeps the running configuration, a fixed one applies.
+#[cfg(unix)]
+#[tokio::test]
+async fn sighup_reloads_config_and_ignores_broken() {
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    // Grab a free port for the spawned relay.
+    let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let cfg_path = dir.path().join("nosfry.toml");
+    let write_config = |name: &str| {
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[db]\npath = {:?}\n[relay]\nport = {port}\n\
+                 [relay.info]\nname = \"{name}\"\n",
+                dir.path().join("db")
+            ),
+        )
+        .unwrap();
+    };
+    write_config("before");
+    let err_log = dir.path().join("stderr.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nosfry"))
+        .args(["relay", "--config"])
+        .arg(&cfg_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&err_log).unwrap()))
+        .spawn()
+        .unwrap();
+    let sighup = |child: &std::process::Child| {
+        let status = Command::new("kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    let up = wait_until(|| async { tokio::net::TcpStream::connect(addr).await.is_ok() }).await;
+    assert!(up, "spawned relay never listened");
+
+    // A broken config is logged and ignored.
+    std::fs::write(&cfg_path, "not = [valid\n").unwrap();
+    sighup(&child);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tokio::net::TcpStream::connect(addr).await.is_ok(),
+        "relay died on a broken reload"
+    );
+    let log = std::fs::read_to_string(&err_log).unwrap();
+    assert!(log.contains("config reload failed"), "{log}");
+    assert_eq!(nip11_name(addr).await, "before");
+
+    // A fixed config applies on the next SIGHUP.
+    write_config("after");
+    sighup(&child);
+    let applied = wait_until(|| async { nip11_name(addr).await == "after" }).await;
+    drop(child.kill());
+    drop(child.wait());
+    assert!(applied, "SIGHUP never applied the fixed config");
 }
