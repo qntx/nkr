@@ -38,6 +38,38 @@ points at the config file too. `RUST_LOG` controls tracing;
 `RUST_LOG_JSON=1` selects JSON logs. SIGINT/SIGTERM shut down
 gracefully.
 
+## Administration
+
+The binary ships strfry-style administration commands. `--config` is a
+global flag, so `nosfry --config nosfry.toml <command>` and
+`nosfry <command> --config nosfry.toml` are equivalent. All commands
+write logs to stderr; event output goes to stdout.
+
+```bash
+nosfry export [--since <unix>] [--until <unix>] [--reverse] > dump.jsonl
+nosfry import [--show-rejected] < dump.jsonl
+nosfry scan '{"kinds":[1],"limit":10}' [--count]
+nosfry compact <dest-file>
+```
+
+- `export` writes every stored event as one JSON line, ordered by
+  `created_at` (newest first with `--reverse`), over a consistent
+  snapshot.
+- `import` verifies each line's signature and stores verified events in
+  batches; malformed, oversized, or invalid lines are rejected and
+  counted. Unlike relay ingest there is no `created_at` time-window
+  check, so archives of any age import cleanly. Events imported while
+  the relay is running are stored and queryable but are not broadcast
+  to live subscriptions.
+- `scan` runs a `REQ` filter over the whole database in newest-first
+  order; `--count` prints the match count only.
+- `compact` writes a compacted copy of the database to a new file and
+  refuses to overwrite an existing one.
+
+`export`, `scan`, and `compact` fail with `no database at <path>` when
+`<db.path>/data.mdb` does not exist; `import` creates the database like
+`relay` does.
+
 ## License
 
 Licensed under either of:

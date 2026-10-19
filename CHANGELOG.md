@@ -10,6 +10,29 @@ The format is based on [Keep a Changelog]; this project follows
 
 ## [Unreleased]
 
+### Added
+
+- Administration commands on the `nosfry` binary: `export` writes every
+  stored event as JSON lines ordered by `created_at` (with `--since`,
+  `--until`, and `--reverse`), `import` verifies and stores event JSON
+  lines from stdin in 10 000-event batches without a `created_at`
+  time-window check (`--show-rejected` logs each rejected line), `scan`
+  runs a `REQ` filter over the whole database in newest-first order
+  (with `--count`), and `compact` copies the database to a compacted
+  file. Read-only commands fail with `no database at <path>` when the
+  database does not exist.
+- `Store::export` (snapshot-consistent chronological streaming via
+  `ix_time`) and `Store::compact_to` (compacted environment copy) in
+  `nosfry-lmdb`.
+- `nosfry::admin`, the library API behind the administration commands.
+
+### Changed
+
+- `--config` is a global flag on the `nosfry` binary: it works before
+  or after the subcommand, not just on `relay`.
+- All logs go to stderr (previously stdout), keeping stdout clean for
+  `export` and `scan` output.
+
 ## [0.1.0] - 2026-10-19
 
 ### Added

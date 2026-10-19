@@ -24,9 +24,11 @@
     )
 )]
 
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
+use heed::CompactionOption;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 use nosfry_core::event::{Event, supersedes};
@@ -360,6 +362,79 @@ impl Store {
     /// A TLS-less read transaction; callers drop it before returning.
     pub(crate) fn read_txn(&self) -> Result<Reader<'_>, StoreError> {
         Ok(self.env.read_txn()?)
+    }
+
+    /// Stream every stored event's canonical JSON to `emit`, ordered by
+    /// `created_at` then seq (descending when `reverse`), inclusively
+    /// bounded by `since`/`until`. One read transaction, so the stream
+    /// is a consistent snapshot. Returns the emitted count.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
+    /// broken index invariant, [`StoreError::Io`] when `emit` fails.
+    pub fn export(
+        &self,
+        since: u64,
+        until: u64,
+        reverse: bool,
+        emit: &mut dyn FnMut(&str) -> std::io::Result<()>,
+    ) -> Result<u64, StoreError> {
+        let txn = self.read_txn()?;
+        let mut lo = Vec::with_capacity(16);
+        lo.extend_from_slice(&since.to_be_bytes());
+        lo.extend_from_slice(&u64::MIN.to_be_bytes());
+        let mut hi = Vec::with_capacity(16);
+        hi.extend_from_slice(&until.to_be_bytes());
+        hi.extend_from_slice(&u64::MAX.to_be_bytes());
+        let bounds = (
+            Bound::Included(lo.as_slice()),
+            Bound::Included(hi.as_slice()),
+        );
+        let mut count = 0u64;
+        let mut emit_row = |key: &[u8]| -> Result<(), StoreError> {
+            let seq: &[u8; 8] = key
+                .get(8..)
+                .and_then(|s| s.try_into().ok())
+                .ok_or(StoreError::Corrupt("bad ix_time key"))?;
+            let Some(bytes) = self.payloads.get(&txn, seq)? else {
+                return Err(StoreError::Corrupt("ix_time points at a missing payload"));
+            };
+            let json = std::str::from_utf8(bytes)
+                .map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?;
+            emit(json)?;
+            count += 1;
+            Ok(())
+        };
+        if reverse {
+            for entry in self.ix_time.rev_range(&txn, &bounds)? {
+                emit_row(entry?.0)?;
+            }
+        } else {
+            for entry in self.ix_time.range(&txn, &bounds)? {
+                emit_row(entry?.0)?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Copy the environment to `dest` with LMDB compaction, producing a
+    /// single `data.mdb`-style file. `dest` must not already exist.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when `dest` exists or cannot be created,
+    /// [`StoreError::Heed`] on LMDB failure.
+    pub fn compact_to(&self, dest: &Path) -> Result<(), StoreError> {
+        if dest.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("output file '{}' exists, not overwriting", dest.display()),
+            )
+            .into());
+        }
+        self.env.copy_to_path(dest, CompactionOption::Enabled)?;
+        Ok(())
     }
 
     fn next_seq(&self, txn: &Reader<'_>) -> Result<u64, StoreError> {

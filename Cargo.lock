@@ -1175,7 +1175,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "faster-hex",
@@ -1217,7 +1217,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-lmdb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "criterion",
  "faster-hex",
