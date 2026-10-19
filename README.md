@@ -24,6 +24,11 @@ its default and a comment. `NOSFRY_CONFIG` points at the config file,
 `RUST_LOG` controls tracing, `RUST_LOG_JSON=1` selects JSON logs, and
 SIGINT/SIGTERM shut down gracefully.
 
+At startup the relay raises its soft open-file limit to `relay.nofiles`
+(default 1,000,000; `0` disables), capped by the hard limit — systemd
+`LimitNOFILE=` and `docker --ulimit nofile=` are only needed to lift the
+hard limit above its default (systemd/containerd: 524288).
+
 ### systemd
 
 ```ini
@@ -35,6 +40,7 @@ After=network.target
 User=nosfry
 WorkingDirectory=/var/lib/nosfry
 ExecStart=/usr/local/bin/nosfry --config /etc/nosfry/nosfry.toml relay
+# The relay raises its own soft limit; this lifts the hard limit.
 LimitNOFILE=1000000
 TimeoutStopSec=20
 Restart=on-failure

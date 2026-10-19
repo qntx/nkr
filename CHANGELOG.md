@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- `[relay] nofiles` (default 1,000,000, `0` disables): the binary raises
+  its soft open-file limit at startup, capped by the hard limit, so
+  systemd/containerd's 1024 default no longer caps connection count.
+  Failures warn and do not abort startup.
 - NIP-09 event deletion: kind-5 `e` tags delete the author's own events
   by id and `a` tags delete the author's own replaceable/addressable
   events at an address (versions with `created_at` not newer than the

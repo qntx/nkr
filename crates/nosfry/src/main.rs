@@ -160,7 +160,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Raise the soft open-file limit toward `target`, capped by the hard
+/// limit (`rlimit` never lowers it and is a no-op off unix). systemd and
+/// containerd hand processes a soft limit of 1024, which would cap the
+/// relay near 1000 connections. The resulting limit is logged next to
+/// the target, so a hard-limit cap is visible without warning on every
+/// default start. Unlike strfry, a failure only warns: a relay that can
+/// still start should start.
+fn raise_nofile_limit(target: u64) {
+    if target == 0 {
+        return;
+    }
+    match rlimit::increase_nofile_limit(target) {
+        Ok(limit) => tracing::info!(limit, requested = target, "open-file limit"),
+        Err(err) => tracing::warn!(%err, "could not raise open-file limit"),
+    }
+}
+
 async fn relay(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    raise_nofile_limit(config.relay.nofiles);
     let addr = (config.relay.bind, config.relay.port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await

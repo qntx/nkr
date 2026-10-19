@@ -29,6 +29,9 @@ max_tag_val_size = 1024
 # Listen address and port.
 bind = "127.0.0.1"
 port = 7777
+# Raise the soft open-file limit at startup up to this value, capped by
+# the hard limit; 0 leaves it unchanged.
+nofiles = 1000000
 # Header carrying the real client IP (empty = socket address).
 real_ip_header = ""
 # Maximum inbound WebSocket payload in bytes.
