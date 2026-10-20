@@ -1457,3 +1457,210 @@ fn vanish_resume_survives_reopen() {
     );
     assert_eq!(served_ids(&reopened, &mentioner).len(), 100);
 }
+
+/// The `PublicKey` of a test keypair (x-only, 32 bytes).
+fn pubkey_of(keypair: &secp256k1::Keypair) -> nosfry_core::event::PublicKey {
+    nosfry_core::event::PublicKey(keypair.x_only_public_key().0.to_byte_array())
+}
+
+#[test]
+fn moderation_ops_round_trip() {
+    let (_dir, store) = store();
+    let (a, b) = (key(1), key(2));
+    let (pk_a, pk_b) = (pubkey_of(&a), pubkey_of(&b));
+
+    // Ban with a reason; the ban drops a later-added allow entry and
+    // unban leaves an allow entry untouched.
+    let mut m = store
+        .moderate(nosfry_lmdb::ModOp::BanPubkey {
+            pubkey: pk_a,
+            reason: Some("spam".into()),
+        })
+        .unwrap();
+    assert_eq!(m.banned_pubkeys[&pk_a].as_deref(), Some("spam"));
+    m = store
+        .moderate(nosfry_lmdb::ModOp::AllowPubkey {
+            pubkey: pk_a,
+            reason: None,
+        })
+        .unwrap();
+    assert!(m.allowed_pubkeys.contains_key(&pk_a) && m.banned_pubkeys.is_empty());
+    m = store
+        .moderate(nosfry_lmdb::ModOp::UnbanPubkey { pubkey: pk_a })
+        .unwrap();
+    assert!(
+        m.allowed_pubkeys.contains_key(&pk_a),
+        "unbanpubkey leaves an allow entry"
+    );
+    m = store
+        .moderate(nosfry_lmdb::ModOp::UnallowPubkey { pubkey: pk_a })
+        .unwrap();
+    assert!(m.allowed_pubkeys.is_empty());
+    store
+        .moderate(nosfry_lmdb::ModOp::BanPubkey {
+            pubkey: pk_b,
+            reason: None,
+        })
+        .unwrap();
+    m = store
+        .moderate(nosfry_lmdb::ModOp::UnbanPubkey { pubkey: pk_b })
+        .unwrap();
+    assert!(m.banned_pubkeys.is_empty() && m.allowed_pubkeys.is_empty());
+
+    // allowkind/disallowkind swap the single state byte.
+    store
+        .moderate(nosfry_lmdb::ModOp::DisallowKind { kind: 4 })
+        .unwrap();
+    m = store
+        .moderate(nosfry_lmdb::ModOp::AllowKind { kind: 4 })
+        .unwrap();
+    assert!(m.allowed_kinds.contains(&4) && !m.disallowed_kinds.contains(&4));
+    m = store
+        .moderate(nosfry_lmdb::ModOp::DisallowKind { kind: 4 })
+        .unwrap();
+    assert!(m.disallowed_kinds.contains(&4) && !m.allowed_kinds.contains(&4));
+
+    // IPs are stored canonical; both families round-trip.
+    let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+    store
+        .moderate(nosfry_lmdb::ModOp::BlockIp {
+            ip: v6,
+            reason: Some("abuse".into()),
+        })
+        .unwrap();
+    m = store
+        .moderate(nosfry_lmdb::ModOp::BlockIp {
+            ip: "127.0.0.1".parse().unwrap(),
+            reason: None,
+        })
+        .unwrap();
+    assert!(m.ip_blocked(&v6));
+    assert!(m.blocked_ips[&"127.0.0.1".parse().unwrap()].is_none());
+    m = store
+        .moderate(nosfry_lmdb::ModOp::UnblockIp { ip: v6 })
+        .unwrap();
+    assert!(!m.ip_blocked(&v6));
+
+    // NIP-11 overrides, including the empty-string override.
+    m = store
+        .moderate(nosfry_lmdb::ModOp::SetInfo {
+            field: nosfry_lmdb::InfoField::Name,
+            value: "ops".into(),
+        })
+        .unwrap();
+    assert_eq!(m.name.as_deref(), Some("ops"));
+    m = store
+        .moderate(nosfry_lmdb::ModOp::SetInfo {
+            field: nosfry_lmdb::InfoField::Description,
+            value: String::new(),
+        })
+        .unwrap();
+    assert_eq!(m.description.as_deref(), Some(""));
+}
+
+#[test]
+fn banevent_deletes_the_stored_event_and_survives_reopen() {
+    let (dir, store) = store();
+    let author = key(1);
+    let note = event(&author, 1, 100, &json!([]), "hi");
+    let keep = event(&author, 1, 110, &json!([]), "keep");
+    store
+        .write(&[Arc::clone(&note), Arc::clone(&keep)], None)
+        .unwrap();
+
+    let mut m = store
+        .moderate(nosfry_lmdb::ModOp::BanEvent {
+            id: note.id(),
+            reason: Some("illegal".into()),
+        })
+        .unwrap();
+    assert_eq!(m.banned_events[&note.id()].as_deref(), Some("illegal"));
+    assert_eq!(served_ids(&store, &author), vec![keep.id().to_string()]);
+    assert_eq!(m.blocked_reason(&note), Some("blocked: event banned"));
+    assert_eq!(m.blocked_reason(&keep), None);
+    m = store
+        .moderate(nosfry_lmdb::ModOp::UnbanEvent { id: note.id() })
+        .unwrap();
+    assert!(m.banned_events.is_empty());
+
+    // The ban (and every other `mod_*` row) persists across reopen.
+    store
+        .moderate(nosfry_lmdb::ModOp::BanEvent {
+            id: keep.id(),
+            reason: None,
+        })
+        .unwrap();
+    drop(store);
+    let reopened = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+    m = reopened.moderation().unwrap();
+    assert!(m.banned_events.contains_key(&keep.id()));
+    assert_eq!(served_ids(&reopened, &author), Vec::<String>::new());
+}
+
+#[test]
+fn blocked_reason_enforces_bans_and_allow_lists() {
+    let (_dir, store) = store();
+    let (a, b) = (key(1), key(2));
+    let pk_of = pubkey_of;
+    let note_a = event(&a, 1, 100, &json!([]), "a");
+    let note_b = event(&b, 4, 100, &json!([]), "b");
+
+    // Empty snapshot blocks nothing.
+    let mut m = store.moderation().unwrap();
+    assert_eq!(m.blocked_reason(&note_a), None);
+
+    // Banned author; other authors unaffected.
+    m = store
+        .moderate(nosfry_lmdb::ModOp::BanPubkey {
+            pubkey: pk_of(&a),
+            reason: None,
+        })
+        .unwrap();
+    assert_eq!(
+        m.blocked_reason(&note_a),
+        Some("blocked: pubkey not allowed")
+    );
+    assert_eq!(m.blocked_reason(&note_b), None);
+
+    // A non-empty allow list blocks everyone not on it.
+    store
+        .moderate(nosfry_lmdb::ModOp::UnbanPubkey { pubkey: pk_of(&a) })
+        .unwrap();
+    m = store
+        .moderate(nosfry_lmdb::ModOp::AllowPubkey {
+            pubkey: pk_of(&b),
+            reason: None,
+        })
+        .unwrap();
+    assert_eq!(
+        m.blocked_reason(&note_a),
+        Some("blocked: pubkey not allowed")
+    );
+    assert_eq!(m.blocked_reason(&note_b), None);
+
+    // disallowed kind 4; a non-empty allowed-kinds list blocks kinds
+    // not on it.
+    store
+        .moderate(nosfry_lmdb::ModOp::UnallowPubkey { pubkey: pk_of(&b) })
+        .unwrap();
+    m = store
+        .moderate(nosfry_lmdb::ModOp::DisallowKind { kind: 4 })
+        .unwrap();
+    assert_eq!(m.blocked_reason(&note_b), Some("blocked: kind not allowed"));
+    assert_eq!(m.blocked_reason(&note_a), None);
+    m = store
+        .moderate(nosfry_lmdb::ModOp::AllowKind { kind: 4 })
+        .unwrap();
+    assert_eq!(m.blocked_reason(&note_b), None, "kind 4 was allowed");
+    store
+        .moderate(nosfry_lmdb::ModOp::AllowKind { kind: 1 })
+        .unwrap();
+    let note_c = event(&a, 7, 100, &json!([]), "c");
+    m = store.moderation().unwrap();
+    assert_eq!(
+        m.blocked_reason(&note_c),
+        Some("blocked: kind not allowed"),
+        "kind 7 is not on the allow list"
+    );
+    assert_eq!(m.blocked_reason(&note_a), None);
+}

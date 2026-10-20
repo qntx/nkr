@@ -10,12 +10,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
-use nosfry_core::auth::ReadGate;
+use nosfry_core::auth::{AUTH_KIND, ReadGate};
 use nosfry_core::event::PublicKey;
 use nosfry_core::filter::Filter;
 use nosfry_core::limits::AddressBuckets;
 use nosfry_core::message::{RelayVerb, SubId, closed_frame, event_frame, notice_frame, ok_frame};
 use nosfry_core::session::{Command, Session, SubKey};
+use nosfry_lmdb::Moderation;
 use tokio::sync::{mpsc, watch};
 use yawc::close::CloseCode;
 use yawc::{Frame, HttpWebSocket, OpCode};
@@ -38,6 +39,9 @@ pub(crate) struct Handle {
     /// Live-reloadable state: limits/outbound budget are read once
     /// per connection, the write policy at every publish.
     pub(crate) live: watch::Receiver<Arc<crate::Live>>,
+    /// Latest NIP-86 snapshot; cloned per publish, never borrowed
+    /// across an `.await`.
+    pub(crate) moderation: watch::Receiver<Arc<Moderation>>,
     /// Process-wide counters.
     pub(crate) metrics: Arc<Metrics>,
     /// Process-wide pending outbound bytes shared by every `Outbound`.
@@ -263,6 +267,27 @@ impl<'a> Connection<'a> {
         }
     }
 
+    /// NIP-86 publish gate, checked before the write-policy plugin
+    /// and covering ephemeral events: banned authors/ids/kinds get a
+    /// `blocked:` `OK`. AUTH events and requests to vanish naming this
+    /// relay are exempt — a banned author may still vanish.
+    fn moderation_allows(&self, event: &nosfry_core::event::Event) -> bool {
+        if event.kind() == AUTH_KIND
+            || event.requests_vanish(self.handle.live.borrow().limits.auth.relay())
+        {
+            return true;
+        }
+        let Some(reason) = self.handle.moderation.borrow().blocked_reason(event) else {
+            return true;
+        };
+        self.out.push(Out::Frame {
+            sub: None,
+            verb: RelayVerb::Ok,
+            text: ok_frame(&event.id(), false, reason),
+        });
+        false
+    }
+
     /// Ask the write-policy plugin and answer the client when it
     /// vetoes. `false` means the event stops here: `reject` answers
     /// `OK false` (`blocked: rejected by write policy` when the plugin
@@ -301,11 +326,15 @@ impl<'a> Connection<'a> {
         false
     }
 
-    /// Run the write-policy plugin (when configured), then broadcast an
-    /// ephemeral event or queue a stored write; the writer pushes the
-    /// `OK` onto this connection's `Outbound` itself.
+    /// Run the NIP-86 moderation snapshot and the write-policy plugin
+    /// (when configured), then broadcast an ephemeral event or queue a
+    /// stored write; the writer pushes the `OK` onto this connection's
+    /// `Outbound` itself.
     async fn publish(&self, event: Arc<nosfry_core::event::Event>, authed: Option<PublicKey>) {
         self.handle.metrics.event(u16::from(event.kind()));
+        if !self.moderation_allows(&event) {
+            return;
+        }
         if !self.policy_accepts(&event, authed).await {
             return;
         }

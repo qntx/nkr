@@ -20,7 +20,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::{Relay, close_wire, count_wire, event_wire, key, recv_text, req_wire, send_text};
 use futures_util::{SinkExt, StreamExt};
+use nosfry_core::event::Event;
 use serde_json::{Value, json};
+use sha2::Digest as _;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const T: Duration = Duration::from_secs(15);
@@ -1429,7 +1431,7 @@ fn policy_config(plugin: &str, timeout_seconds: u64) -> nosfry::config::Config {
 }
 
 /// Receive one frame and assert it is `["OK", <event id>, ...]`.
-async fn recv_ok(ws: &mut yawc::TcpWebSocket, event: &nosfry_core::event::Event) -> Value {
+async fn recv_ok(ws: &mut yawc::TcpWebSocket, event: &Event) -> Value {
     let ok = json(&recv_text(ws, T).await);
     assert_eq!(ok[0], "OK", "{ok}");
     assert_eq!(ok[1], event.id().to_string(), "{ok}");
@@ -2521,10 +2523,7 @@ async fn neg_sync(
 }
 
 /// Publish each event over `pub_ws`, asserting `OK true`.
-async fn publish_all(
-    pub_ws: &mut yawc::TcpWebSocket,
-    events: &[std::sync::Arc<nosfry_core::event::Event>],
-) {
+async fn publish_all(pub_ws: &mut yawc::TcpWebSocket, events: &[std::sync::Arc<Event>]) {
     for ev in events {
         send_text(pub_ws, &event_wire(ev)).await;
         assert_eq!(recv_ok(pub_ws, ev).await[2], true, "{ev:?}");
@@ -2888,5 +2887,530 @@ async fn nip62_vanish_bypasses_write_policy() {
     );
     send_text(&mut ws, &event_wire(&foreign)).await;
     assert_eq!(recv_ok(&mut ws, &foreign).await[2], false);
+    relay.stop().await;
+}
+
+/// A NIP-86 management POST; returns `(status, response body)`.
+async fn http_post(
+    addr: std::net::SocketAddr,
+    body: &str,
+    auth: Option<&str>,
+    content_type: &str,
+    headers: &[(&str, &str)],
+) -> (u16, String) {
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    if let Some(auth) = auth {
+        request.push_str("Authorization: ");
+        request.push_str(auth);
+        request.push_str("\r\n");
+    }
+    for (name, value) in headers {
+        request.push_str(name);
+        request.push_str(": ");
+        request.push_str(value);
+        request.push_str("\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    (
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        body.to_owned(),
+    )
+}
+
+/// A NIP-98 `Authorization` value over `body` signed by `key`; the
+/// `u` tag normalizes to `relay.example.com` — the `service_url`
+/// every management test configures.
+fn nip98(k: &secp256k1::Keypair, body: &str) -> String {
+    let payload = faster_hex::hex_string(&sha2::Sha256::digest(body.as_bytes()));
+    let tags = json!([
+        ["u", "http://relay.example.com/"],
+        ["method", "POST"],
+        ["payload", payload],
+    ]);
+    auth_b64(&common::event(k, 27235, now(), &tags, ""))
+}
+
+/// `Nostr <base64>` for an auth event.
+fn auth_b64(event: &Event) -> String {
+    use base64::Engine as _;
+    format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(event.json())
+    )
+}
+
+/// An authorized management call; asserts HTTP 200 and returns the
+/// `{"result"|"error"}` object.
+async fn rpc(
+    relay: &Relay,
+    key: &secp256k1::Keypair,
+    method: &str,
+    params: Value,
+    headers: &[(&str, &str)],
+) -> Value {
+    let body = json!({"method": method, "params": params}).to_string();
+    let auth = nip98(key, &body);
+    let (status, text) = http_post(
+        relay.addr,
+        &body,
+        Some(&auth),
+        "application/nostr+json+rpc",
+        headers,
+    )
+    .await;
+    assert_eq!(status, 200, "{method}: {text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+/// Send an event and read its `OK` (live subs may interleave EVENT
+/// frames); returns the reply frame.
+async fn publish(ws: &mut yawc::TcpWebSocket, event: &Event) -> Value {
+    send_text(ws, &event_wire(event)).await;
+    loop {
+        let frame = json(&recv_text(ws, T).await);
+        if frame[0] == "OK" {
+            return frame;
+        }
+    }
+}
+
+/// The pubkey hex of a test keypair.
+fn pubkey_hex(keypair: &secp256k1::Keypair) -> String {
+    keypair.x_only_public_key().0.to_string()
+}
+
+/// A relay config with NIP-86 enabled for `admin` and the
+/// `relay.example.com` service URL `nip98` signs against.
+fn mgmt_config(admin: &secp256k1::Keypair) -> nosfry::config::Config {
+    let mut config = common::config();
+    config.relay.service_url = "wss://relay.example.com".into();
+    config.relay.management.admins = vec![pubkey_hex(admin)];
+    config
+}
+
+#[tokio::test]
+async fn nip86_pubkey_event_and_kind_moderation() {
+    let admin = key(9);
+    let relay = Relay::start_with(mgmt_config(&admin)).await;
+    let mut ws = relay.connect().await;
+    let (a, b) = (key(1), key(2));
+    let (pk_a, pk_b) = (pubkey_hex(&a), pubkey_hex(&b));
+
+    // `supportedmethods` is exactly the implemented set.
+    let res = rpc(&relay, &admin, "supportedmethods", json!([]), &[]).await;
+    assert_eq!(
+        res["result"],
+        json!([
+            "allowkind",
+            "allowpubkey",
+            "banevent",
+            "banpubkey",
+            "blockip",
+            "changerelaydescription",
+            "changerelayicon",
+            "changerelayname",
+            "disallowkind",
+            "listallowedkinds",
+            "listallowedpubkeys",
+            "listbannedevents",
+            "listbannedpubkeys",
+            "listblockedips",
+            "listdisallowedkinds",
+            "supportedmethods",
+            "unallowpubkey",
+            "unbanevent",
+            "unbanpubkey",
+            "unblockip",
+        ])
+    );
+
+    let note = common::event(&a, 1, now(), &json!([]), "a1");
+    assert_eq!(publish(&mut ws, &note).await[2], true);
+
+    // banpubkey → author blocked (stored and ephemeral); b unaffected.
+    let res = rpc(&relay, &admin, "banpubkey", json!([pk_a, "spam"]), &[]).await;
+    assert_eq!(res["result"], true);
+    let banned = common::event(&a, 1, now(), &json!([]), "a2");
+    let ok = publish(&mut ws, &banned).await;
+    assert_eq!(
+        (ok[2].as_bool(), ok[3].as_str()),
+        (Some(false), Some("blocked: pubkey not allowed"))
+    );
+    let eph = common::event(&a, 20000, now(), &json!([]), "e");
+    let ok = publish(&mut ws, &eph).await;
+    assert_eq!(ok[3], "blocked: pubkey not allowed");
+    let note_b = common::event(&b, 1, now(), &json!([]), "b1");
+    assert_eq!(publish(&mut ws, &note_b).await[2], true);
+    let res = rpc(&relay, &admin, "listbannedpubkeys", json!([]), &[]).await;
+    assert_eq!(res["result"], json!([{ "pubkey": pk_a, "reason": "spam" }]));
+    // unbanpubkey → a publishes again.
+    rpc(&relay, &admin, "unbanpubkey", json!([pk_a]), &[]).await;
+    let freed = common::event(&a, 1, now(), &json!([]), "a3");
+    assert_eq!(publish(&mut ws, &freed).await[2], true);
+
+    // Allow-list mode: only listed authors publish.
+    rpc(&relay, &admin, "allowpubkey", json!([pk_b, "vip"]), &[]).await;
+    let denied = common::event(&a, 1, now(), &json!([]), "a4");
+    assert_eq!(
+        publish(&mut ws, &denied).await[3],
+        "blocked: pubkey not allowed"
+    );
+    let allowed = common::event(&b, 1, now(), &json!([]), "b2");
+    assert_eq!(publish(&mut ws, &allowed).await[2], true);
+    let res = rpc(&relay, &admin, "listallowedpubkeys", json!([]), &[]).await;
+    assert_eq!(res["result"], json!([{ "pubkey": pk_b, "reason": "vip" }]));
+    rpc(&relay, &admin, "unallowpubkey", json!([pk_b]), &[]).await;
+    let free = common::event(&a, 1, now(), &json!([]), "a5");
+    assert_eq!(publish(&mut ws, &free).await[2], true);
+
+    // banevent: the stored event disappears from REQ and its
+    // republish is blocked.
+    send_text(
+        &mut ws,
+        &req_wire("s", &format!("{{\"authors\":[\"{pk_a}\"]}}")),
+    )
+    .await;
+    let mut before = Vec::new();
+    loop {
+        let frame = json(&recv_text(&mut ws, T).await);
+        if frame[0] == "EVENT" {
+            before.push(frame[2]["id"].as_str().unwrap().to_owned());
+        } else {
+            break;
+        }
+    }
+    assert!(before.contains(&note.id().to_string()), "{before:?}");
+    let res = rpc(
+        &relay,
+        &admin,
+        "banevent",
+        json!([note.id().to_string(), "bad"]),
+        &[],
+    )
+    .await;
+    assert_eq!(res["result"], true);
+    send_text(
+        &mut ws,
+        &req_wire("s2", &format!("{{\"authors\":[\"{pk_a}\"]}}")),
+    )
+    .await;
+    let mut after = Vec::new();
+    loop {
+        let frame = json(&recv_text(&mut ws, T).await);
+        if frame[0] == "EVENT" {
+            after.push(frame[2]["id"].as_str().unwrap().to_owned());
+        } else {
+            break;
+        }
+    }
+    assert!(!after.contains(&note.id().to_string()), "{after:?}");
+    assert!(after.contains(&freed.id().to_string()));
+    let ok = publish(&mut ws, &note).await;
+    assert_eq!(
+        (ok[2].as_bool(), ok[3].as_str()),
+        (Some(false), Some("blocked: event banned"))
+    );
+    let res = rpc(&relay, &admin, "listbannedevents", json!([]), &[]).await;
+    assert_eq!(
+        res["result"],
+        json!([{ "id": note.id().to_string(), "reason": "bad" }])
+    );
+    // unbanevent → republish stores again.
+    rpc(
+        &relay,
+        &admin,
+        "unbanevent",
+        json!([note.id().to_string()]),
+        &[],
+    )
+    .await;
+    let ok = publish(&mut ws, &note).await;
+    assert_eq!(ok[2], true);
+
+    // disallowkind blocks the kind; allowkind both clears it and
+    // switches to allow-list mode.
+    let dm = common::event(&a, 4, now(), &json!([["p", pk_b]]), "dm");
+    rpc(&relay, &admin, "disallowkind", json!([4]), &[]).await;
+    let ok = publish(&mut ws, &dm).await;
+    assert_eq!(
+        (ok[2].as_bool(), ok[3].as_str()),
+        (Some(false), Some("blocked: kind not allowed"))
+    );
+    let res = rpc(&relay, &admin, "listdisallowedkinds", json!([]), &[]).await;
+    assert_eq!(res["result"], json!([4]));
+    rpc(&relay, &admin, "allowkind", json!([4]), &[]).await;
+    let ok = publish(&mut ws, &dm).await;
+    assert_eq!(ok[2], true);
+    let res = rpc(&relay, &admin, "listallowedkinds", json!([]), &[]).await;
+    assert_eq!(res["result"], json!([4]));
+    let off = common::event(&a, 7, now(), &json!([]), "off list");
+    let ok = publish(&mut ws, &off).await;
+    assert_eq!(ok[3], "blocked: kind not allowed");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn nip86_ip_block_and_relay_info() {
+    let admin = key(9);
+    let mut config = mgmt_config(&admin);
+    config.relay.real_ip_header = "x-forwarded-for".into();
+    let relay = Relay::start_with(config).await;
+    // The management caller keeps a distinct apparent IP so blocking
+    // the socket peer still allows unblock calls.
+    let admin_ip: &[(&str, &str)] = &[("x-forwarded-for", "10.0.0.9")];
+
+    // NIP-86 info ops take precedence in the NIP-11 document.
+    assert_eq!(
+        rpc(
+            &relay,
+            &admin,
+            "changerelayname",
+            json!(["ops relay"]),
+            admin_ip
+        )
+        .await["result"],
+        true
+    );
+    rpc(
+        &relay,
+        &admin,
+        "changerelaydescription",
+        json!(["managed"]),
+        admin_ip,
+    )
+    .await;
+    rpc(
+        &relay,
+        &admin,
+        "changerelayicon",
+        json!(["https://x/i.png"]),
+        admin_ip,
+    )
+    .await;
+    let doc = nip11_body(&http_get(relay.addr, "/").await);
+    assert_eq!(doc["name"], "ops relay");
+    assert_eq!(doc["description"], "managed");
+    assert_eq!(doc["icon"], "https://x/i.png");
+    assert!(doc["supported_nips"].to_string().contains("86"));
+
+    // blockip: new requests from the peer get 403 — the upgrade and
+    // NIP-11/management paths share the same gate — while requests
+    // carrying a different real-IP header still work.
+    assert_eq!(
+        rpc(
+            &relay,
+            &admin,
+            "blockip",
+            json!(["127.0.0.1", "scanner"]),
+            admin_ip
+        )
+        .await["result"],
+        true
+    );
+    let res = rpc(&relay, &admin, "listblockedips", json!([]), admin_ip).await;
+    assert_eq!(
+        res["result"],
+        json!([{ "ip": "127.0.0.1", "reason": "scanner" }])
+    );
+    let upgrade = http_get(relay.addr, "/").await;
+    assert!(upgrade.starts_with("HTTP/1.1 403"), "{upgrade}");
+    let (status, _) = http_post(
+        relay.addr,
+        r#"{"method":"supportedmethods","params":[]}"#,
+        None,
+        "application/nostr+json+rpc",
+        &[],
+    )
+    .await;
+    assert_eq!(status, 403);
+    // unblockip restores access.
+    assert_eq!(
+        rpc(&relay, &admin, "unblockip", json!(["127.0.0.1"]), admin_ip).await["result"],
+        true
+    );
+    let doc = nip11_body(&http_get(relay.addr, "/").await);
+    assert_eq!(doc["name"], "ops relay");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn nip86_auth_failures() {
+    let admin = key(9);
+    let relay = Relay::start_with(mgmt_config(&admin)).await;
+    let body = json!({"method": "supportedmethods", "params": []}).to_string();
+    let rpc_ct = "application/nostr+json+rpc";
+
+    // Missing/invalid authorization, bad base64.
+    assert_eq!(http_post(relay.addr, &body, None, rpc_ct, &[]).await.0, 401);
+    assert_eq!(
+        http_post(relay.addr, &body, Some("Bearer xyz"), rpc_ct, &[])
+            .await
+            .0,
+        401
+    );
+    assert_eq!(
+        http_post(relay.addr, &body, Some("Nostr !!!"), rpc_ct, &[])
+            .await
+            .0,
+        401
+    );
+
+    let check = |auth: String, name: &'static str| {
+        let body = body.clone();
+        let addr = relay.addr;
+        async move {
+            let (status, _) = http_post(addr, &body, Some(&auth), rpc_ct, &[]).await;
+            assert_eq!(status, 401, "{name}");
+        }
+    };
+    let digest = faster_hex::hex_string(&sha2::Sha256::digest(body.as_bytes()));
+
+    // Wrong kind, stale timestamp, wrong method, missing/wrong
+    // payload, wrong `u`, non-admin signer.
+    let wrong_kind = common::event(
+        &admin,
+        1,
+        now(),
+        &json!([
+            ["u", "http://relay.example.com/"],
+            ["method", "POST"],
+            ["payload", digest]
+        ]),
+        "",
+    );
+    check(auth_b64(&wrong_kind), "kind").await;
+    let stale = common::event(
+        &admin,
+        27235,
+        now() - 3600,
+        &json!([
+            ["u", "http://relay.example.com/"],
+            ["method", "POST"],
+            ["payload", digest]
+        ]),
+        "",
+    );
+    check(auth_b64(&stale), "stale").await;
+    let get = common::event(
+        &admin,
+        27235,
+        now(),
+        &json!([
+            ["u", "http://relay.example.com/"],
+            ["method", "GET"],
+            ["payload", digest]
+        ]),
+        "",
+    );
+    check(auth_b64(&get), "method").await;
+    let no_payload = common::event(
+        &admin,
+        27235,
+        now(),
+        &json!([["u", "http://relay.example.com/"], ["method", "POST"]]),
+        "",
+    );
+    check(auth_b64(&no_payload), "no payload").await;
+    let bad_payload = common::event(
+        &admin,
+        27235,
+        now(),
+        &json!([
+            ["u", "http://relay.example.com/"],
+            ["method", "POST"],
+            ["payload", "00".repeat(32)]
+        ]),
+        "",
+    );
+    check(auth_b64(&bad_payload), "payload").await;
+    let wrong_u = common::event(
+        &admin,
+        27235,
+        now(),
+        &json!([
+            ["u", "http://other.example.com/"],
+            ["method", "POST"],
+            ["payload", digest]
+        ]),
+        "",
+    );
+    check(auth_b64(&wrong_u), "u").await;
+    let stranger = nip98(&key(8), &body);
+    check(stranger, "non-admin").await;
+    // Bad signature: corrupt the last nibble of `sig`.
+    let mut doc = json(
+        common::event(
+            &admin,
+            27235,
+            now(),
+            &json!([
+                ["u", "http://relay.example.com/"],
+                ["method", "POST"],
+                ["payload", digest]
+            ]),
+            "",
+        )
+        .json(),
+    );
+    let sig = doc["sig"].as_str().unwrap().to_owned();
+    let flipped = if sig.ends_with('0') { '1' } else { '0' };
+    doc["sig"] = json!(format!("{}{}", &sig[..sig.len() - 1], flipped));
+    check(auth_b64_str(&doc.to_string()), "signature").await;
+
+    // Valid auth proves the wiring (the failures above are not a
+    // generic reject).
+    let (status, _) = http_post(relay.addr, &body, Some(&nip98(&admin, &body)), rpc_ct, &[]).await;
+    assert_eq!(status, 200);
+
+    // Unknown method → 200 with `{"error"}`, bad params likewise.
+    let res = rpc(&relay, &admin, "frobnicate", json!([]), &[]).await;
+    assert_eq!(res["error"], "unsupported method: frobnicate");
+    let res = rpc(&relay, &admin, "banpubkey", json!(["not-hex"]), &[]).await;
+    assert!(res["error"].as_str().unwrap().starts_with("invalid params"));
+
+    // Oversized body → 413 (route layer, before auth).
+    let big = "x".repeat(70_000);
+    assert_eq!(http_post(relay.addr, &big, None, rpc_ct, &[]).await.0, 413);
+
+    // Wrong content type falls through to the pre-NIP-86 behavior.
+    assert_eq!(
+        http_post(relay.addr, &body, None, "application/json", &[])
+            .await
+            .0,
+        405
+    );
+    relay.stop().await;
+}
+
+/// `Nostr <base64>` for a raw event JSON string (possibly tampered).
+fn auth_b64_str(event_json: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(event_json)
+    )
+}
+
+#[tokio::test]
+async fn nip86_absent_without_admins() {
+    let relay = Relay::start().await;
+    let body = json!({"method": "supportedmethods", "params": []}).to_string();
+    let (status, _) = http_post(relay.addr, &body, None, "application/nostr+json+rpc", &[]).await;
+    assert_eq!(status, 405);
+    let doc = nip11_body(&http_get(relay.addr, "/").await);
+    assert!(!doc["supported_nips"].to_string().contains("86"));
     relay.stop().await;
 }

@@ -1184,6 +1184,7 @@ name = "nosfry"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "faster-hex",
  "foldhash",

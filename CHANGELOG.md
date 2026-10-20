@@ -12,6 +12,17 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- NIP-86 relay management API over NIP-98 auth: `POST /` with
+  `application/nostr+json+rpc` answers `{"result"|"error"}` JSON for
+  pubkey/event/kind bans and allow-lists, IP blocks, and NIP-11
+  name/description/icon overrides. Enabled by `[relay.management]
+admins`; every call must carry a valid kind-27235 auth event from a
+  configured admin (the `u` tag is matched against `[relay]
+service_url` host-normalized, `payload` must hash the body).
+  Moderation state persists in the store (format 4) and is enforced
+  from an in-memory snapshot: publishes get `blocked:` `OK`s (AUTH
+  and relay-scoped vanish requests exempt), `banevent` deletes the
+  stored event atomically, and blocked IPs get 403 on new requests.
 - NIP-62 request to vanish: a kind-62 event whose `relay` tags name
   `[relay] service_url` or hold `ALL_RELAYS` (honored even without a
   configured URL) records a vanish point at its `created_at`, deletes
@@ -46,7 +57,7 @@ The format is based on [Keep a Changelog]; this project follows
   are reaped after 60 s (`closed: idle timeout`).
   `relay.limits.max_sync_events` (default 1,000,000, `0` disables
   sync) bounds the records per sync — `blocked: too many query
-  results` with the cap as the fourth `NEG-ERR` element — and
+results` with the cap as the fourth `NEG-ERR` element — and
   `[relay] max_sync_memory_bytes` (default 1 GiB, `0` unlimited) is
   the process-wide budget for sealed storages at 40 bytes per
   record. Both are restart-only; NIP-11 advertises 77 while sync is

@@ -22,11 +22,19 @@ pub(crate) enum StoreOp {
     Scan,
     /// A NIP-62 vanish sweep.
     Vanish,
+    /// A NIP-86 management write.
+    Moderate,
 }
 
 impl StoreOp {
     /// Every op in render order.
-    const ALL: [Self; 4] = [Self::Write, Self::Expire, Self::Scan, Self::Vanish];
+    const ALL: [Self; 5] = [
+        Self::Write,
+        Self::Expire,
+        Self::Scan,
+        Self::Vanish,
+        Self::Moderate,
+    ];
 
     /// The `op` label value.
     const fn as_str(self) -> &'static str {
@@ -35,6 +43,7 @@ impl StoreOp {
             Self::Expire => "expire",
             Self::Scan => "scan",
             Self::Vanish => "vanish",
+            Self::Moderate => "moderate",
         }
     }
 }

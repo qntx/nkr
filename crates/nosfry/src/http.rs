@@ -5,11 +5,12 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, get};
+use nosfry_lmdb::Moderation;
 use serde_json::json;
 use tokio::sync::watch;
 use yawc::{IncomingUpgrade, Options};
@@ -18,6 +19,7 @@ use crate::Live;
 use crate::config::Config;
 use crate::connection;
 use crate::limiter::ConnectionLimiter;
+use crate::management;
 use crate::metrics::Metrics;
 
 /// Everything a connection handler needs.
@@ -34,13 +36,26 @@ pub(crate) struct AppState {
     /// Process-wide reserved sync-storage bytes (the
     /// `nosfry_sync_memory_bytes` gauge).
     pub(crate) sync_memory: Arc<std::sync::atomic::AtomicUsize>,
+    /// Latest NIP-86 snapshot; read-only copies for the handlers.
+    pub(crate) moderation: watch::Receiver<Arc<Moderation>>,
+    /// Moderation snapshot sender — the management handler publishes
+    /// the snapshot the writer returned after each applied op.
+    pub(crate) mod_tx: watch::Sender<Arc<Moderation>>,
+    /// [`Live`] sender — `changerelay*` ops rebuild `nip11`.
+    pub(crate) live_tx: watch::Sender<Arc<Live>>,
 }
 
 /// Build the application router. `/metrics` exists only when
 /// `[relay] metrics` is enabled — otherwise it falls through to the
 /// default 404 like any unknown path.
 pub(crate) fn router(state: AppState) -> Router {
-    let router = Router::new().route("/", get(root).on(MethodFilter::OPTIONS, preflight));
+    let router = Router::new().route(
+        "/",
+        get(root)
+            .post(management::handle)
+            .on(MethodFilter::OPTIONS, preflight)
+            .route_layer(DefaultBodyLimit::max(management::BODY_LIMIT)),
+    );
     let router = if state.live.borrow().config.relay.metrics {
         router.route("/metrics", get(metrics))
     } else {
@@ -97,6 +112,9 @@ async fn root(State(state): State<AppState>, request: Request) -> Response {
     else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    if ip_blocked(&state, &parts.headers, peer.ip()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let wants_upgrade = parts
         .headers
         .get(header::UPGRADE)
@@ -126,6 +144,16 @@ async fn root(State(state): State<AppState>, request: Request) -> Response {
             "nosfry: a nostr relay. connect with a websocket client.\n",
         ))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Whether the effective client IP (the same address the per-IP
+/// limiter charges, `real_ip_header`-aware) is on the NIP-86 block
+/// list. Checked before upgrades, NIP-11, and the management RPC —
+/// existing WebSocket connections are not cut off (block applies to
+/// new requests only).
+pub(crate) fn ip_blocked(state: &AppState, headers: &header::HeaderMap, peer: IpAddr) -> bool {
+    let ip = client_ip(&state.live.borrow().config, headers, peer);
+    state.moderation.borrow().ip_blocked(&ip)
 }
 
 /// WebSocket upgrade branch of `root`; `None` when the upgrade headers
@@ -207,7 +235,7 @@ fn client_ip(config: &Config, headers: &header::HeaderMap, peer: IpAddr) -> IpAd
 /// (it is static for the process lifetime). `description`, `pubkey`,
 /// `contact`, and `icon` are optional and omitted when empty; `name`
 /// stays unconditionally.
-pub(crate) fn nip11(config: &Config) -> String {
+pub(crate) fn nip11(config: &Config, moderation: &Moderation) -> String {
     let relay = &config.relay;
     let mut nips = vec![1, 9, 11, 40, 62, 70];
     if relay.limits.max_filter_limit_count > 0 {
@@ -219,9 +247,12 @@ pub(crate) fn nip11(config: &Config) -> String {
     if !relay.service_url.is_empty() {
         nips.push(42);
     }
+    if !relay.management.admins.is_empty() {
+        nips.push(86);
+    }
     nips.sort_unstable();
     let mut doc = json!({
-        "name": relay.info.name,
+        "name": moderation.name.as_deref().unwrap_or(&relay.info.name),
         "supported_nips": nips,
         "software": "https://github.com/qntx/nosfry",
         "version": env!("CARGO_PKG_VERSION"),
@@ -241,10 +272,19 @@ pub(crate) fn nip11(config: &Config) -> String {
     });
     if let Some(map) = doc.as_object_mut() {
         for (key, value) in [
-            ("description", &relay.info.description),
-            ("pubkey", &relay.info.pubkey),
-            ("contact", &relay.info.contact),
-            ("icon", &relay.info.icon),
+            (
+                "description",
+                moderation
+                    .description
+                    .as_deref()
+                    .unwrap_or(&relay.info.description),
+            ),
+            ("pubkey", relay.info.pubkey.as_str()),
+            ("contact", relay.info.contact.as_str()),
+            (
+                "icon",
+                moderation.icon.as_deref().unwrap_or(&relay.info.icon),
+            ),
         ] {
             if !value.is_empty() {
                 map.insert(key.to_owned(), json!(value));
