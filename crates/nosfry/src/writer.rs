@@ -7,7 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use nosfry_core::message::{RelayVerb, ok_frame};
 use nosfry_lmdb::{Store, WriteOutcome};
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 
+use crate::Live;
 use crate::channels::{Batch, Out, Outbound, ShardMsg, WriteRequest, WriterMsg};
 use crate::metrics::{Metrics, StoreOp};
 
@@ -20,6 +22,10 @@ const EXPIRE_CAP: usize = 10_000;
 
 /// Expiry timer cadence (strfry's cron interval is ~9 s).
 const EXPIRE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Events deleted per vanish sweep; same backlog semantics as
+/// [`EXPIRE_CAP`].
+const VANISH_CAP: usize = 10_000;
 
 /// A store commit, shard enqueue, or expiry sweep slower than this is
 /// logged — it stalls every publisher's `OK` while reads keep flowing.
@@ -41,6 +47,7 @@ const fn ok_reply(outcome: WriteOutcome) -> (bool, &'static str) {
         WriteOutcome::Duplicate => (true, "duplicate: have this event"),
         WriteOutcome::Superseded => (false, "duplicate: have a newer version"),
         WriteOutcome::Deleted => (false, "blocked: deleted by its author"),
+        WriteOutcome::Vanished => (false, "blocked: request to vanish"),
     }
 }
 
@@ -62,11 +69,20 @@ pub(crate) fn run(
     mut rx: mpsc::Receiver<WriterMsg>,
     shards: &[mpsc::Sender<ShardMsg>],
     metrics: &Metrics,
+    live: &watch::Receiver<Arc<Live>>,
 ) {
     let mut expire_pending = false;
     let mut expire_backlog = false;
+    // Vanish work persisted across a restart resumes on the first
+    // loop turn; `backlog` keeps the inbox non-blocking while a step
+    // still reports more work.
+    let mut vanish_pending = store.vanish_pending().unwrap_or_else(|err| {
+        tracing::error!(%err, "vanish queue check failed");
+        false
+    });
+    let mut vanish_backlog = vanish_pending;
     loop {
-        let first = if expire_backlog {
+        let first = if expire_backlog || vanish_backlog {
             match rx.try_recv() {
                 Ok(msg) => Some(msg),
                 Err(mpsc::error::TryRecvError::Empty) => None,
@@ -88,13 +104,17 @@ pub(crate) fn run(
                         Err(_) => break,
                     }
                 }
-                write_batch(store, reqs, shards, metrics);
+                vanish_pending |= write_batch(store, reqs, shards, metrics, live);
             }
             Some(WriterMsg::Expire) | None => expire_pending = true,
         }
         if expire_pending {
             expire_backlog = expire_sweep(store, metrics);
             expire_pending = expire_backlog;
+        }
+        if vanish_pending {
+            vanish_backlog = vanish_sweep(store, metrics);
+            vanish_pending = vanish_backlog;
         }
     }
 }
@@ -126,6 +146,30 @@ fn expire_sweep(store: &Store, metrics: &Metrics) -> bool {
     backlog
 }
 
+/// One NIP-62 vanish sweep; `true` means work remains, same contract
+/// as [`expire_sweep`].
+fn vanish_sweep(store: &Store, metrics: &Metrics) -> bool {
+    let started = Instant::now();
+    match store.vanish_step(VANISH_CAP) {
+        Ok(step) => {
+            let elapsed = started.elapsed();
+            if elapsed > SLOW_WRITE {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis(),
+                    deleted = step.deleted,
+                    "slow vanish sweep"
+                );
+            }
+            step.more
+        }
+        Err(err) => {
+            metrics.store_error(StoreOp::Vanish);
+            tracing::error!(%err, "vanish sweep failed");
+            false
+        }
+    }
+}
+
 /// `mdb_reader_check`: clear lock-table slots left by readers whose
 /// process died mid-transaction (kill -9, `export | head`), which would
 /// otherwise pin old pages and grow `data.mdb` without bound.
@@ -140,20 +184,26 @@ fn clear_stale_readers(store: &Store) {
 /// Commit one publish batch, queue `Stored` events on every shard,
 /// then push each request's `OK`. Events stored and removed inside
 /// the same transaction (`Written::deleted`) are never broadcast.
+/// Returns `true` when any stored event was a request to vanish, so
+/// the run loop schedules a sweep.
 fn write_batch(
     store: &Store,
     reqs: Vec<WriteRequest>,
     shards: &[mpsc::Sender<ShardMsg>],
     metrics: &Metrics,
-) {
+    live: &watch::Receiver<Arc<Live>>,
+) -> bool {
     let events: Vec<Arc<nosfry_core::event::Event>> =
         reqs.iter().map(|r| Arc::clone(&r.event)).collect();
+    // The service URL re-reads the live config so a reload applies to
+    // the next batch (like the write-policy plugin).
+    let service_url = live.borrow().limits.auth.relay().cloned();
     let started = Instant::now();
-    let written = match store.write(&events) {
+    let written = match store.write(&events, service_url.as_ref()) {
         Ok(written) => written,
         Err(err) => {
             write_failed(reqs, metrics, &err);
-            return;
+            return false;
         }
     };
     let commit_elapsed = started.elapsed();
@@ -164,6 +214,7 @@ fn write_batch(
             "slow store commit"
         );
     }
+    let vanish = written.vanish_pending;
     let (batch, replies) = collect_batch(reqs, written, events);
     enqueue_batch(batch, shards);
     for (out, text) in replies {
@@ -173,6 +224,7 @@ fn write_batch(
             text,
         });
     }
+    vanish
 }
 
 /// A failed commit: count the error and answer every request

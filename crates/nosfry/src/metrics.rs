@@ -20,11 +20,13 @@ pub(crate) enum StoreOp {
     Expire,
     /// One stored-event scan step.
     Scan,
+    /// A NIP-62 vanish sweep.
+    Vanish,
 }
 
 impl StoreOp {
     /// Every op in render order.
-    const ALL: [Self; 3] = [Self::Write, Self::Expire, Self::Scan];
+    const ALL: [Self; 4] = [Self::Write, Self::Expire, Self::Scan, Self::Vanish];
 
     /// The `op` label value.
     const fn as_str(self) -> &'static str {
@@ -32,6 +34,7 @@ impl StoreOp {
             Self::Write => "write",
             Self::Expire => "expire",
             Self::Scan => "scan",
+            Self::Vanish => "vanish",
         }
     }
 }

@@ -75,12 +75,11 @@ with `error: internal error` and a fresh plugin process serves the next
 event. A plugin configured as a bare path is reloaded automatically
 when the file's mtime changes.
 
-`[relay.auth]` implements NIP-42 authentication and the strfry-style
-read restrictions that ride on it. `service_url` (default empty) is
-the relay's canonical `ws://`/`wss://` address clients echo in the AUTH
-event's `relay` tag; when it is set, NIP-11 advertises NIP 42 and the
-relay challenges clients lazily — only when they REQ a fully
-restricted filter or publish a protected event. A connection may
+`[relay] service_url` (default empty) is the relay's canonical
+`ws://`/`wss://` address: clients echo it in the AUTH event's `relay`
+tag and name it in a NIP-62 request to vanish. When it is set, NIP-11
+advertises NIP 42 and the relay challenges clients lazily — only when
+they REQ a fully restricted filter or publish a protected event. A connection may
 authenticate up to 8 distinct pubkeys. `restricted_read_kinds`
 (default `[4, 1059]` — DMs and gift wraps) are served only to
 authenticated readers; with `restrict_read_to_involved = true`
@@ -95,6 +94,18 @@ authenticated; kind-6/16 reposts embedding a protected event are
 always blocked. AUTH events (kind 22242) are never stored or
 broadcast. The write-policy request gains `authed` — the hex pubkey
 the connection authenticated with — after a successful AUTH.
+
+A kind-62 event (NIP-62 request to vanish) whose `relay` tags name
+this relay's `service_url` — or hold `ALL_RELAYS`, which applies even
+without one — deletes every event the author published with
+`created_at` at or before the request (all kinds except 62 itself,
+which can never be deleted or replaced), plus kind-1059 gift wraps
+`p`-tagged to the author in that window. Deletion runs as background
+sweeps on the writer (10,000 events per step, persisting across
+restarts), republishing a vanished event is refused with
+`blocked: request to vanish`, and the request bypasses the
+write-policy plugin as NIP-62 requires. A request naming only other
+relays is stored with no local effect.
 
 `["COUNT", <sub>, <filters>…]` (NIP-45) counts the stored events the
 same filters would return and answers with one

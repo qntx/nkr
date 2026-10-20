@@ -93,6 +93,7 @@ fn import_mixed_corpus_stats() {
     let stats = import(
         &store,
         &EventLimits::default(),
+        None,
         MAX_LINE,
         Cursor::new(corpus),
         true,
@@ -142,13 +143,14 @@ fn export_import_export_is_byte_identical() {
             event(&k, kind, 1_000 + i, &json!([]), &format!("e{i}"))
         })
         .collect();
-    a.write(&events).unwrap();
+    a.write(&events, None).unwrap();
     let dump = export_bytes(&a);
 
     let (_dir_b, b) = store();
     let stats = import(
         &b,
         &EventLimits::default(),
+        None,
         MAX_LINE,
         Cursor::new(&dump),
         false,
@@ -166,12 +168,13 @@ fn reimport_reports_all_duplicates() {
     let events: Vec<_> = (0..10u64)
         .map(|i| event(&k, 1, 1_000 + i, &json!([]), &format!("e{i}")))
         .collect();
-    a.write(&events).unwrap();
+    a.write(&events, None).unwrap();
     let dump = export_bytes(&a);
 
     let stats = import(
         &a,
         &EventLimits::default(),
+        None,
         MAX_LINE,
         Cursor::new(&dump),
         false,
@@ -192,8 +195,8 @@ fn scan_filters_limits_and_counts() {
     let reposts: Vec<_> = (0..50u64)
         .map(|i| event(&k, 7, 10_000 + i, &json!([]), &format!("r{i}")))
         .collect();
-    store.write(&notes).unwrap();
-    store.write(&reposts).unwrap();
+    store.write(&notes, None).unwrap();
+    store.write(&reposts, None).unwrap();
 
     let mut limited_out = Vec::new();
     let limited = scan(
@@ -256,7 +259,9 @@ impl Write for FailAfter {
 fn scan_propagates_write_error_on_final_step() {
     let (_dir, store) = store();
     let k = key(6);
-    store.write(&[event(&k, 1, 100, &json!([]), "x")]).unwrap();
+    store
+        .write(&[event(&k, 1, 100, &json!([]), "x")], None)
+        .unwrap();
     // The whole result fits in one step, so the write error lands in
     // the same `step` that returns `Progress::Done`.
     let mut out = FailAfter { budget: 4 };
@@ -278,8 +283,8 @@ fn delete_removes_matches_and_dry_run_counts() {
         .map(|i| event(&k, 1, 100 + i, &json!([]), &format!("n{i}")))
         .collect();
     let repost = event(&k, 7, 200, &json!([]), "r");
-    store.write(&notes).unwrap();
-    store.write(&[repost]).unwrap();
+    store.write(&notes, None).unwrap();
+    store.write(&[repost], None).unwrap();
 
     // Dry run counts without touching the store.
     let filter = || Filter::parse("{\"kinds\":[1]}").unwrap();
@@ -309,7 +314,7 @@ fn delete_covers_expired_events() {
         &json!([["expiration", (now - 100).to_string()]]),
         "stale",
     );
-    store.write(&[expired]).unwrap();
+    store.write(&[expired], None).unwrap();
     // The admin delete scans with now = 0, so expired events match.
     assert_eq!(
         delete(&store, Filter::parse("{\"kinds\":[1]}").unwrap(), false).unwrap(),
@@ -329,6 +334,7 @@ fn import_counts_blocked_events() {
     let stats = import(
         &store,
         &EventLimits::default(),
+        None,
         MAX_LINE,
         Cursor::new(corpus),
         false,

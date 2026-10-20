@@ -67,9 +67,9 @@ pub enum ServerError {
     /// TOML parse failure.
     #[error("config: {0}")]
     Config(#[from] toml::de::Error),
-    /// Invalid `[relay.auth]` configuration.
-    #[error("config: relay.auth: {0}")]
-    Auth(#[from] nosfry_core::auth::AuthRulesError),
+    /// Invalid `[relay] service_url`.
+    #[error("config: relay.service_url: {0}")]
+    ServiceUrl(#[from] nosfry_core::url::RelayUrlError),
     /// The worker shutdown task failed.
     #[error("worker shutdown: {0}")]
     Shutdown(#[source] tokio::task::JoinError),
@@ -94,6 +94,27 @@ pub(crate) struct Live {
     /// Active write-policy plugin; read at each publish so a reload
     /// applies to the next event on every connection.
     pub(crate) policy: Option<policy::WritePolicy>,
+}
+
+/// The `monitors` shard channel pairs.
+fn shard_channels(monitors: usize) -> (Vec<mpsc::Sender<ShardMsg>>, Vec<mpsc::Receiver<ShardMsg>>) {
+    (0..monitors)
+        .map(|_| mpsc::channel::<ShardMsg>(SHARD_QUEUE))
+        .unzip()
+}
+
+/// The `readers` reader channel pairs; senders are shared by every
+/// shard for scan routing.
+fn reader_channels(
+    readers: usize,
+) -> (
+    Arc<[std::sync::mpsc::Sender<ReaderMsg>]>,
+    Vec<std::sync::mpsc::Receiver<ReaderMsg>>,
+) {
+    let (txs, rxs): (Vec<_>, Vec<_>) = (0..readers)
+        .map(|_| std::sync::mpsc::channel::<ReaderMsg>())
+        .unzip();
+    (txs.into(), rxs)
 }
 
 /// Start the write-policy task unless the plugin command is empty.
@@ -220,21 +241,8 @@ impl Server {
 
         // All channels first: shards forward scan control into reader
         // inboxes, readers reply through shard inboxes.
-        let mut shard_rxs = Vec::with_capacity(monitors);
-        let mut shard_txs = Vec::with_capacity(monitors);
-        for _ in 0..monitors {
-            let (tx, rx) = mpsc::channel::<ShardMsg>(SHARD_QUEUE);
-            shard_txs.push(tx);
-            shard_rxs.push(rx);
-        }
-        let mut reader_rxs = Vec::with_capacity(readers);
-        let mut reader_txs = Vec::with_capacity(readers);
-        for _ in 0..readers {
-            let (tx, rx) = std::sync::mpsc::channel::<ReaderMsg>();
-            reader_txs.push(tx);
-            reader_rxs.push(rx);
-        }
-        let reader_txs: Arc<[_]> = reader_txs.into();
+        let (shard_txs, shard_rxs) = shard_channels(monitors);
+        let (reader_txs, reader_rxs) = reader_channels(readers);
 
         // Monitor shards.
         for rx in shard_rxs {
@@ -273,14 +281,32 @@ impl Server {
             );
         }
 
+        // The live-config channel exists before the writer spawn so
+        // the vanish path re-reads `service_url` on every batch.
+        let (live_tx, live_rx) = watch::channel(Arc::new(Live {
+            config: Arc::clone(&config),
+            limits: Arc::new(config.limits()?),
+            nip11: http::nip11(&config).into(),
+            policy: start_policy(&config.relay.write_policy),
+        }));
+
         // Writer.
         let (writer_tx, writer_rx) = mpsc::channel::<WriterMsg>(WRITER_QUEUE);
         let writer_shards = shard_txs.clone();
         let writer_metrics = Arc::clone(&metrics);
+        let writer_live = live_rx.clone();
         threads.push(
             std::thread::Builder::new()
                 .name("nosfry-writer".into())
-                .spawn(move || writer::run(&store, writer_rx, &writer_shards, &writer_metrics))
+                .spawn(move || {
+                    writer::run(
+                        &store,
+                        writer_rx,
+                        &writer_shards,
+                        &writer_metrics,
+                        &writer_live,
+                    );
+                })
                 .map_err(ServerError::Spawn)?,
         );
 
@@ -296,12 +322,6 @@ impl Server {
                     .map_err(ServerError::Spawn)?,
             );
         }
-        let (live_tx, live_rx) = watch::channel(Arc::new(Live {
-            config: Arc::clone(&config),
-            limits: Arc::new(config.limits()?),
-            nip11: http::nip11(&config).into(),
-            policy: start_policy(&config.relay.write_policy),
-        }));
         let conn = connection::Handle {
             writer: writer_tx.clone(),
             shards: Arc::from(shard_txs.as_slice()),

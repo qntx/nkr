@@ -750,7 +750,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let events: Vec<Arc<nosfry_core::event::Event>> = (0..10).map(event).collect();
-        store.write(&events).unwrap();
+        store.write(&events, None).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let (shard_tx, _shard_rx) = mpsc::channel(8);
         let (out, mut out_rx) = Outbound::new(1 << 30, Arc::new(AtomicUsize::new(0)));
@@ -875,7 +875,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let events: Vec<Arc<nosfry_core::event::Event>> = (0..3).map(event).collect();
-        store.write(&events).unwrap();
+        store.write(&events, None).unwrap();
         // Pre-inflated shared total: over any tiny budget.
         let total = Arc::new(AtomicUsize::new(2));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -966,7 +966,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let events: Vec<Arc<nosfry_core::event::Event>> = (0..4_000).map(event).collect();
-        store.write(&events).unwrap();
+        store.write(&events, None).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         // Every finishing scan `blocking_send`s an `Activate`; keep the
         // inbox bigger than the flood.

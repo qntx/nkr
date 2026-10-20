@@ -44,6 +44,11 @@ pub struct Relay {
     pub bind: IpAddr,
     /// Bind port.
     pub port: u16,
+    /// The relay's canonical `ws://`/`wss://` URL clients sign into an
+    /// AUTH event's `relay` tag and name in a NIP-62 request to
+    /// vanish. Empty disables AUTH: restricted kinds are stored but
+    /// never served, and protected events are rejected.
+    pub service_url: String,
     /// Soft open-file limit to raise to at startup, capped by the hard
     /// limit (0 = leave unchanged).
     pub nofiles: u64,
@@ -94,14 +99,11 @@ pub struct Relay {
     pub info: Info,
 }
 
-/// `[relay.auth]` — NIP-42 authentication (strfry `relay.auth.*`).
+/// `[relay.auth]` — NIP-42 restricted read kinds (strfry
+/// `relay.auth.*`; the URL moved to `[relay] service_url`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Auth {
-    /// The relay's canonical `ws://`/`wss://` URL clients sign into an
-    /// AUTH event's `relay` tag. Empty disables AUTH: restricted kinds
-    /// are stored but never served, and protected events are rejected.
-    pub service_url: String,
     /// Kinds served only to authenticated readers.
     pub restricted_read_kinds: Vec<u16>,
     /// Restricted kinds are served only to authenticated pubkeys
@@ -113,7 +115,6 @@ pub struct Auth {
 impl Default for Auth {
     fn default() -> Self {
         Self {
-            service_url: String::new(),
             restricted_read_kinds: vec![4, 1059],
             restrict_read_to_involved: true,
         }
@@ -200,6 +201,7 @@ impl Default for Relay {
         Self {
             bind: IpAddr::from([127, 0, 0, 1]),
             port: 7_777,
+            service_url: String::new(),
             nofiles: 1_000_000,
             real_ip_header: String::new(),
             max_websocket_payload_size: 131_072,
@@ -258,8 +260,8 @@ impl Config {
     /// # Errors
     ///
     /// [`ServerError::Io`] on read failure, [`ServerError::Config`] on
-    /// TOML syntax errors or unknown keys, [`ServerError::Auth`] on an
-    /// invalid `[relay.auth] service_url`.
+    /// TOML syntax errors or unknown keys, [`ServerError::ServiceUrl`]
+    /// on an invalid `[relay] service_url`.
     pub fn load(path: &Path) -> Result<Self, ServerError> {
         let text = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&text)?;
@@ -272,17 +274,22 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// [`ServerError::Auth`] on an invalid `[relay.auth] service_url`.
+    /// [`ServerError::ServiceUrl`] on an invalid `[relay] service_url`.
     pub fn limits(&self) -> Result<Limits, ServerError> {
+        let service_url = if self.relay.service_url.is_empty() {
+            None
+        } else {
+            Some(nosfry_core::url::RelayUrl::parse(&self.relay.service_url)?)
+        };
         Ok(Limits {
             event: self.events,
             req: self.relay.limits,
             rate: self.relay.rate_limits,
             auth: std::sync::Arc::new(nosfry_core::auth::AuthRules::new(
-                &self.relay.auth.service_url,
+                service_url,
                 &self.relay.auth.restricted_read_kinds,
                 self.relay.auth.restrict_read_to_involved,
-            )?),
+            )),
         })
     }
 
@@ -394,15 +401,18 @@ mod tests {
         assert!(toml::from_str::<Config>("[relay]\nbogus = 1\n").is_err());
     }
 
-    /// `Config::load` validates `[relay.auth]` too, so a file whose
-    /// `service_url` is not a ws/wss URL fails with `ServerError::Auth`
+    /// `Config::load` validates `[relay] service_url` too, so a file
+    /// whose URL is not ws/wss fails with `ServerError::ServiceUrl`
     /// and a broken SIGHUP reload keeps the running configuration.
     #[test]
-    fn load_rejects_invalid_auth_service_url() {
+    fn load_rejects_invalid_service_url() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nosfry.toml");
-        std::fs::write(&path, "[relay.auth]\nservice_url = \"http://bad\"\n").unwrap();
-        assert!(matches!(Config::load(&path), Err(ServerError::Auth(_))));
+        std::fs::write(&path, "[relay]\nservice_url = \"http://bad\"\n").unwrap();
+        assert!(matches!(
+            Config::load(&path),
+            Err(ServerError::ServiceUrl(_))
+        ));
     }
 
     /// Restart-only fields keep the running value and are reported;
@@ -425,7 +435,7 @@ mod tests {
         new.relay.info.name = "reloaded".into();
         new.relay.rate_limits.events_per_second = 5;
         new.relay.write_policy.plugin = "/bin/true".into();
-        new.relay.auth.service_url = "wss://relay.example.com".into();
+        new.relay.service_url = "wss://relay.example.com".into();
         let (merged, ignored) = running.reloadable_from(new);
         assert_eq!(
             ignored,
@@ -448,7 +458,7 @@ mod tests {
         assert_eq!(merged.relay.info.name, "reloaded");
         assert_eq!(merged.relay.rate_limits.events_per_second, 5);
         assert_eq!(merged.relay.write_policy.plugin, "/bin/true");
-        assert_eq!(merged.relay.auth.service_url, "wss://relay.example.com");
+        assert_eq!(merged.relay.service_url, "wss://relay.example.com");
     }
 
     /// An unchanged reload reports nothing.

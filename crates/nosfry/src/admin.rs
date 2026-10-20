@@ -10,6 +10,7 @@ use std::time::Duration;
 use nosfry_core::auth::ReadGate;
 use nosfry_core::event::{Event, EventLimits, UnverifiedEvent};
 use nosfry_core::filter::{Filter, FilterError};
+use nosfry_core::url::RelayUrl;
 use nosfry_lmdb::{Progress, Scan, Store, StoreError, WriteOutcome};
 
 /// Events per write transaction on import (strfry's import batch).
@@ -89,6 +90,7 @@ pub fn export(
 pub fn import(
     store: &Store,
     limits: &EventLimits,
+    service_url: Option<&RelayUrl>,
     max_line: usize,
     mut input: impl BufRead,
     show_rejected: bool,
@@ -96,6 +98,7 @@ pub fn import(
     let mut importer = Importer {
         store,
         limits,
+        service_url,
         max_line,
         show_rejected,
         batch: Vec::with_capacity(IMPORT_BATCH),
@@ -120,6 +123,9 @@ pub fn import(
 struct Importer<'a> {
     store: &'a Store,
     limits: &'a EventLimits,
+    /// `[relay] service_url`, applied to NIP-62 requests to vanish in
+    /// the imported set.
+    service_url: Option<&'a RelayUrl>,
     max_line: usize,
     show_rejected: bool,
     batch: Vec<Arc<Event>>,
@@ -176,13 +182,13 @@ impl Importer<'_> {
         if self.batch.is_empty() {
             return Ok(());
         }
-        for outcome in self.store.write(&self.batch)?.outcomes {
+        for outcome in self.store.write(&self.batch, self.service_url)?.outcomes {
             match outcome {
                 WriteOutcome::Stored { .. } => self.stats.added += 1,
                 WriteOutcome::Duplicate => self.stats.duplicates += 1,
                 WriteOutcome::Superseded => self.stats.superseded += 1,
                 WriteOutcome::Ephemeral => self.stats.ephemeral += 1,
-                WriteOutcome::Deleted => self.stats.blocked += 1,
+                WriteOutcome::Deleted | WriteOutcome::Vanished => self.stats.blocked += 1,
             }
         }
         self.batch.clear();

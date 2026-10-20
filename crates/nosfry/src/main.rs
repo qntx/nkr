@@ -233,10 +233,12 @@ fn export(
 
 fn import(config: &Config, show_rejected: bool) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(&config.db.path, &config.store_options())?;
+    let limits = config.limits()?;
     let stdin = std::io::stdin();
     nosfry::admin::import(
         &store,
         &config.events,
+        limits.auth.relay(),
         config.relay.max_websocket_payload_size,
         stdin.lock(),
         show_rejected,

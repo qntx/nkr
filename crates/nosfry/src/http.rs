@@ -209,14 +209,14 @@ fn client_ip(config: &Config, headers: &header::HeaderMap, peer: IpAddr) -> IpAd
 /// stays unconditionally.
 pub(crate) fn nip11(config: &Config) -> String {
     let relay = &config.relay;
-    let mut nips = vec![1, 9, 11, 40, 70];
+    let mut nips = vec![1, 9, 11, 40, 62, 70];
     if relay.limits.max_filter_limit_count > 0 {
         nips.push(45);
     }
     if relay.limits.max_sync_events > 0 {
         nips.push(77);
     }
-    if !relay.auth.service_url.is_empty() {
+    if !relay.service_url.is_empty() {
         nips.push(42);
     }
     nips.sort_unstable();

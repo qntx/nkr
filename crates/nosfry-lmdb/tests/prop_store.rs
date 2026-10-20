@@ -603,7 +603,7 @@ proptest! {
         for chunk in &batches {
             let take = all.len().min(*chunk);
             let batch: Vec<Arc<Event>> = all.drain(..take).collect();
-            let written = store.write(&batch).unwrap();
+            let written = store.write(&batch, None).unwrap();
             prop_assert_eq!(written.outcomes.len(), batch.len());
             for outcome in &written.outcomes {
                 let known = matches!(
@@ -617,7 +617,7 @@ proptest! {
                 prop_assert!(known, "unknown outcome {outcome:?}");
             }
         }
-        let written = store.write(&all).unwrap();
+        let written = store.write(&all, None).unwrap();
         prop_assert_eq!(written.outcomes.len(), all.len());
 
         let mut stored = model_store(&events);
@@ -674,8 +674,11 @@ proptest! {
 
         // A restricted-kind gate shrinks the count exactly as it
         // shrinks the scan union.
-        let rules = nosfry_core::auth::AuthRules::new("wss://relay.example.com", &[3], true)
-            .unwrap();
+        let rules = nosfry_core::auth::AuthRules::new(
+            Some(nosfry_core::url::RelayUrl::parse("wss://relay.example.com").unwrap()),
+            &[3],
+            true,
+        );
         let authed: Arc<[PublicKey]> = Arc::from(vec![PublicKey(
             keys()[0].x_only_public_key().0.to_byte_array(),
         )]);
@@ -704,7 +707,7 @@ fn count_budget_marks_approximate() {
             )
         })
         .collect();
-    store.write(&events).unwrap();
+    store.write(&events, None).unwrap();
 
     let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
     let snapshot = store.snapshot().unwrap();

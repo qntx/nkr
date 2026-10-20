@@ -99,7 +99,7 @@ fn author_setup() -> (tempfile::TempDir, Store, Arc<[Filter]>) {
         })
         .collect();
     for chunk in events.chunks(10_000) {
-        store.write(chunk).unwrap();
+        store.write(chunk, None).unwrap();
     }
     let authors_json = format!(
         "{{\"authors\":[{}],\"limit\":500}}",
@@ -130,7 +130,7 @@ fn bench_store(c: &mut Criterion) {
                 let base = counter.fetch_add(1_000, Ordering::Relaxed);
                 let batch = events(&key, 10_000_000 + base, 1_000);
                 let started = std::time::Instant::now();
-                store.write(&batch).unwrap();
+                store.write(&batch, None).unwrap();
                 elapsed += started.elapsed();
             }
             elapsed
@@ -140,7 +140,7 @@ fn bench_store(c: &mut Criterion) {
     // Scan kinds:[1] limit 500 over 100k stored events.
     let (_dir2, store2) = open();
     for chunk in events(&key, 0, 100_000).chunks(10_000) {
-        store2.write(chunk).unwrap();
+        store2.write(chunk, None).unwrap();
     }
     let filters: Arc<[Filter]> =
         Arc::from([Filter::parse("{\"kinds\":[1],\"limit\":500}").unwrap()]);
