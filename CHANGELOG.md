@@ -208,6 +208,13 @@ down`; CLOSE is never charged.
   subscription id now closes the old subscription before the `CLOSED`,
   so it no longer keeps delivering under an id the client was told is
   closed.
+- `Filter::intrinsic_limit` bounded an `authors` + addressable-`kinds`
+  filter without a `#d` condition to `authors * kinds`, so
+  `{"kinds":[30023],"authors":[pk]}` served one article of fifty. It
+  now follows nostr-tools `getFilterLimit`: the `authors * kinds` bound
+  applies only when every kind is replaceable, `authors * kinds * #d`
+  only when every kind is addressable and `#d` is present, and mixed or
+  `#d`-less filters are unbounded.
 
 ### Security
 

@@ -316,6 +316,39 @@ fn scan_limit_and_ties() {
 }
 
 #[test]
+fn scan_addressable_kinds_without_d_unbounded() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let pk = format!("{}", k.x_only_public_key().0);
+    let events: Vec<Arc<Event>> = ["a", "b", "c"]
+        .iter()
+        .map(|d| event(&k, 30_023, 100, &json!([["d", d]]), d))
+        .collect();
+    store.write(&events).unwrap();
+    // No `#d` condition: an author+addressable-kind filter has no
+    // intrinsic bound, so all live `d` addresses are returned.
+    let got = collect(
+        &store,
+        Arc::from([
+            Filter::parse(&format!("{{\"kinds\":[30023],\"authors\":[\"{pk}\"]}}")).unwrap(),
+        ]),
+        3,
+    );
+    assert_eq!(got.len(), 3);
+    // With `#d` the intrinsic bound is authors*kinds*#d and only the
+    // listed addresses match anyway.
+    let got_d = collect(
+        &store,
+        Arc::from([Filter::parse(&format!(
+            "{{\"kinds\":[30023],\"authors\":[\"{pk}\"],\"#d\":[\"a\"]}}"
+        ))
+        .unwrap()]),
+        3,
+    );
+    assert_eq!(got_d, vec![events[0].json().to_owned()]);
+}
+
+#[test]
 fn scan_cross_filter_dedup() {
     let (_dir, store) = store();
     let k = key(1);

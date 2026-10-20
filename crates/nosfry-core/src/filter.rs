@@ -138,8 +138,16 @@ impl Filter {
 
     /// Intrinsic result bound implied by the filter itself, independent of
     /// any external cap: empty ids/kinds/authors => `0`, deduplicated ids
-    /// count, replaceable/addressable `kinds * authors * #d`, explicit
-    /// `limit`, or `None` when unbounded (`vectors/filter-limit.json`).
+    /// count, explicit `limit`, or `None` when unbounded
+    /// (`vectors/filter-limit.json`).
+    ///
+    /// The kinds cardinality mirrors nostr-tools `getFilterLimit`
+    /// (filter.ts @ `8ffc628`): `authors * kinds` only when every kind
+    /// is replaceable (one live event per author+kind); `authors *
+    /// kinds * #d` only when every kind is addressable *and* a `#d`
+    /// condition is present (one live event per author+kind+d value).
+    /// Addressable kinds without `#d`, and kinds mixing classes, are
+    /// unbounded — an author may store any number of `d` addresses.
     #[must_use]
     pub fn intrinsic_limit(&self) -> Option<u64> {
         if self.impossible {
@@ -152,21 +160,33 @@ impl Filter {
         if let (Some(kinds), Some(authors)) = (&self.kinds, &self.authors)
             && !kinds.is_empty()
             && !authors.is_empty()
-            && kinds
-                .iter()
-                .all(|k| Kind(*k).is_replaceable() || Kind(*k).is_addressable())
+            && let Some(card) = self.kinds_cardinality(kinds, authors)
         {
-            let d = self
-                .tags
-                .iter()
-                .find(|(name, _)| *name == b'd')
-                .map_or(1, |(_, values)| values.len() as u64);
-            let card = (kinds.len() as u64)
-                .saturating_mul(authors.len() as u64)
-                .saturating_mul(d);
             bound = Some(bound.map_or(card, |b| b.min(card)));
         }
         bound
+    }
+
+    /// The author+kind cardinality a filter can hold: `authors *
+    /// kinds` when every kind is replaceable, `authors * kinds * #d`
+    /// when every kind is addressable and a `#d` condition is present,
+    /// else `None`.
+    fn kinds_cardinality(&self, kinds: &[u16], authors: &[[u8; 32]]) -> Option<u64> {
+        if kinds.iter().all(|k| Kind(*k).is_replaceable()) {
+            return Some((kinds.len() as u64).saturating_mul(authors.len() as u64));
+        }
+        if !kinds.iter().all(|k| Kind(*k).is_addressable()) {
+            return None;
+        }
+        self.tags
+            .iter()
+            .find(|(name, _)| *name == b'd')
+            .filter(|(_, values)| !values.is_empty())
+            .map(|(_, values)| {
+                (kinds.len() as u64)
+                    .saturating_mul(authors.len() as u64)
+                    .saturating_mul(values.len() as u64)
+            })
     }
 
     /// Result bound after applying `max` as the external cap.

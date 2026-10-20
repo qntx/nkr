@@ -183,6 +183,58 @@
         "limit": 10
       },
       "limit": 1
+    },
+    {
+      "filter": {
+        "kinds": [
+          30023
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "limit": null
+    },
+    {
+      "filter": {
+        "kinds": [
+          0,
+          30023
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23"
+        ]
+      },
+      "limit": null
+    },
+    {
+      "filter": {
+        "kinds": [
+          30023,
+          30033
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+          "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ],
+        "#d": [
+          "a",
+          "b"
+        ]
+      },
+      "limit": 8
+    },
+    {
+      "filter": {
+        "kinds": [
+          0
+        ],
+        "authors": [
+          "90a80db6eb294b9eab0b4e8ddfa3efe7263458ce2d07566df4e6c58868feef23",
+          "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        ]
+      },
+      "limit": 2
     }
   ]
 }
