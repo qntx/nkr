@@ -14,6 +14,7 @@ use crate::deletion::DeletionTarget;
 use crate::hex;
 use crate::kind::{Kind, KindClass};
 use crate::packed::{PackedEvent, PackedRef};
+use crate::url::RelayUrl;
 
 /// A 32-byte event id. `Display` is lowercase hex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -285,6 +286,16 @@ impl<'a> UnverifiedEvent<'a> {
         crate::deletion::targets(self.kind, &self.pubkey, &self.tags)
     }
 
+    /// The `relay` tag values of a kind-62 request to vanish; empty
+    /// for other kinds.
+    #[must_use]
+    pub fn vanish_relays(&self) -> Box<[Box<str>]> {
+        if self.kind.0 != 62 {
+            return Box::new([]);
+        }
+        self.tag_values("relay").map(Box::from).collect()
+    }
+
     /// The claimed event id.
     #[must_use]
     pub const fn id(&self) -> EventId {
@@ -386,6 +397,7 @@ impl<'a> UnverifiedEvent<'a> {
             address: self.address(),
             expiration: self.expiration,
             deletion_targets: self.deletion_targets(),
+            vanish_relays: self.vanish_relays(),
         })
     }
 }
@@ -410,6 +422,7 @@ pub struct Event {
     address: Option<[u8; 32]>,
     expiration: Option<u64>,
     deletion_targets: Vec<DeletionTarget>,
+    vanish_relays: Box<[Box<str>]>,
 }
 
 impl Event {
@@ -467,6 +480,16 @@ impl Event {
     #[must_use]
     pub fn deletion_targets(&self) -> &[DeletionTarget] {
         &self.deletion_targets
+    }
+
+    /// Whether this is a NIP-62 request to vanish that this relay must
+    /// honor: a kind 62 whose `relay` tags hold `ALL_RELAYS` or a value
+    /// matching `url`.
+    #[must_use]
+    pub fn requests_vanish(&self, url: Option<&RelayUrl>) -> bool {
+        self.vanish_relays
+            .iter()
+            .any(|value| value.as_ref() == "ALL_RELAYS" || url.is_some_and(|u| u.matches(value)))
     }
 }
 
@@ -760,5 +783,40 @@ mod tests {
         assert_eq!(unverified.deletion_targets(), Vec::<DeletionTarget>::new());
         let event = unverified.verify(&EventLimits::default()).expect("verify");
         assert_eq!(event.deletion_targets(), &[]);
+    }
+
+    #[test]
+    fn requests_vanish_matches_relay_tags() {
+        use crate::url::RelayUrl;
+        let url = RelayUrl::parse("wss://relay.example.com/path").expect("url");
+        let vanish = |tags: Vec<Vec<String>>| {
+            UnverifiedEvent::parse(&sign_json(62, 1000, &tags, "bye"), &EventLimits::default())
+                .expect("parse")
+                .verify(&EventLimits::default())
+                .expect("verify")
+        };
+        // `ALL_RELAYS` applies even without a configured URL; a
+        // matching URL compares under strfry normalization (scheme,
+        // path, case dropped).
+        assert!(vanish(vec![vec!["relay".into(), "ALL_RELAYS".into()]]).requests_vanish(None));
+        let named = vanish(vec![
+            vec!["relay".into(), "wss://other.example.com".into()],
+            vec!["relay".into(), "ws://Relay.Example.COM/elsewhere".into()],
+        ]);
+        assert!(named.requests_vanish(Some(&url)));
+        assert!(!named.requests_vanish(None));
+        let foreign = vanish(vec![vec!["relay".into(), "wss://other.example.com".into()]]);
+        assert!(!foreign.requests_vanish(Some(&url)));
+        // Not kind 62, or no `relay` tags: never a request.
+        assert!(!vanish(vec![]).requests_vanish(Some(&url)));
+        let note = UnverifiedEvent::parse(
+            &sign_json(1, 1000, &[vec!["relay".into(), "ALL_RELAYS".into()]], "x"),
+            &EventLimits::default(),
+        )
+        .expect("parse")
+        .verify(&EventLimits::default())
+        .expect("verify");
+        assert!(!note.requests_vanish(Some(&url)));
+        assert!(note.vanish_relays.is_empty());
     }
 }

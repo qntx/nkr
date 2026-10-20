@@ -30,6 +30,7 @@ use nosfry_core::kind::Kind;
 use nosfry_core::limits::{AddressBuckets, Limits};
 use nosfry_core::message::ClientVerb;
 use nosfry_core::session::{Command, Received, Session};
+use nosfry_core::url::RelayUrl;
 use secp256k1::Keypair;
 use secp256k1::schnorr;
 
@@ -641,11 +642,14 @@ fn rate_limited_flag_marks_refusals() {
 /// Session under auth rules: `url` empty disables AUTH; `kinds` are
 /// the restricted read kinds.
 fn session_auth(url: &str, kinds: &[u16], involved_only: bool) -> Session {
+    let service_url = (!url.is_empty()).then(|| RelayUrl::parse(url).expect("service url"));
     Session::new(
         Arc::new(Limits {
-            auth: Arc::new(
-                nosfry_core::auth::AuthRules::new(url, kinds, involved_only).expect("auth rules"),
-            ),
+            auth: Arc::new(nosfry_core::auth::AuthRules::new(
+                service_url,
+                kinds,
+                involved_only,
+            )),
             ..Limits::default()
         }),
         "challenge".to_owned(),
@@ -877,10 +881,11 @@ fn auth_charges_event_bucket() {
     };
     let mut s = Session::new(
         Arc::new(Limits {
-            auth: Arc::new(
-                nosfry_core::auth::AuthRules::new("wss://relay.example.com", &[4], true)
-                    .expect("auth rules"),
-            ),
+            auth: Arc::new(nosfry_core::auth::AuthRules::new(
+                Some(RelayUrl::parse("wss://relay.example.com").expect("service url")),
+                &[4],
+                true,
+            )),
             rate,
             ..Limits::default()
         }),

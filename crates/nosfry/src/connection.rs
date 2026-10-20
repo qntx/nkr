@@ -277,6 +277,11 @@ impl<'a> Connection<'a> {
         // The policy is re-read per event so a config reload takes
         // effect on the next publish on every connection.
         let live = self.handle.live.borrow().clone();
+        // NIP-62: a request to vanish naming this relay must not be
+        // filtered by the write policy (restricted relays MUST comply).
+        if event.requests_vanish(live.limits.auth.relay()) {
+            return true;
+        }
         let Some(policy) = &live.policy else {
             return true;
         };

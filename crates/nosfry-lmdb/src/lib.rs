@@ -42,6 +42,7 @@ use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, UnverifiedEvent, supersedes};
 use nosfry_core::packed::PackedRef;
+use nosfry_core::url::RelayUrl;
 
 mod count;
 mod scan;
@@ -50,7 +51,7 @@ pub use count::{CountResult, CountScan};
 pub use scan::{Progress, Scan};
 
 /// On-disk format version, stored under the `format` meta key.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 type BytesDb = Database<Bytes, Bytes>;
 type Reader<'a> = RoTxn<'a, WithoutTls>;
@@ -92,6 +93,10 @@ pub enum WriteOutcome {
     Ephemeral,
     /// A stored same-author kind-5 event deleted (or blocks) this event.
     Deleted,
+    /// The author's NIP-62 request to vanish covers this event
+    /// (`created_at <= T`), or it is a kind-1059 gift wrap `p`-tagged
+    /// to a vanished pubkey.
+    Vanished,
 }
 
 /// The result of one [`Store::write`] transaction.
@@ -102,6 +107,33 @@ pub struct Written {
     /// Seqs removed inside the transaction: replaced predecessors and
     /// NIP-09 targets (possibly stored and removed in this same batch).
     pub deleted: Vec<u64>,
+    /// A stored (or duplicate) NIP-62 request queued deletion work:
+    /// the writer should keep draining [`Store::vanish_step`].
+    pub vanish_pending: bool,
+}
+
+/// Outcome of one [`Store::vanish_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VanishStep {
+    /// Events deleted in this step.
+    pub deleted: usize,
+    /// `vanish_pending` still holds work — call again.
+    pub more: bool,
+}
+
+/// Collected seqs and the resume position of one bounded vanish
+/// range walk.
+struct RangeWalk {
+    /// Seqs whose record kind passed the phase's predicate.
+    seqs: Vec<u64>,
+    /// Index entries examined before the range ended or the budget
+    /// ran out — skipped kinds count too, so a step's work is bounded.
+    examined: usize,
+    /// Key of the last examined row; resuming starts strictly after
+    /// it, so skipped rows are never examined twice.
+    last: Option<Vec<u8>>,
+    /// The range reached its end without spending the budget.
+    drained: bool,
 }
 
 /// Store failures.
@@ -255,6 +287,12 @@ pub struct Store {
     ix_expiration: BytesDb,
     ix_deletion: BytesDb,
     ix_replace_deletion: BytesDb,
+    /// `ix_vanish`: `pubkey` → vanish point `T` (u64 BE, max of its
+    /// NIP-62 requests' `created_at`).
+    ix_vanish: BytesDb,
+    /// `vanish_pending`: pubkeys whose vanish ranges are not drained —
+    /// a persistent work queue, so a restart resumes mid-vanish.
+    vanish_pending: BytesDb,
 }
 
 impl Store {
@@ -275,7 +313,7 @@ impl Store {
         options
             .map_size(opts.map_size)
             .max_readers(opts.max_readers)
-            .max_dbs(16);
+            .max_dbs(18);
         if opts.no_read_ahead {
             // SAFETY: heed requires env flags to be set before opening.
             unsafe { options.flags(EnvFlags::NO_READ_AHEAD) };
@@ -305,6 +343,8 @@ impl Store {
         let ix_expiration = open_or_create("ix_expiration")?;
         let ix_deletion = open_or_create("ix_deletion")?;
         let ix_replace_deletion = open_or_create("ix_replace_deletion")?;
+        let ix_vanish = open_or_create("ix_vanish")?;
+        let vanish_pending = open_or_create("vanish_pending")?;
         if let Some(bytes) = meta.get(&wtxn, b"format")? {
             let found = u32::from_be_bytes(
                 bytes
@@ -337,24 +377,43 @@ impl Store {
             ix_expiration,
             ix_deletion,
             ix_replace_deletion,
+            ix_vanish,
+            vanish_pending,
         })
     }
 
-    /// Apply `events` in arrival order inside a single write transaction.
+    /// Apply `events` in arrival order inside a single write
+    /// transaction. `service_url` is the relay's own URL for NIP-62
+    /// (`None` honors only `ALL_RELAYS` requests).
     ///
     /// # Errors
     ///
     /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
     /// broken index invariant.
-    pub fn write(&self, events: &[Arc<Event>]) -> Result<Written, StoreError> {
+    pub fn write(
+        &self,
+        events: &[Arc<Event>],
+        service_url: Option<&RelayUrl>,
+    ) -> Result<Written, StoreError> {
         let mut txn = self.env.write_txn()?;
         let mut next_seq = self.next_seq(&txn)?;
         let mut written = Written {
             outcomes: Vec::with_capacity(events.len()),
             deleted: Vec::new(),
+            vanish_pending: false,
         };
         for event in events {
             let outcome = self.apply(&mut txn, event, &mut next_seq, &mut written.deleted)?;
+            // A request to vanish that was stored (or already stored)
+            // extends the author's vanish point and queues the sweep.
+            if event.requests_vanish(service_url)
+                && matches!(
+                    outcome,
+                    WriteOutcome::Stored { .. } | WriteOutcome::Duplicate
+                )
+            {
+                written.vanish_pending |= self.record_vanish(&mut txn, event)?;
+            }
             written.outcomes.push(outcome);
         }
         self.meta
@@ -374,6 +433,12 @@ impl Store {
         next_seq: &mut u64,
         deleted: &mut Vec<u64>,
     ) -> Result<WriteOutcome, StoreError> {
+        // NIP-62: a stored request to vanish blocks the author's
+        // equal-or-older events (never a kind 62 itself) and gift
+        // wraps `p`-tagged to a vanished pubkey.
+        if event.kind().0 != 62 && self.vanish_blocked(txn, event)? {
+            return Ok(WriteOutcome::Vanished);
+        }
         if event.kind().is_ephemeral() {
             return Ok(WriteOutcome::Ephemeral);
         }
@@ -381,8 +446,12 @@ impl Store {
             return Ok(WriteOutcome::Duplicate);
         }
         // NIP-09: an id covered by a stored same-author kind 5 stays
-        // deleted; a kind 5 itself is never blocked.
-        if event.kind().0 != 5 && self.has_prefix(txn, Index::Deletion, &deletion_prefix(event))? {
+        // deleted; a kind 5 itself is never blocked, and a kind 62
+        // request to vanish is never blocked either (NIP-62).
+        if event.kind().0 != 5
+            && event.kind().0 != 62
+            && self.has_prefix(txn, Index::Deletion, &deletion_prefix(event))?
+        {
             return Ok(WriteOutcome::Deleted);
         }
         // NIP-09: an `a` deletion blocks equal-or-older versions.
@@ -444,8 +513,9 @@ impl Store {
     }
 
     /// Delete the `e`-tagged event `id` when it is `author`'s own and
-    /// not itself a kind 5 (NIP-09: a deletion request cannot delete a
-    /// deletion request).
+    /// neither a kind 5 (NIP-09: a deletion request cannot delete a
+    /// deletion request) nor a kind 62 (NIP-62: a request to vanish
+    /// cannot be deleted).
     fn delete_event_target(
         &self,
         txn: &mut RwTxn<'_>,
@@ -462,7 +532,7 @@ impl Store {
                 return Ok(());
             };
             let packed = PackedRef::new(bytes).ok_or(StoreError::Corrupt("bad packed record"))?;
-            packed.pubkey() == *author && packed.kind().0 != 5
+            packed.pubkey() == *author && packed.kind().0 != 5 && packed.kind().0 != 62
         };
         if deletable && self.delete_seq(txn, seq)? {
             deleted.push(seq);
@@ -541,6 +611,69 @@ impl Store {
             .ok_or(StoreError::Corrupt("ix_replace points at a missing event"))?
             .to_vec();
         Ok(Some((old_seq, bytes)))
+    }
+
+    /// The stored vanish point `T` of `pubkey` — the maximum
+    /// `created_at` of its honored NIP-62 requests.
+    fn vanished_at(&self, txn: &RwTxn<'_>, pubkey: &[u8; 32]) -> Result<Option<u64>, StoreError> {
+        self.ix_vanish
+            .get(txn, pubkey)?
+            .map(|bytes| {
+                bytes
+                    .try_into()
+                    .map(u64::from_be_bytes)
+                    .map_err(|_| StoreError::Corrupt("bad ix_vanish value"))
+            })
+            .transpose()
+    }
+
+    /// Whether a NIP-62 vanish point covers `event`: the author's `T`
+    /// blocks its events with `created_at <= T`, and a kind-1059 gift
+    /// wrap is blocked by the `p`-tagged recipient's `T`.
+    fn vanish_blocked(&self, txn: &RwTxn<'_>, event: &Event) -> Result<bool, StoreError> {
+        if self
+            .vanished_at(txn, &event.pubkey().0)?
+            .is_some_and(|t| event.created_at() <= t)
+        {
+            return Ok(true);
+        }
+        if event.kind().0 != 1059 {
+            return Ok(false);
+        }
+        for (name, value) in event.packed().tags() {
+            let Ok(value) = <&[u8; 32]>::try_from(value) else {
+                continue;
+            };
+            if name == b'p'
+                && self
+                    .vanished_at(txn, value)?
+                    .is_some_and(|t| event.created_at() <= t)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Register `event`'s NIP-62 request: raise the author's vanish
+    /// point to its `created_at` and queue the pubkey for
+    /// [`Store::vanish_step`]. A raised point restarts the walk from
+    /// the beginning so rows between the old and new `T` are covered;
+    /// an equal-or-older request keeps the in-flight resume position.
+    /// Returns whether undrained work is queued.
+    fn record_vanish(&self, txn: &mut RwTxn<'_>, event: &Event) -> Result<bool, StoreError> {
+        let pubkey = event.pubkey().0;
+        let t = event.created_at();
+        match self.vanished_at(txn, &pubkey)? {
+            Some(old) if old >= t => {}
+            _ => {
+                self.ix_vanish.put(txn, &pubkey, &t.to_be_bytes())?;
+                // Phase 0, no resume key: walk from the start.
+                self.vanish_pending.put(txn, &pubkey, &[0])?;
+                return Ok(true);
+            }
+        }
+        Ok(self.vanish_pending.get(txn, &pubkey)?.is_some())
     }
 
     /// The highest assigned sequence number (`0` when empty); the upper
@@ -755,6 +888,182 @@ impl Store {
         Ok(count)
     }
 
+    /// Whether any pubkey has undrained vanish work (startup check so
+    /// a vanish queued before a crash resumes).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure.
+    pub fn vanish_pending(&self) -> Result<bool, StoreError> {
+        let txn = self.env.read_txn()?;
+        Ok(self.vanish_pending.iter(&txn)?.next().is_some())
+    }
+
+    /// Drain pending vanish work examining at most `limit` index
+    /// entries, in one write transaction. Per pubkey the walk visits
+    /// the author's events with `created_at <= T` via `ix_pubkey`
+    /// (kind 62 skipped — a request to vanish is never deleted), then
+    /// kind-1059 gift wraps `p`-tagged to it via `ix_tag`, removing
+    /// collected seqs through the full [`Store::delete_seq`] routine.
+    /// The `vanish_pending` value is a resume cursor — a phase byte
+    /// plus the last examined index key — so skipped rows (kind 62
+    /// itself, non-wrap mentions of the author) are examined once
+    /// across steps, and an exhausted wraps range removes the pubkey.
+    /// The returned [`VanishStep::more`] is the writer's keep-going
+    /// signal; `deleted` counts rows actually removed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on
+    /// a broken index invariant.
+    pub fn vanish_step(&self, limit: usize) -> Result<VanishStep, StoreError> {
+        let mut txn = self.env.write_txn()?;
+        let mut queue = Vec::new();
+        for entry in self.vanish_pending.iter(&txn)? {
+            let (key, value) = entry?;
+            let pubkey: &[u8; 32] = key
+                .try_into()
+                .map_err(|_| StoreError::Corrupt("bad vanish_pending key"))?;
+            queue.push((*pubkey, value.to_vec()));
+        }
+        let mut budget = limit;
+        let mut deleted = 0usize;
+        let mut more = false;
+        for (pubkey, resume) in queue {
+            if budget == 0 {
+                more = true;
+                break;
+            }
+            let (removed, done) = self.drain_vanished(&mut txn, &pubkey, &resume, &mut budget)?;
+            deleted += removed;
+            more |= !done;
+        }
+        txn.commit()?;
+        Ok(VanishStep { deleted, more })
+    }
+
+    /// Drain one pending pubkey's vanish ranges under the shared
+    /// `budget` (decremented per examined entry): the author's events
+    /// up to `T` via `ix_pubkey` (kind 62 excepted), then kind-1059
+    /// gift wraps `p`-tagged to it via `ix_tag`. Collected seqs go
+    /// through [`Store::delete_seq`]; the `vanish_pending` cursor is
+    /// removed when both ranges drained and advanced otherwise.
+    /// Returns the deleted count and whether the pubkey is done.
+    fn drain_vanished(
+        &self,
+        txn: &mut RwTxn<'_>,
+        pubkey: &[u8; 32],
+        resume: &[u8],
+        budget: &mut usize,
+    ) -> Result<(usize, bool), StoreError> {
+        let Some(t) = self.vanished_at(txn, pubkey)? else {
+            self.vanish_pending.delete(txn, pubkey)?;
+            return Ok((0, true));
+        };
+        let (mut phase, mut last) = decode_resume(resume)?;
+        let mut seqs = Vec::new();
+        let mut done = false;
+        loop {
+            let (index, prefix, keep): (&BytesDb, Vec<u8>, fn(u16) -> bool) = if phase == 0 {
+                (&self.ix_pubkey, pubkey.to_vec(), |kind| kind != 62)
+            } else {
+                (&self.ix_tag, wraps_prefix(pubkey), |kind| kind == 1059)
+            };
+            let walk =
+                self.collect_vanished(txn, (index, &prefix), t, last.as_deref(), keep, *budget)?;
+            *budget -= walk.examined;
+            seqs.extend(walk.seqs);
+            last = walk.last;
+            if !walk.drained {
+                break;
+            }
+            if phase == 1 {
+                done = true;
+                break;
+            }
+            phase = 1;
+            last = None;
+        }
+        let mut deleted = 0usize;
+        for seq in seqs {
+            deleted += usize::from(self.delete_seq(txn, seq)?);
+        }
+        if done {
+            self.vanish_pending.delete(txn, pubkey)?;
+        } else {
+            let mut value = Vec::with_capacity(1 + last.as_ref().map_or(0, Vec::len));
+            value.push(phase);
+            if let Some(key) = &last {
+                value.extend_from_slice(key);
+            }
+            self.vanish_pending.put(txn, pubkey, &value)?;
+        }
+        Ok((deleted, done))
+    }
+
+    /// Walk one vanish index range — `(last, range.1 ‖ T ‖ u64::MAX]`,
+    /// or from the range start when `last` is `None` — examining at
+    /// most `budget` entries and collecting seqs whose record kind
+    /// `keep` accepts.
+    fn collect_vanished(
+        &self,
+        txn: &RwTxn<'_>,
+        range: (&BytesDb, &[u8]),
+        t: u64,
+        last: Option<&[u8]>,
+        keep: fn(u16) -> bool,
+        budget: usize,
+    ) -> Result<RangeWalk, StoreError> {
+        let (index, prefix) = range;
+        let mut start = Vec::with_capacity(prefix.len() + 16);
+        if let Some(key) = last {
+            start.extend_from_slice(key);
+        } else {
+            start.extend_from_slice(prefix);
+            start.extend_from_slice(&[0; 16]);
+        }
+        let lo = if last.is_some() {
+            Bound::Excluded(&*start)
+        } else {
+            Bound::Included(&*start)
+        };
+        let mut end = Vec::with_capacity(prefix.len() + 16);
+        end.extend_from_slice(prefix);
+        end.extend_from_slice(&t.to_be_bytes());
+        end.extend_from_slice(&u64::MAX.to_be_bytes());
+        let bounds = (lo, Bound::Included(&*end));
+        let mut walk = RangeWalk {
+            seqs: Vec::new(),
+            examined: 0,
+            last: last.map(<[u8]>::to_vec),
+            drained: false,
+        };
+        let mut iter = index.range(txn, &bounds)?;
+        loop {
+            if walk.examined >= budget {
+                return Ok(walk);
+            }
+            let Some(entry) = iter.next() else {
+                walk.drained = true;
+                return Ok(walk);
+            };
+            walk.examined += 1;
+            let (key, _) = entry?;
+            walk.last = Some(key.to_vec());
+            let seq = decode_seq(
+                key.last_chunk::<8>()
+                    .ok_or(StoreError::Corrupt("bad vanish index key"))?,
+            )?;
+            let packed = PackedRef::new(self.events.get(txn, &seq.to_be_bytes())?.ok_or(
+                StoreError::Corrupt("vanish index points at a missing event"),
+            )?)
+            .ok_or(StoreError::Corrupt("bad packed record"))?;
+            if keep(packed.kind().0) {
+                walk.seqs.push(seq);
+            }
+        }
+    }
+
     fn insert(&self, txn: &mut RwTxn<'_>, event: &Event, seq: u64) -> Result<(), StoreError> {
         self.events
             .put(txn, &seq.to_be_bytes(), event.packed().as_bytes())?;
@@ -821,6 +1130,28 @@ fn deletion_prefix(event: &Event) -> [u8; 64] {
     id.copy_from_slice(&event.id().0);
     pubkey.copy_from_slice(&event.pubkey().0);
     prefix
+}
+
+/// The `('p' ‖ 32 ‖ pubkey)` `ix_tag` range prefix for gift wraps
+/// `p`-tagged to a vanishing author.
+fn wraps_prefix(pubkey: &[u8; 32]) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(34);
+    prefix.extend_from_slice(&[b'p', 32]);
+    prefix.extend_from_slice(pubkey);
+    prefix
+}
+
+/// A `vanish_pending` value: phase byte (`0` author range, `1` wraps
+/// range) plus the last examined index key (`None` = walk not
+/// started).
+fn decode_resume(value: &[u8]) -> Result<(u8, Option<Vec<u8>>), StoreError> {
+    let (phase, rest) = value
+        .split_first()
+        .ok_or(StoreError::Corrupt("bad vanish_pending value"))?;
+    match *phase {
+        0 | 1 => Ok((*phase, (!rest.is_empty()).then(|| rest.to_vec()))),
+        _ => Err(StoreError::Corrupt("bad vanish_pending phase")),
+    }
 }
 
 fn decode_seq(bytes: &[u8]) -> Result<u64, StoreError> {
@@ -894,7 +1225,7 @@ mod tests {
         let signer = key(1);
         let old = event(&signer, 0, 100, &json!([["t", "x"]]), "old");
         let new = event(&signer, 0, 200, &json!([["t", "x"]]), "new");
-        let outcomes = store.write(&[Arc::clone(&old), new]).unwrap();
+        let outcomes = store.write(&[Arc::clone(&old), new], None).unwrap();
         assert_eq!(
             outcomes.outcomes,
             vec![
@@ -981,7 +1312,7 @@ mod tests {
             "",
         );
         let written = store
-            .write(&[Arc::clone(&target), Arc::clone(&kind5)])
+            .write(&[Arc::clone(&target), Arc::clone(&kind5)], None)
             .unwrap();
         assert_eq!(written.deleted, vec![1]);
         assert_seq_gone(&store, 1);
@@ -1015,7 +1346,7 @@ mod tests {
             &json!([["d", long_d], ["expiration", "150"], ["t", "x"]]),
             "v",
         );
-        store.write(&[Arc::clone(&target)]).unwrap();
+        store.write(&[Arc::clone(&target)], None).unwrap();
         assert_eq!(store.expire(200, 10).unwrap(), 1);
         assert_seq_gone(&store, 1);
         let txn = store.read_txn().unwrap();

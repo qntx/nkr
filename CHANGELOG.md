@@ -12,6 +12,18 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- NIP-62 request to vanish: a kind-62 event whose `relay` tags name
+  `[relay] service_url` or hold `ALL_RELAYS` (honored even without a
+  configured URL) records a vanish point at its `created_at`, deletes
+  the author's events at or before it (every kind except 62 itself,
+  which can never be deleted or blocked) and `p`-tagged kind-1059
+  gift wraps in the window, and queues a persistent backlog the
+  writer drains 10,000 events per step — resuming after a restart.
+  Republishing vanished events is refused with
+  `blocked: request to vanish`, and requests bypass the
+  write-policy plugin as the NIP requires. NIP-11 advertises 62.
+  The store's `write` takes the relay URL, bumps the on-disk format
+  to 3, and `vanish_step`/`vanish_pending` drive the sweep.
 - NIP-45 `COUNT`: `["COUNT", <sub>, <filters>…]` counts the stored
   events the filters would return and answers with one
   `["COUNT",<sub>,{"count":n}]` frame. COUNTs share the REQ rate
@@ -157,6 +169,11 @@ down`; CLOSE is never charged.
 
 ### Changed
 
+- `service_url` moved from `[relay.auth]` to `[relay]` (the URL is
+  also the NIP-62 vanish target, independent of AUTH); the error is
+  `ServerError::ServiceUrl`. `nosfry_core`'s `AuthRules::new` takes a
+  typed `Option<RelayUrl>` and `AuthRulesError` is gone.
+
 - `Session::on_text` takes the current unix time in **milliseconds**
   (previously seconds), needed for millisecond-accurate rate buckets,
   and returns `Received { verb, rate_limited }` — the recognized client
@@ -198,7 +215,7 @@ down`; CLOSE is never charged.
   `Command::Subscribe` carries a `ReadGate`; `Scan::new` and
   `Monitors::insert` take the gate; `Limits` is no longer `Copy`
   (new `auth` field); `Config::limits` is now fallible
-  (`ServerError::Auth` on an invalid `relay.auth.service_url`).
+  (`ServerError::ServiceUrl` on an invalid `relay.service_url`).
 - `--config` is a global flag on the `nosfry` binary: it works before
   or after the subcommand, not just on `relay`.
 - All logs go to stderr (previously stdout), keeping stdout clean for

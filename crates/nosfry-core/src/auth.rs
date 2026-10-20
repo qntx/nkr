@@ -1,10 +1,10 @@
 //! NIP-42 authentication rules and the per-subscription read gate.
 //!
-//! [`AuthRules`] carries the configured service URL (normalized like
-//! strfry's `normalizeRelayUrl`), the restricted read kinds, and the
-//! `involved_only` policy. [`ReadGate`] is the snapshot taken at REQ
-//! time — the rules plus the connection's authenticated pubkeys — that
-//! stored scans and live monitors consult per event.
+//! [`AuthRules`] carries the configured service URL, the restricted
+//! read kinds, and the `involved_only` policy. [`ReadGate`] is the
+//! snapshot taken at REQ time — the rules plus the connection's
+//! authenticated pubkeys — that stored scans and live monitors
+//! consult per event.
 
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use crate::event::PublicKey;
 use crate::filter::Filter;
 use crate::kind::Kind;
 use crate::packed::PackedRef;
+use crate::url::RelayUrl;
 
 /// The NIP-42 authentication event kind.
 pub const AUTH_KIND: Kind = Kind(22242);
@@ -26,8 +27,8 @@ pub const MAX_AUTHED_PUBKEYS: usize = 8;
 /// `Default` disables AUTH entirely and restricts nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AuthRules {
-    /// Normalized `host[:port]` of the service URL when AUTH is enabled.
-    relay: Option<Box<str>>,
+    /// The relay's own URL when AUTH is enabled.
+    relay: Option<RelayUrl>,
     /// Sorted, deduplicated kinds hidden from unauthorized readers.
     restricted_kinds: Box<[u16]>,
     /// Restricted events are served only to authenticated pubkeys
@@ -36,39 +37,24 @@ pub struct AuthRules {
 }
 
 impl AuthRules {
-    /// New rules. An empty `service_url` disables AUTH (protected
-    /// events are rejected outright and restricted kinds are never
-    /// served). A non-empty URL must be `ws://` or `wss://` with a
-    /// non-empty normalized host.
-    ///
-    /// # Errors
-    ///
-    /// [`AuthRulesError::ServiceUrl`] on a malformed service URL.
-    pub fn new(
-        service_url: &str,
-        restricted_kinds: &[u16],
-        involved_only: bool,
-    ) -> Result<Self, AuthRulesError> {
-        let relay = if service_url.is_empty() {
-            None
-        } else {
-            if !service_url.starts_with("ws://") && !service_url.starts_with("wss://") {
-                return Err(AuthRulesError::ServiceUrl);
-            }
-            let host = normalize_relay_url(service_url).to_ascii_lowercase();
-            if host.is_empty() {
-                return Err(AuthRulesError::ServiceUrl);
-            }
-            Some(host.into_boxed_str())
-        };
+    /// New rules. `None` disables AUTH (protected events are rejected
+    /// outright and restricted kinds are never served).
+    #[must_use]
+    pub fn new(relay: Option<RelayUrl>, restricted_kinds: &[u16], involved_only: bool) -> Self {
         let mut restricted_kinds = restricted_kinds.to_vec();
         restricted_kinds.sort_unstable();
         restricted_kinds.dedup();
-        Ok(Self {
+        Self {
             relay,
             restricted_kinds: restricted_kinds.into(),
             involved_only,
-        })
+        }
+    }
+
+    /// The configured service URL (`None` = AUTH disabled).
+    #[must_use]
+    pub const fn relay(&self) -> Option<&RelayUrl> {
+        self.relay.as_ref()
     }
 
     /// Whether AUTH is enabled (a service URL is configured).
@@ -83,12 +69,9 @@ impl AuthRules {
         self.restricted_kinds.binary_search(&kind).is_ok()
     }
 
-    /// Whether a normalized `relay` tag value equals the configured
-    /// service URL.
+    /// Whether a `relay` tag value names the configured service URL.
     pub(crate) fn matches_relay(&self, url: &str) -> bool {
-        self.relay
-            .as_deref()
-            .is_some_and(|relay| normalize_relay_url(url).eq_ignore_ascii_case(relay))
+        self.relay.as_ref().is_some_and(|relay| relay.matches(url))
     }
 
     /// Whether every filter is fully restricted — restricted kinds are
@@ -104,14 +87,6 @@ impl AuthRules {
                     .is_some_and(|kinds| kinds.iter().all(|kind| self.is_restricted(*kind)))
             })
     }
-}
-
-/// An invalid `[relay.auth] service_url`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum AuthRulesError {
-    /// The URL is not a `ws://`/`wss://` URL with a host.
-    #[error("service_url must be a ws:// or wss:// URL with a host")]
-    ServiceUrl,
 }
 
 /// Per-subscription read visibility: the rules plus the pubkeys the
@@ -162,15 +137,6 @@ impl ReadGate {
     }
 }
 
-/// The host part of a relay URL, lowercased by the caller where needed:
-/// strip through `://`, cut at the first `/`, `?`, or `#` (strfry
-/// `normalizeRelayUrl`).
-fn normalize_relay_url(url: &str) -> &str {
-    let rest = url.find("://").map_or(url, |pos| &url[pos + 3..]);
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    &rest[..end]
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -181,7 +147,12 @@ mod tests {
     use super::*;
 
     fn auth_rules(url: &str, kinds: &[u16], involved_only: bool) -> AuthRules {
-        AuthRules::new(url, kinds, involved_only).unwrap()
+        let url = if url.is_empty() {
+            None
+        } else {
+            Some(RelayUrl::parse(url).unwrap())
+        };
+        AuthRules::new(url, kinds, involved_only)
     }
 
     fn gate(rules: &AuthRules, authed: &[[u8; 32]]) -> ReadGate {
@@ -212,10 +183,7 @@ mod tests {
         assert!(ok.enabled());
         assert!(ok.matches_relay("wss://relay.example.com"));
         assert!(ok.matches_relay("wss://Relay.Example.com/sub#frag"));
-        for bad in ["http://x", "wss://", "relay.example.com", "ws://"] {
-            assert!(AuthRules::new(bad, &[], false).is_err(), "{bad} must fail");
-        }
-        let disabled = AuthRules::new("", &[4], true).unwrap();
+        let disabled = auth_rules("", &[4], true);
         assert!(!disabled.enabled());
         assert!(!disabled.matches_relay("wss://x"));
     }

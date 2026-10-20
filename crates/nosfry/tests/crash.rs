@@ -160,7 +160,7 @@ fn seed_events(store: &Store, count: u64) {
         let batch: Vec<_> = (base..(base + 500).min(count))
             .map(|i| event(&k, 1, 1_000_000 + i, &json!([]), &format!("{content}-{i}")))
             .collect();
-        store.write(&batch).unwrap();
+        store.write(&batch, None).unwrap();
     }
 }
 

@@ -566,7 +566,7 @@ async fn nip11_document() {
     for key in ["description", "pubkey", "contact", "icon"] {
         assert!(doc.get(key).is_none(), "{key} must be omitted when empty");
     }
-    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 45, 70, 77]));
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 45, 62, 70, 77]));
     assert_eq!(doc["software"], "https://github.com/qntx/nosfry");
     assert_eq!(doc["limitation"]["max_subscriptions"], 200);
     assert_eq!(
@@ -1929,7 +1929,7 @@ async fn invalid_auth_reload_rejects_everything() {
 
     let mut bad = reload_config("must not apply");
     bad.relay.max_connections_per_ip = 1;
-    bad.relay.auth.service_url = "http://bad".into();
+    bad.relay.service_url = "http://bad".into();
     relay.reload(bad);
     // Let the reload task consume (and reject) it. The name stays the
     // startup value, and the lowered cap never applies: both checks
@@ -2029,7 +2029,7 @@ fn auth_wire(keypair: &secp256k1::Keypair, challenge: &str, relay_url: &str) -> 
 /// Relay config with NIP-42 enabled.
 fn auth_config() -> nosfry::config::Config {
     let mut config = common::config();
-    config.relay.auth.service_url = "wss://relay.example.com".into();
+    config.relay.service_url = "wss://relay.example.com".into();
     config
 }
 
@@ -2038,7 +2038,10 @@ async fn nip11_lists_42_only_with_auth_service_url() {
     let relay = Relay::start_with(auth_config()).await;
     let text = http_get(relay.addr, "/").await;
     let doc = nip11_body(&text);
-    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 42, 45, 70, 77]));
+    assert_eq!(
+        doc["supported_nips"],
+        json!([1, 9, 11, 40, 42, 45, 62, 70, 77])
+    );
     relay.stop().await;
 }
 
@@ -2162,7 +2165,7 @@ async fn write_policy_receives_authed_pubkey() {
         out_path.display()
     ));
     let mut config = policy_config(&plugin, 10);
-    config.relay.auth.service_url = "wss://relay.example.com".into();
+    config.relay.service_url = "wss://relay.example.com".into();
     let relay = Relay::start_with(config).await;
     let mut ws = relay.connect().await;
     // Trigger the challenge with a restricted REQ, then AUTH.
@@ -2771,5 +2774,119 @@ async fn neg_malformed_msg_is_invalid() {
     send_text(&mut ws, &neg_msg_wire("s", &[0x61])).await;
     let frame = json(&recv_text(&mut ws, T).await);
     assert_eq!(frame[2], "closed: unknown subscription", "{frame}");
+    relay.stop().await;
+}
+
+// NIP-62 request to vanish: end-to-end over the wire.
+
+/// A config with a `service_url` so vanish requests can name this
+/// relay, and no restricted read kinds so REQs see gift wraps too.
+fn vanish_config() -> nosfry::config::Config {
+    let mut config = auth_config();
+    config.relay.auth.restricted_read_kinds = vec![];
+    config
+}
+
+/// REQ `{}` until exactly `want` ids are served or the bound expires;
+/// the vanish sweep runs on the writer, so the client may observe the
+/// pre-sweep set for a few polls.
+async fn settled_ids(ws: &mut yawc::TcpWebSocket, sub: &str, want: &mut Vec<String>) {
+    want.sort_unstable();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut got = req_ids(ws, sub, "{}").await;
+        got.sort_unstable();
+        if got == *want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {want:?}, still {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn nip62_vanish_deletes_covered_events_and_blocks_republish() {
+    let relay = Relay::start_with(vanish_config()).await;
+    let mut ws = relay.connect().await;
+    let (author, other) = (key(60), key(61));
+    let t = now();
+    // Everything of the author's at or before the request's
+    // `created_at` vanishes — notes, replaceables, and addressables —
+    // as do gift wraps `p`-tagged to the author in the window.
+    let note = common::event(&author, 1, t - 10, &json!([]), "gone");
+    let article = common::event(&author, 30023, t - 5, &json!([["d", "x"]]), "gone too");
+    let wrap = common::event(&other, 1059, t - 3, &json!([["p", pk_hex(60)]]), "sealed");
+    let keep = common::event(&other, 1, t - 4, &json!([]), "untouched");
+    for ev in [&note, &article, &wrap, &keep] {
+        send_text(&mut ws, &event_wire(ev)).await;
+        assert_eq!(recv_ok(&mut ws, ev).await[2], true);
+    }
+    let vanish = common::event(
+        &author,
+        62,
+        t,
+        &json!([["relay", "wss://relay.example.com"]]),
+        "bye",
+    );
+    send_text(&mut ws, &event_wire(&vanish)).await;
+    assert_eq!(recv_ok(&mut ws, &vanish).await[2], true);
+    let late = common::event(&author, 1, t + 10, &json!([]), "after");
+    send_text(&mut ws, &event_wire(&late)).await;
+    assert_eq!(recv_ok(&mut ws, &late).await[2], true);
+
+    let mut want = vec![
+        vanish.id().to_string(),
+        late.id().to_string(),
+        keep.id().to_string(),
+    ];
+    settled_ids(&mut ws, "v", &mut want).await;
+
+    // Republishing a vanished event is refused.
+    send_text(&mut ws, &event_wire(&note)).await;
+    let ok = recv_ok(&mut ws, &note).await;
+    assert_eq!(ok[2], false);
+    assert_eq!(ok[3], "blocked: request to vanish", "{ok}");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn nip62_vanish_bypasses_write_policy() {
+    let (_dir, plugin) = write_plugin(&loop_plugin(
+        r#"printf '{"id":"%s","action":"reject","msg":"nope"}\n' "$id""#,
+    ));
+    let mut config = policy_config(&plugin, 10);
+    config.relay.service_url = "wss://relay.example.com".into();
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+    let author = key(62);
+    // The plugin vetoes an ordinary event …
+    let note = common::event(&author, 1, now(), &json!([]), "vetoed");
+    send_text(&mut ws, &event_wire(&note)).await;
+    let ok = recv_ok(&mut ws, &note).await;
+    assert_eq!(ok[2], false);
+    // … but a request to vanish naming this relay MUST be accepted
+    // (NIP-62), while one naming only another relay still goes through
+    // the plugin.
+    let vanish = common::event(
+        &author,
+        62,
+        now(),
+        &json!([["relay", "wss://relay.example.com"]]),
+        "bye",
+    );
+    send_text(&mut ws, &event_wire(&vanish)).await;
+    assert_eq!(recv_ok(&mut ws, &vanish).await[2], true);
+    let foreign = common::event(
+        &author,
+        62,
+        now() + 1,
+        &json!([["relay", "wss://other.example.com"]]),
+        "not here",
+    );
+    send_text(&mut ws, &event_wire(&foreign)).await;
+    assert_eq!(recv_ok(&mut ws, &foreign).await[2], false);
     relay.stop().await;
 }

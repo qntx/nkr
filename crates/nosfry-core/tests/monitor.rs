@@ -23,10 +23,15 @@ use nosfry_core::message::SubId;
 use nosfry_core::monitor::Monitors;
 use nosfry_core::packed::PackedEvent;
 use nosfry_core::session::SubKey;
+use nosfry_core::url::RelayUrl;
 
 #[test]
 fn restricted_event_reaches_only_involved_authed_subs() {
-    let rules = Arc::new(AuthRules::new("wss://relay.example.com", &[4], true).unwrap());
+    let rules = Arc::new(AuthRules::new(
+        Some(RelayUrl::parse("wss://relay.example.com").unwrap()),
+        &[4],
+        true,
+    ));
     let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[4]}").unwrap()]);
     let mut monitors = Monitors::<u8>::new();
     // conn 1: unauthenticated; conn 2: authed but uninvolved;
