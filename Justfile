@@ -54,6 +54,10 @@ fmt-check:
     cargo +nightly fmt --all -- --check
     npx --yes @taplo/cli@0.7.0 fmt --check
 
+# Fuzz one target for `secs` seconds (nightly + cargo-fuzz required)
+fuzz target='client_message' secs='60':
+    cargo +nightly fuzz run {{target}} -- -max_total_time={{secs}}
+
 # Generate documentation for all crates and open it in the browser
 doc:
     cargo +nightly doc --all-features --no-deps --open

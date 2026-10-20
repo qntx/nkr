@@ -31,4 +31,10 @@ cargo run --release -p nosfry -- relay --config nosfry.example.toml
 
 TOML is formatted by taplo (`.taplo.toml`, aligned `=`); keep `taplo fmt --check` green.
 
+Fuzz one target locally (needs a nightly toolchain and `cargo-fuzz`):
+
+```bash
+cargo +nightly fuzz run <target> -- -max_total_time=60
+```
+
 `docs/` is local-only and is never pushed: the whole directory is gitignored; never commit any file under `docs/`. Locally it is a Fumadocs tree: every page needs non-empty `title` and `description` frontmatter and must be listed in its folder's `meta.json`; headings start at `##`, every fenced code block has a language. Verify doc changes with `bunx oxfmt --ignore-path=/dev/null <files>` and `bun validate-docs-tree.ts docs --lint` from a checkout of `qntx/workflows/actions/validate-docs-tree`.

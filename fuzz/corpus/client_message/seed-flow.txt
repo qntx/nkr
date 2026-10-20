@@ -1,0 +1,3 @@
+["AUTH",{"content":"","created_at":1700000000,"id":"fe05b276ac951ef5093728d5870de78a23bbad289d3f307c520cc97da4dde767","kind":22242,"pubkey":"989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f","sig":"de4291a8149c70deb5e04d6709c7f0d11115e27e8f3212587318e2d4e9dec2675721d38ce3e53dd37856739b79fb5b4251a8e49d55ae54fc4e401e818d2866e5","tags":[["challenge","fuzzchallenge"],["relay","wss://fuzz.example"]]}]
+["REQ","s1",{"kinds":[4]}]
+["CLOSE","s1"]
