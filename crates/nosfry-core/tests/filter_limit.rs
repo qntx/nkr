@@ -41,7 +41,7 @@ struct Case {
 #[test]
 fn filter_limit() {
     let cases = common::cases::<Case>("filter-limit.json");
-    assert_eq!(cases.len(), 18, "vector count drift");
+    assert_eq!(cases.len(), 22, "vector count drift");
     let mut divergent = 0usize;
     for (i, case) in cases.iter().enumerate() {
         let filter_json = serde_json::to_string(&case.filter).expect("filter json");

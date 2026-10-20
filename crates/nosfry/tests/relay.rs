@@ -804,6 +804,45 @@ async fn nip09_delete_by_address() {
 }
 
 #[tokio::test]
+async fn req_addressable_kinds_without_d_returns_all_addresses() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let k = key(33);
+    let pk = format!("{}", k.x_only_public_key().0);
+    let mut ids = Vec::new();
+    let mut b_id = String::new();
+    for d in ["a", "b", "c"] {
+        let ev = common::event(&k, 30_023, now(), &json!([["d", d]]), d);
+        send_text(&mut ws, &event_wire(&ev)).await;
+        assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+        if d == "b" {
+            b_id = ev.id().to_string();
+        }
+        ids.push(ev.id().to_string());
+    }
+    // `intrinsic_limit` must not bound an addressable author+kind
+    // query that has no `#d` condition.
+    let mut got = req_ids(
+        &mut ws,
+        "al",
+        &format!("{{\"kinds\":[30023],\"authors\":[\"{pk}\"]}}"),
+    )
+    .await;
+    got.sort();
+    ids.sort();
+    assert_eq!(got, ids);
+    // With `#d` only the listed addresses match.
+    let got = req_ids(
+        &mut ws,
+        "dx",
+        &format!("{{\"kinds\":[30023],\"authors\":[\"{pk}\"],\"#d\":[\"b\"]}}"),
+    )
+    .await;
+    assert_eq!(got, vec![b_id]);
+    relay.stop().await;
+}
+
+#[tokio::test]
 async fn nip40_expired_event_rejected_on_ingest() {
     let relay = Relay::start().await;
     let mut ws = relay.connect().await;
