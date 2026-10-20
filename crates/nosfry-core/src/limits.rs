@@ -18,6 +18,10 @@ pub struct ReqLimits {
     pub max_subs_per_connection: usize,
     /// Cap applied to a filter's `limit` when serving stored events.
     pub max_filter_limit: u64,
+    /// Cap on index entries a `COUNT` scan may examine; `0` disables
+    /// `COUNT` entirely. The count itself is never capped — hitting
+    /// the budget marks the answer `"approximate": true`.
+    pub max_filter_limit_count: u64,
     /// Maximum number of `#x` tag conditions allowed per filter.
     pub max_tags_per_filter: usize,
 }
@@ -28,6 +32,7 @@ impl Default for ReqLimits {
             max_req_filter_size: 200,
             max_subs_per_connection: 200,
             max_filter_limit: 500,
+            max_filter_limit_count: 1_000_000,
             max_tags_per_filter: 3,
         }
     }

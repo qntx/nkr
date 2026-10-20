@@ -63,7 +63,7 @@ fuzz_target!(|data: &[u8]| {
                         "frame verb mismatch: {text}"
                     );
                 }
-                Command::Subscribe { sub, .. } => {
+                Command::Subscribe { sub, .. } | Command::Count { sub, .. } => {
                     assert!(sub.generation > last_generation);
                     last_generation = sub.generation;
                     assert!(session.is_current(sub), "stale Subscribe {sub:?}");

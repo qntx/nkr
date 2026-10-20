@@ -5,9 +5,9 @@
 High-performance Nostr relay in Rust, for bare-metal servers and Cloudflare Workers.
 
 Status: 0.1. The native relay serves NIP-01, NIP-09 (event deletion),
-NIP-11, and NIP-40 (event expiration); the remaining strfry
-feature-parity layer (NIP-42, 45, 70, 77, plugins, metrics) is in
-progress. Linux and macOS are supported.
+NIP-11, NIP-40 (event expiration), and NIP-45 (`COUNT`); the
+remaining strfry feature-parity layer (NIP-42, 70, 77, plugins,
+metrics) is in progress. Linux and macOS are supported.
 
 - `nosfry-core` — sans-IO protocol core (`wasm32-unknown-unknown` clean)
 - `nosfry-lmdb` — synchronous LMDB event store (native only)
@@ -96,13 +96,30 @@ always blocked. AUTH events (kind 22242) are never stored or
 broadcast. The write-policy request gains `authed` — the hex pubkey
 the connection authenticated with — after a successful AUTH.
 
+`["COUNT", <sub>, <filters>…]` (NIP-45) counts the stored events the
+same filters would return and answers with one
+`["COUNT",<sub>,{"count":n}]` frame, then frees the sub id. COUNTs
+share the REQ rate buckets, subscription slots, and filter
+validation, take the same snapshot a REQ would (an event is counted
+as soon as its `OK` is sent), and run on the same time-sliced reader
+threads. A filter's `limit` is ignored — the count is always the full
+union size — and restricted kinds are only counted for readers
+allowed to see them. `relay.limits.max_filter_limit_count` (default
+1 000 000, `0` disables COUNT) caps the index entries one COUNT may
+examine; reaching it ends the scan early and the answer carries
+`"approximate": true` (where strfry would say `limited`). When the
+request is exactly one filter with exactly one tag condition of one
+value, the answer also carries `"hll"`, the 256-register HyperLogLog
+sketch of the counted authors' pubkeys (the NIP-45 offset rule), for
+client-side follower-count combining.
+
 SIGHUP reloads the configuration file without restarting: the relay
 re-reads it, logs an error and keeps the running configuration on a
 parse failure, and applies everything except the restart-only keys —
 `[db]`, `relay.bind`, `relay.port`, `relay.nofiles`, `relay.metrics`,
 `relay.threads`, `relay.query_timeslice_budget_microseconds`,
-`relay.limits.max_filter_limit`, and
-`relay.max_pending_outbound_bytes_total` — which are logged as
+`relay.limits.max_filter_limit`, `relay.limits.max_filter_limit_count`,
+and `relay.max_pending_outbound_bytes_total` — which are logged as
 ignored. Session
 limits and connection options (`events`, `relay.limits`,
 `relay.rate_limits`, payload size, ping interval, outbound budget,

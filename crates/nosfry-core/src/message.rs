@@ -171,11 +171,13 @@ pub enum RelayVerb {
     Auth,
     /// `["NEG-ERR", <sub>, <message>]`.
     NegErr,
+    /// `["COUNT", <sub>, {"count": n}]` (NIP-45).
+    Count,
 }
 
 impl RelayVerb {
     /// Every verb, for fixed-size per-verb tables.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Event,
         Self::Eose,
         Self::Ok,
@@ -183,6 +185,7 @@ impl RelayVerb {
         Self::Closed,
         Self::Auth,
         Self::NegErr,
+        Self::Count,
     ];
 
     /// The wire string.
@@ -196,6 +199,7 @@ impl RelayVerb {
             Self::Closed => "CLOSED",
             Self::Auth => "AUTH",
             Self::NegErr => "NEG-ERR",
+            Self::Count => "COUNT",
         }
     }
 }
@@ -565,6 +569,30 @@ pub fn ok_frame(id: &EventId, accepted: bool, message: &str) -> String {
 #[must_use]
 pub fn eose_frame(sub: &SubId) -> String {
     frame_with_sub("EOSE", sub, "]")
+}
+
+/// `["COUNT", "<sub>", {"count": n}]` — the NIP-45 answer.
+///
+/// `"approximate":true` is added only when the scan hit its entry
+/// budget; `"hll":"<512 hex>"` only when the query was eligible for a
+/// sketch and one was built.
+#[must_use]
+pub fn count_frame(sub: &SubId, count: u64, approximate: bool, hll: Option<&[u8; 256]>) -> String {
+    let mut out = String::with_capacity(24 + sub.json().len() + hll.map_or(0, |_| 524));
+    out.push_str("[\"COUNT\",");
+    out.push_str(sub.json());
+    out.push_str(",{\"count\":");
+    out.push_str(&count.to_string());
+    if approximate {
+        out.push_str(",\"approximate\":true");
+    }
+    if let Some(registers) = hll {
+        out.push_str(",\"hll\":\"");
+        out.push_str(&faster_hex::hex_string(registers));
+        out.push('"');
+    }
+    out.push_str("}]");
+    out
 }
 
 /// `["CLOSED", "<sub>", "<message>"]`.

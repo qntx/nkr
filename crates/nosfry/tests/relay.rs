@@ -18,7 +18,7 @@ mod common;
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use common::{Relay, close_wire, event_wire, key, recv_text, req_wire, send_text};
+use common::{Relay, close_wire, count_wire, event_wire, key, recv_text, req_wire, send_text};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -566,7 +566,7 @@ async fn nip11_document() {
     for key in ["description", "pubkey", "contact", "icon"] {
         assert!(doc.get(key).is_none(), "{key} must be omitted when empty");
     }
-    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 70]));
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 45, 70]));
     assert_eq!(doc["software"], "https://github.com/qntx/nosfry");
     assert_eq!(doc["limitation"]["max_subscriptions"], 200);
     assert_eq!(
@@ -1952,7 +1952,7 @@ async fn nip11_lists_42_only_with_auth_service_url() {
     let relay = Relay::start_with(auth_config()).await;
     let text = http_get(relay.addr, "/").await;
     let doc = nip11_body(&text);
-    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 42, 70]));
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 42, 45, 70]));
     relay.stop().await;
 }
 
@@ -2121,5 +2121,242 @@ async fn restricted_kinds_stored_but_never_served_by_default() {
     // A mixed REQ serves kind 1 but hides the kind 4.
     let got = req_ids(&mut ws, "m", "{\"kinds\":[1,4]}").await;
     assert_eq!(got, vec![note.id().to_string()], "{got:?}");
+    relay.stop().await;
+}
+
+/// Send a `COUNT` and read its one `["COUNT",<sub>,{..}]` answer body.
+async fn recv_count(ws: &mut yawc::TcpWebSocket, sub: &str) -> Value {
+    let frame = json(&recv_text(ws, T).await);
+    assert_eq!(frame[0], "COUNT", "{frame}");
+    assert_eq!(frame[1], sub, "{frame}");
+    frame[2].clone()
+}
+
+fn pk_hex(n: u8) -> String {
+    faster_hex::hex_string(&key(n).x_only_public_key().0.to_byte_array())
+}
+
+#[tokio::test]
+async fn count_reports_union_once() {
+    let relay = Relay::start().await;
+    let mut pub_ws = relay.connect().await;
+    // key 11: two kind-1s + one kind-3; key 12: one kind-1.
+    let events = [
+        common::event(&key(11), 1, now(), &json!([]), "a"),
+        common::event(&key(11), 1, now(), &json!([]), "b"),
+        common::event(&key(12), 1, now(), &json!([]), "c"),
+        common::event(&key(11), 3, now(), &json!([]), "d"),
+    ];
+    for ev in &events {
+        send_text(&mut pub_ws, &event_wire(ev)).await;
+        assert_eq!(recv_ok(&mut pub_ws, ev).await[2], true);
+    }
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &count_wire("c", "{\"kinds\":[1]}")).await;
+    let body = recv_count(&mut ws, "c").await;
+    assert_eq!(body["count"], 3, "{body}");
+    assert!(body.get("approximate").is_none(), "{body}");
+
+    // Overlapping filters count each event once: 3 kind-1s plus key
+    // 11's kind-3 — not 3 + 3.
+    let filters = format!("{{\"kinds\":[1]}},{{\"authors\":[\"{}\"]}}", pk_hex(11));
+    send_text(&mut ws, &count_wire("d", &filters)).await;
+    assert_eq!(recv_count(&mut ws, "d").await["count"], 4);
+
+    // A filter `limit` is ignored for COUNT.
+    send_text(&mut ws, &count_wire("e", "{\"kinds\":[1],\"limit\":1}")).await;
+    assert_eq!(recv_count(&mut ws, "e").await["count"], 3);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn count_after_ok_includes_the_event() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(&key(21), 1, now(), &json!([]), "fresh");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    // Read-your-writes: the COUNT's snapshot covers the acked write.
+    send_text(&mut ws, &count_wire("c", "{\"kinds\":[1]}")).await;
+    assert_eq!(recv_count(&mut ws, "c").await["count"], 1);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn count_excludes_deleted_and_expired() {
+    let relay = Relay::start().await;
+    let mut pub_ws = relay.connect().await;
+    let k = key(31);
+    let gone = common::event(&k, 1, now(), &json!([]), "gone");
+    let keep = common::event(&k, 1, now(), &json!([]), "keep");
+    let expiring = common::event(
+        &k,
+        1,
+        now(),
+        &json!([["expiration", (now() + 2).to_string()]]),
+        "exp",
+    );
+    for ev in [&gone, &keep, &expiring] {
+        send_text(&mut pub_ws, &event_wire(ev)).await;
+        assert_eq!(recv_ok(&mut pub_ws, ev).await[2], true);
+    }
+    let deletion = common::event(&k, 5, now(), &json!([["e", gone.id().to_string()]]), "");
+    send_text(&mut pub_ws, &event_wire(&deletion)).await;
+    assert_eq!(recv_ok(&mut pub_ws, &deletion).await[2], true);
+
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &count_wire("c", "{\"kinds\":[1]}")).await;
+    assert_eq!(recv_count(&mut ws, "c").await["count"], 2);
+
+    // Past the expiration the event is hidden even before the sweep.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    send_text(&mut ws, &count_wire("d", "{\"kinds\":[1]}")).await;
+    assert_eq!(recv_count(&mut ws, "d").await["count"], 1);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn count_budget_marks_approximate() {
+    let mut config = common::config();
+    config.relay.limits.max_filter_limit_count = 10;
+    let relay = Relay::start_with(config).await;
+    let mut pub_ws = relay.connect().await;
+    for i in 0..20u64 {
+        let ev = common::event(&key(33), 1, now() + i, &json!([]), &format!("e{i}"));
+        send_text(&mut pub_ws, &event_wire(&ev)).await;
+        assert_eq!(recv_ok(&mut pub_ws, &ev).await[2], true);
+    }
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &count_wire("c", "{\"kinds\":[1]}")).await;
+    let body = recv_count(&mut ws, "c").await;
+    assert_eq!(body["approximate"], true, "{body}");
+    let partial = body["count"].as_u64().unwrap();
+    assert!(partial <= 20, "{body}");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn count_disabled_closes_unsupported() {
+    let mut config = common::config();
+    config.relay.limits.max_filter_limit_count = 0;
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &count_wire("c", "{\"kinds\":[1]}")).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(frame, json!(["CLOSED", "c", "unsupported: COUNT"]));
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn count_respects_the_read_gate() {
+    let relay = Relay::start_with(auth_config()).await;
+    let url = "wss://relay.example.com";
+    // Two stored DMs plus two public notes.
+    let dm12 = common::event(&key(1), 4, now(), &json!([["p", pk_hex(2)]]), "for 2");
+    let dm34 = common::event(&key(3), 4, now(), &json!([["p", pk_hex(4)]]), "for 4");
+    let note = common::event(&key(5), 1, now(), &json!([]), "n1");
+    let note2 = common::event(&key(6), 1, now(), &json!([]), "n2");
+    let mut pub_ws = relay.connect().await;
+    for ev in [&dm12, &dm34, &note, &note2] {
+        send_text(&mut pub_ws, &event_wire(ev)).await;
+        assert_eq!(recv_ok(&mut pub_ws, ev).await[2], true);
+    }
+
+    // Unauthenticated all-restricted COUNT: challenge + CLOSED.
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &count_wire("c", "{\"kinds\":[4]}")).await;
+    let auth = json(&recv_text(&mut ws, T).await);
+    assert_eq!(auth[0], "AUTH", "{auth}");
+    let challenge = auth[1].as_str().unwrap().to_owned();
+    let closed = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        closed,
+        json!([
+            "CLOSED",
+            "c",
+            "auth-required: requested filter requires authentication"
+        ])
+    );
+
+    // A mixed count sees only what the requester may read.
+    send_text(&mut ws, &count_wire("m", "{}")).await;
+    assert_eq!(recv_count(&mut ws, "m").await["count"], 2);
+
+    // Authenticated as key 2, only the involved DM is counted.
+    send_text(&mut ws, &auth_wire(&key(2), &challenge, url)).await;
+    assert_eq!(json(&recv_text(&mut ws, T).await)[2], true);
+    send_text(&mut ws, &count_wire("d", "{\"kinds\":[4]}")).await;
+    assert_eq!(recv_count(&mut ws, "d").await["count"], 1);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn count_hll_matches_local_sketch() {
+    let relay = Relay::start().await;
+    let target = pk_hex(2);
+    let mut pub_ws = relay.connect().await;
+    // Three followers tag key 2 in kind-3 contact lists; a kind-1 with
+    // the same tag does not match the filter.
+    let mut followers = Vec::new();
+    for n in [1u8, 3, 5] {
+        let ev = common::event(&key(n), 3, now(), &json!([["p", target]]), "");
+        send_text(&mut pub_ws, &event_wire(&ev)).await;
+        assert_eq!(recv_ok(&mut pub_ws, &ev).await[2], true);
+        followers.push(n);
+    }
+    let stray = common::event(&key(7), 1, now(), &json!([["p", target]]), "");
+    send_text(&mut pub_ws, &event_wire(&stray)).await;
+    assert_eq!(recv_ok(&mut pub_ws, &stray).await[2], true);
+
+    let mut ws = relay.connect().await;
+    let filters = format!("{{\"#p\":[\"{target}\"],\"kinds\":[3]}}");
+    send_text(&mut ws, &count_wire("c", &filters)).await;
+    let body = recv_count(&mut ws, "c").await;
+    assert_eq!(body["count"], 3, "{body}");
+
+    // The relay's hll equals the sketch built locally over the same
+    // pubkeys with nosfry-core's Hll.
+    let filter = nosfry_core::filter::Filter::parse(&filters).unwrap();
+    let mut hll = nosfry_core::hll::Hll::for_filters(&[filter]).unwrap();
+    for n in followers {
+        hll.add(&nosfry_core::event::PublicKey(
+            key(n).x_only_public_key().0.to_byte_array(),
+        ));
+    }
+    assert_eq!(
+        body["hll"].as_str().unwrap(),
+        faster_hex::hex_string(hll.registers()),
+        "{body}"
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn count_never_answers_for_a_replaced_id() {
+    let relay = Relay::start().await;
+    let mut pub_ws = relay.connect().await;
+    let ev = common::event(&key(41), 1, now(), &json!([]), "x");
+    send_text(&mut pub_ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut pub_ws, &ev).await[2], true);
+
+    let mut ws = relay.connect().await;
+    // The REQ re-uses the id: the COUNT's generation goes stale and
+    // its answer, whenever the scan finishes, must be dropped.
+    send_text(&mut ws, &count_wire("c", "{}")).await;
+    send_text(&mut ws, &req_wire("c", "{\"kinds\":[1]}")).await;
+    let mut events = 0usize;
+    loop {
+        let frame = json(&recv_text(&mut ws, T).await);
+        match frame[0].as_str().unwrap() {
+            "EVENT" => {
+                assert_eq!(frame[1], "c", "{frame}");
+                events += 1;
+            }
+            "EOSE" => break,
+            "COUNT" => panic!("stale generation answered: {frame}"),
+            other => panic!("unexpected frame {other}"),
+        }
+    }
+    assert_eq!(events, 1);
     relay.stop().await;
 }

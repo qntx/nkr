@@ -4,13 +4,14 @@ use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nosfry_core::message::{RelayVerb, eose_frame, event_frame};
+use nosfry_core::hll::Hll;
+use nosfry_core::message::{RelayVerb, count_frame, eose_frame, event_frame};
 use nosfry_core::session::SubKey;
-use nosfry_lmdb::{Progress, Scan, Store};
+use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreError};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::watch;
 
-use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg, route};
+use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ScanKind, ShardMsg, route};
 use crate::metrics::{Metrics, StoreOp};
 
 /// How long an idle reader waits for new work.
@@ -29,12 +30,21 @@ thread_local! {
     static LOOP_TICKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The stored-event work one subscription asked for.
+#[derive(Debug)]
+enum Job {
+    /// A REQ's snapshot-bounded scan.
+    Scan(Scan),
+    /// A NIP-45 `COUNT`.
+    Count(Box<CountScan>),
+}
+
 /// One running scan.
 #[derive(Debug)]
 struct ScanEntry {
     conn: ConnId,
     sub: SubKey,
-    scan: Scan,
+    job: Job,
     out: Outbound,
     /// The scan's first emitted frame already went out as its own
     /// chunk so the first event never waits for a full chunk.
@@ -56,6 +66,9 @@ pub(crate) struct Tuning {
     pub(crate) total_budget: usize,
     /// Per-filter cap on stored scan results.
     pub(crate) max_filter_limit: u64,
+    /// Index entries a `COUNT` scan may examine before answering
+    /// `"approximate": true`.
+    pub(crate) max_filter_limit_count: u64,
 }
 
 /// Reader thread main loop. `tuning.high_water` pauses scans for
@@ -72,7 +85,6 @@ pub(crate) fn run(
     metrics: &Metrics,
     shutdown: &watch::Receiver<bool>,
 ) {
-    let max_filter_limit = tuning.max_filter_limit;
     let mut new_scans: VecDeque<ScanEntry> = VecDeque::new();
     let mut resumed: VecDeque<ScanEntry> = VecDeque::new();
     let mut skipped = 0usize;
@@ -85,7 +97,7 @@ pub(crate) fn run(
         LOOP_TICKS.with(|t| t.set(t.get() + 1));
         match rx.try_recv() {
             Ok(msg) => {
-                apply(msg, &mut new_scans, &mut resumed, max_filter_limit);
+                apply(msg, &mut new_scans, &mut resumed, tuning);
                 skipped = 0;
                 continue;
             }
@@ -99,7 +111,7 @@ pub(crate) fn run(
         };
         prefer_new = !prefer_new;
         let Some(entry) = entry else {
-            if !idle(rx, &mut new_scans, &mut resumed, max_filter_limit, shutdown) {
+            if !idle(rx, &mut new_scans, &mut resumed, tuning, shutdown) {
                 return;
             }
             continue;
@@ -123,7 +135,7 @@ pub(crate) fn run(
         }
         // A full pass with nothing runnable: block for new work
         // instead of spinning.
-        if !idle(rx, &mut new_scans, &mut resumed, max_filter_limit, shutdown) {
+        if !idle(rx, &mut new_scans, &mut resumed, tuning, shutdown) {
             return;
         }
         skipped = 0;
@@ -136,12 +148,12 @@ fn idle(
     rx: &Receiver<ReaderMsg>,
     new_scans: &mut VecDeque<ScanEntry>,
     resumed: &mut VecDeque<ScanEntry>,
-    max_filter_limit: u64,
+    tuning: &Tuning,
     shutdown: &watch::Receiver<bool>,
 ) -> bool {
     match rx.recv_timeout(IDLE_WAIT) {
         Ok(msg) => {
-            apply(msg, new_scans, resumed, max_filter_limit);
+            apply(msg, new_scans, resumed, tuning);
             true
         }
         Err(RecvTimeoutError::Disconnected) => false,
@@ -150,7 +162,8 @@ fn idle(
 }
 
 /// Run one time-slice of `entry` — chunked `Frames` pushes, EOSE plus
-/// `Activate` on completion, `Closed` on error — and requeue it into
+/// `Activate` on completion of a REQ, a single `COUNT` frame on
+/// completion of a count, `Closed` on error — and requeue it into
 /// `resumed` when it stays pending.
 fn step(
     mut entry: ScanEntry,
@@ -160,12 +173,34 @@ fn step(
     metrics: &Metrics,
     resumed: &mut VecDeque<ScanEntry>,
 ) {
+    if let Job::Count(ref mut scan) = entry.job {
+        match scan.step(store, budget) {
+            Ok(Progress::Pending) => resumed.push_back(entry),
+            Ok(Progress::Done) => {
+                let result = scan.result();
+                entry.out.push(Out::Count {
+                    sub: entry.sub.clone(),
+                    text: count_frame(
+                        &entry.sub.id,
+                        result.count,
+                        result.approximate,
+                        result.hll.as_ref(),
+                    ),
+                });
+            }
+            Err(err) => scan_failed(&entry, &err, metrics),
+        }
+        return;
+    }
+    let Job::Scan(ref mut scan) = entry.job else {
+        unreachable!("count handled above")
+    };
     let out = entry.out.clone();
     let sub = entry.sub.clone();
     let mut first = !entry.first_pushed;
     let mut texts = Vec::new();
     let mut bytes = 0usize;
-    let result = entry.scan.step(store, budget, &mut |_seq, json| {
+    let result = scan.step(store, budget, &mut |_seq, json| {
         let text = event_frame(&sub.id, json);
         if first {
             first = false;
@@ -205,15 +240,18 @@ fn step(
                 sub: entry.sub,
             }));
         }
-        Err(err) => {
-            metrics.store_error(StoreOp::Scan);
-            tracing::error!(%err, conn = entry.conn, "scan failed");
-            entry.out.push(Out::Closed {
-                sub: entry.sub.clone(),
-                reason: "error: internal error".to_owned(),
-            });
-        }
+        Err(err) => scan_failed(&entry, &err, metrics),
     }
+}
+
+/// A store error on any scan kind: count it, log it, close the sub.
+fn scan_failed(entry: &ScanEntry, err: &StoreError, metrics: &Metrics) {
+    metrics.store_error(StoreOp::Scan);
+    tracing::error!(%err, conn = entry.conn, "scan failed");
+    entry.out.push(Out::Closed {
+        sub: entry.sub.clone(),
+        reason: "error: internal error".to_owned(),
+    });
 }
 
 /// Apply an inbox message.
@@ -221,24 +259,41 @@ fn apply(
     msg: ReaderMsg,
     new_scans: &mut VecDeque<ScanEntry>,
     resumed: &mut VecDeque<ScanEntry>,
-    max_filter_limit: u64,
+    tuning: &Tuning,
 ) {
     match msg {
-        ReaderMsg::Start(start) => new_scans.push_back(ScanEntry {
-            conn: start.conn,
-            sub: start.sub,
-            scan: Scan::new(
-                start.filters,
-                start.gate,
-                start.snapshot,
-                max_filter_limit,
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs()),
-            ),
-            out: start.out,
-            first_pushed: false,
-        }),
+        ReaderMsg::Start(start) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let job = match start.kind {
+                ScanKind::Req => Job::Scan(Scan::new(
+                    start.filters,
+                    start.gate,
+                    start.snapshot,
+                    tuning.max_filter_limit,
+                    now,
+                )),
+                ScanKind::Count => {
+                    let hll = Hll::for_filters(&start.filters);
+                    Job::Count(Box::new(CountScan::new(
+                        start.filters,
+                        start.gate,
+                        start.snapshot,
+                        tuning.max_filter_limit_count,
+                        now,
+                        hll,
+                    )))
+                }
+            };
+            new_scans.push_back(ScanEntry {
+                conn: start.conn,
+                sub: start.sub,
+                job,
+                out: start.out,
+                first_pushed: false,
+            });
+        }
         ReaderMsg::Cancel { conn, sub_id } => {
             new_scans.retain(|e| e.conn != conn || e.sub.id != sub_id);
             resumed.retain(|e| e.conn != conn || e.sub.id != sub_id);
@@ -270,7 +325,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::channels::ScanStart;
+    use crate::channels::{ScanKind, ScanStart};
 
     /// A signed kind-1 event at a distinct `created_at`.
     fn event(i: u64) -> Arc<nosfry_core::event::Event> {
@@ -321,6 +376,7 @@ mod tests {
                 id: SubId::parse("s").unwrap(),
                 generation: 1,
             },
+            kind: ScanKind::Req,
             filters,
             gate: ReadGate::default(),
             snapshot: u64::MAX,
@@ -337,6 +393,7 @@ mod tests {
                     high_water: usize::MAX,
                     total_budget: 0,
                     max_filter_limit: 500,
+                    max_filter_limit_count: 1_000_000,
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,
@@ -384,6 +441,7 @@ mod tests {
                 id: SubId::parse("s").unwrap(),
                 generation: 1,
             },
+            kind: ScanKind::Req,
             filters,
             gate: ReadGate::default(),
             snapshot: 0,
@@ -403,6 +461,7 @@ mod tests {
                     high_water: 0,
                     total_budget: 0,
                     max_filter_limit: 500,
+                    max_filter_limit_count: 1_000_000,
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,
@@ -447,6 +506,7 @@ mod tests {
                     id: SubId::parse(&format!("s{conn}")).unwrap(),
                     generation: 1,
                 },
+                kind: ScanKind::Req,
                 filters: Arc::clone(&filters),
                 gate: ReadGate::default(),
                 snapshot: u64::MAX,
@@ -464,6 +524,7 @@ mod tests {
                     high_water: usize::MAX,
                     total_budget: 1,
                     max_filter_limit: 500,
+                    max_filter_limit_count: 1_000_000,
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,
@@ -526,6 +587,7 @@ mod tests {
                 id: SubId::parse("long").unwrap(),
                 generation: 1,
             },
+            kind: ScanKind::Req,
             filters: Arc::clone(&all),
             gate: ReadGate::default(),
             snapshot: u64::MAX,
@@ -544,6 +606,7 @@ mod tests {
                     id: SubId::parse(&format!("n{i}")).unwrap(),
                     generation: 1,
                 },
+                kind: ScanKind::Req,
                 filters: Arc::clone(&one),
                 gate: ReadGate::default(),
                 snapshot: u64::MAX,
@@ -561,6 +624,7 @@ mod tests {
                     high_water: usize::MAX,
                     total_budget: 0,
                     max_filter_limit: 5_000,
+                    max_filter_limit_count: 1_000_000,
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,

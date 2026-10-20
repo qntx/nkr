@@ -299,8 +299,9 @@ impl Config {
     /// Restart-only: `[db]`, `relay.bind`, `relay.port`,
     /// `relay.nofiles`, `relay.metrics` (route registration),
     /// `relay.query_timeslice_budget_microseconds`, `relay.threads`,
-    /// `relay.limits.max_filter_limit` (reader threads hold it),
-    /// `relay.max_pending_outbound_bytes_total` (ditto).
+    /// `relay.limits.max_filter_limit`,
+    /// `relay.limits.max_filter_limit_count` (reader threads hold
+    /// them), `relay.max_pending_outbound_bytes_total` (ditto).
     #[must_use]
     pub fn reloadable_from(&self, mut new: Self) -> (Self, Vec<&'static str>) {
         let mut ignored = Vec::new();
@@ -338,6 +339,10 @@ impl Config {
         if relay.limits.max_filter_limit != running.limits.max_filter_limit {
             ignored.push("relay.limits.max_filter_limit");
             relay.limits.max_filter_limit = running.limits.max_filter_limit;
+        }
+        if relay.limits.max_filter_limit_count != running.limits.max_filter_limit_count {
+            ignored.push("relay.limits.max_filter_limit_count");
+            relay.limits.max_filter_limit_count = running.limits.max_filter_limit_count;
         }
         if relay.max_pending_outbound_bytes_total != running.max_pending_outbound_bytes_total {
             ignored.push("relay.max_pending_outbound_bytes_total");
@@ -398,6 +403,7 @@ mod tests {
         new.relay.query_timeslice_budget_microseconds = 1;
         new.relay.threads.readers = 9;
         new.relay.limits.max_filter_limit = 1;
+        new.relay.limits.max_filter_limit_count = 1;
         new.relay.max_pending_outbound_bytes_total = 1;
         new.relay.info.name = "reloaded".into();
         new.relay.rate_limits.events_per_second = 5;
@@ -414,6 +420,7 @@ mod tests {
                 "relay.query_timeslice_budget_microseconds",
                 "relay.threads",
                 "relay.limits.max_filter_limit",
+                "relay.limits.max_filter_limit_count",
                 "relay.max_pending_outbound_bytes_total",
             ]
         );

@@ -68,9 +68,11 @@ max_subs_per_connection = 200
 # Per-filter limit cap for stored scans (restart-only — readers hold
 # it for the process lifetime).
 max_filter_limit = 500
+# Index entries a COUNT scan may examine before answering
+# `"approximate": true`; 0 disables COUNT (restart-only).
+max_filter_limit_count = 1000000
 # Maximum `#x` conditions per filter.
 max_tags_per_filter = 3
-# Limit cap for COUNT responses.
 
 [relay.rate_limits]
 # Per-connection token buckets; over-limit EVENTs get `OK false

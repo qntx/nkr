@@ -28,7 +28,9 @@
 
 mod common;
 
-use nosfry_core::message::{ClientMessage, SubId, closed_frame, eose_frame, event_frame};
+use nosfry_core::message::{
+    ClientMessage, SubId, closed_frame, count_frame, eose_frame, event_frame,
+};
 use serde::Deserialize;
 
 /// `(raw substring, why)` — each pattern identifies exactly one case.
@@ -167,4 +169,34 @@ fn escaped_subscription_ids() {
         );
     }
     assert_eq!(eose_frame(&sub_id), "[\"EOSE\",\"é\"]");
+}
+
+/// `count_frame` wire shapes: bare count, approximate flag, and the
+/// 512-char hll field, each only when asked.
+#[test]
+fn count_frame_shapes() {
+    let sub = SubId::parse("c").expect("sub id");
+    assert_eq!(
+        count_frame(&sub, 42, false, None),
+        r#"["COUNT","c",{"count":42}]"#
+    );
+    assert_eq!(
+        count_frame(&sub, 7, true, None),
+        r#"["COUNT","c",{"count":7,"approximate":true}]"#
+    );
+    let registers = [0xabu8; 256];
+    let frame = count_frame(&sub, 0, false, Some(&registers));
+    let body: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
+    assert_eq!(body[0], "COUNT");
+    assert_eq!(body[1], "c");
+    assert_eq!(body[2]["count"], 0);
+    assert!(body[2].get("approximate").is_none());
+    let hll = body[2]["hll"].as_str().expect("hll hex");
+    assert_eq!(hll.len(), 512);
+    assert!(hll.bytes().all(|b| b == b'a' || b == b'b'));
+    // All flags at once.
+    let body: serde_json::Value =
+        serde_json::from_str(&count_frame(&sub, 1, true, Some(&registers))).expect("valid JSON");
+    assert_eq!(body[2]["approximate"], true);
+    assert_eq!(body[2]["hll"].as_str().expect("hll").len(), 512);
 }

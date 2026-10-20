@@ -20,7 +20,9 @@ use tokio::sync::{mpsc, watch};
 use yawc::close::CloseCode;
 use yawc::{Frame, HttpWebSocket, OpCode};
 
-use crate::channels::{ConnId, Out, Outbound, ShardMsg, WriteRequest, WriterMsg, route};
+use crate::channels::{
+    ConnId, Out, Outbound, ScanKind, ScanStart, ShardMsg, WriteRequest, WriterMsg, route,
+};
 use crate::metrics::Metrics;
 use crate::policy::Decision;
 
@@ -210,7 +212,12 @@ impl<'a> Connection<'a> {
     async fn command(&self, cmd: Command) {
         match cmd {
             Command::Publish { event, authed } => self.publish(event, authed).await,
-            Command::Subscribe { sub, filters, gate } => self.subscribe(sub, filters, gate).await,
+            Command::Subscribe { sub, filters, gate } => {
+                self.subscribe(sub, filters, gate, ScanKind::Req).await;
+            }
+            Command::Count { sub, filters, gate } => {
+                self.subscribe(sub, filters, gate, ScanKind::Count).await;
+            }
             Command::Unsubscribe { sub_id } => self.unsubscribe(sub_id).await,
             Command::Send { verb, text } => {
                 self.out.push(Out::Frame {
@@ -306,12 +313,13 @@ impl<'a> Connection<'a> {
 
     /// Register a subscription with this connection's shard; the shard
     /// assigns the scan snapshot and starts it on the reader itself.
-    async fn subscribe(&self, sub: SubKey, filters: Arc<[Filter]>, gate: ReadGate) {
+    async fn subscribe(&self, sub: SubKey, filters: Arc<[Filter]>, gate: ReadGate, kind: ScanKind) {
         drop(
             self.shard
-                .send(ShardMsg::Register(Box::new(crate::channels::ScanStart {
+                .send(ShardMsg::Register(Box::new(ScanStart {
                     conn: self.conn,
                     sub,
+                    kind,
                     filters,
                     gate,
                     snapshot: 0,
@@ -453,6 +461,16 @@ impl<'a> Connection<'a> {
                 let text = closed_frame(&sub.id, &reason);
                 ws.feed(Frame::text(text.into_bytes())).await?;
                 self.handle.metrics.relay_message(RelayVerb::Closed);
+            }
+            Out::Count { sub, text } => {
+                if !self.session.is_current(&sub) {
+                    return Ok(());
+                }
+                ws.feed(Frame::text(text.into_bytes())).await?;
+                self.handle.metrics.relay_message(RelayVerb::Count);
+                // The count is answered: free the sub slot. The scan
+                // already finished, so there is nothing to cancel.
+                self.session.close_by_relay(&sub);
             }
         }
         Ok(())
