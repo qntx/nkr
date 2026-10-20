@@ -2379,8 +2379,10 @@ async fn count_never_answers_for_a_replaced_id() {
     assert_eq!(recv_ok(&mut pub_ws, &ev).await[2], true);
 
     let mut ws = relay.connect().await;
-    // The REQ re-uses the id: the COUNT's generation goes stale and
-    // its answer, whenever the scan finishes, must be dropped.
+    // The REQ re-uses the id: once it is processed the COUNT's
+    // generation is stale and its answer must be dropped. The COUNT
+    // may legitimately finish and answer before the REQ arrives, so
+    // the invariant is ordering: no COUNT frame after any REQ frame.
     send_text(&mut ws, &count_wire("c", "{}")).await;
     send_text(&mut ws, &req_wire("c", "{\"kinds\":[1]}")).await;
     let mut events = 0usize;
@@ -2392,7 +2394,7 @@ async fn count_never_answers_for_a_replaced_id() {
                 events += 1;
             }
             "EOSE" => break,
-            "COUNT" => panic!("stale generation answered: {frame}"),
+            "COUNT" => assert_eq!(events, 0, "stale generation answered: {frame}"),
             other => panic!("unexpected frame {other}"),
         }
     }
