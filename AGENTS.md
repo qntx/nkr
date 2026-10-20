@@ -29,6 +29,13 @@ Run the relay locally:
 cargo run --release -p nosfry -- relay --config nosfry.example.toml
 ```
 
+Crash-recovery testing (kill -9 cycles): the `crash` test defaults to
+6 cycles; raise `NOSFRY_CRASH_CYCLES` for long runs before a release:
+
+```bash
+NOSFRY_CRASH_CYCLES=60 cargo test -p nosfry --test crash
+```
+
 TOML is formatted by taplo (`.taplo.toml`, aligned `=`); keep `taplo fmt --check` green.
 
 Fuzz one target locally (needs a nightly toolchain and `cargo-fuzz`):
