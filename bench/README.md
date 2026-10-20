@@ -22,8 +22,22 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
     event pair, with exact delivery accounting and relay CPU.
   - `conns` measures anonymous resident memory per idle subscribed
     connection.
+  - `soak` runs a mixed long-running workload against one relay
+    (driven by `linux/run-soak.sh`): paced publishers writing a
+    deterministic kind mix and awaiting every `OK`, long-lived
+    subscribers counting deliveries, short-lived connections churning
+    historical REQs, and periodically spawned `REQ {}` consumers that
+    never read. Every `--sample-secs` it prints one cumulative JSON
+    line with relay RSS, `data.mdb` size, connection and rate-limit
+    metrics, and the workload counters; a final `end` line and a
+    `relay_exit` line close the JSONL.
 - **aggregate.py**: `python3 bench/aggregate.py <results-dir>` prints the
   median and [min, max] of every metric across repeated runs.
+- **soak_analyze.py**: `python3 bench/soak_analyze.py <run.jsonl>
+  --warmup-secs N` applies the soak criteria (anonymous-memory slope,
+  `data.mdb` plateau, connection gauge, zero errors) and exits non-zero
+  on a failure. Use a warm-up of at least the 600 s event expiration;
+  the 72 h gate run uses 6 h.
 
 ## Environment
 
@@ -87,7 +101,16 @@ cp /src/nosfry/bench/linux/*.sh /bench/
 ```bash
 /bench/run-relaybench.sh <name>...
 /bench/run-nosfry-bench.sh /bench/results/nosfry-bench <reps> <name>...
+DURATION=1800 SAMPLE=30 /bench/run-soak.sh <name> [label]
 ```
+
+`run-soak.sh` writes `/bench/results/soak-<label>.jsonl` and the
+relay's log lives at `/bench/work/soak-<label>/relay.log`. Defaults:
+8 publishers at 200 events/s total, 200 subscribers, 10 churn
+connections/s, one slow consumer per minute; `DURATION` and `SAMPLE`
+(seconds between samples) plus every workload knob
+(`PUBLISHERS`, `RATE`, `SUBSCRIBERS`, `CHURN_RATE`, `SLOW_EVERY`)
+are environment-overridable.
 
 Each `<name>` is a binary in `/bench/bin`; strfry always runs alongside.
 
