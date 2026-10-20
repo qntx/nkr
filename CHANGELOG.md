@@ -56,6 +56,21 @@ The format is based on [Keep a Changelog]; this project follows
   of 0 disables that bucket). Over-limit EVENTs are answered `OK false
 rate-limited: slow down`, over-limit REQs `CLOSED rate-limited: slow
 down`; CLOSE is never charged.
+- Shared per-client-address rate limits (`ip_events_per_second`,
+  `ip_events_burst`, `ip_reqs_per_second`, `ip_reqs_burst`; defaults
+  100/s burst 500, a `*_per_second` of 0 disables the bucket). Every
+  connection of one client address — IPv4 per address, IPv6 per /64 —
+  draws from the same buckets, and a message is refused when either
+  the connection bucket or the shared address bucket is empty, closing
+  the `max_connections_per_ip × per-connection-rate` bypass.
+- `[relay] max_pending_outbound_bytes_total` (default 1 GiB, `0`
+  disables, restart-only): a process-wide budget on the sum of every
+  connection's pending outbound bytes. Over budget, stored scans pause
+  only on connections already more than one chunk behind; caught-up
+  readers keep scanning and live deliveries are unaffected. New gauge
+  `nosfry_outbound_pending_bytes` reports the shared total.
+- `nosfry_store_errors_total{op}` counter (`write`, `expire`, `scan`)
+  for failed store operations.
 - Connection caps: `[relay] max_connections` (default 0 = unlimited)
   and `max_connections_per_ip` (default 128) refuse over-cap upgrades
   with `429 Too Many Requests`. IPv4 counts per address, IPv4-mapped
@@ -142,6 +157,10 @@ down`; CLOSE is never charged.
 - **BREAKING:** kinds 4 and 1059 are no longer served to
   unauthenticated clients by default (`restricted_read_kinds`); set
   `restricted_read_kinds = []` to keep serving them openly.
+- **BREAKING (API):** `Session::new` takes the client address's
+  shared `Arc<AddressBuckets>` as a third argument. `Outbound`
+  (crate-internal) now carries a shared process-wide pending-byte
+  counter.
 - **BREAKING (API):** `Session::new` takes the per-connection
   challenge; `Command::Publish` is `{ event, authed }` and
   `Command::Subscribe` carries a `ReadGate`; `Scan::new` and

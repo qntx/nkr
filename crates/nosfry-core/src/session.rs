@@ -7,7 +7,7 @@ use crate::auth::{AUTH_KIND, MAX_AUTHED_PUBKEYS, ReadGate};
 use crate::event::{Event, EventId, PublicKey, UnverifiedEvent};
 use crate::filter::Filter;
 use crate::kind::Kind;
-use crate::limits::{Limits, TokenBucket};
+use crate::limits::{AddressBuckets, Limits, TokenBucket};
 use crate::message::{
     ClientMessage, ClientVerb, MessageError, Reason, RelayVerb, SubId, auth_frame, closed_frame,
     neg_err_frame, notice_frame, ok_frame,
@@ -89,13 +89,18 @@ pub struct Session {
     event_bucket: Option<TokenBucket>,
     /// REQ token bucket (`None` when the rate limit is disabled).
     req_bucket: Option<TokenBucket>,
+    /// Buckets shared with every other connection of this client
+    /// address (a session created without an address gets a fully
+    /// disabled pair via [`AddressBuckets::default`]).
+    address: Arc<AddressBuckets>,
 }
 
 impl Session {
     /// New session under the given limits with the adapter-supplied
-    /// NIP-42 challenge (sent lazily, only when the connection needs it).
+    /// NIP-42 challenge (sent lazily, only when the connection needs
+    /// it) and the client address's shared token buckets.
     #[must_use]
-    pub fn new(limits: Arc<Limits>, challenge: String) -> Self {
+    pub fn new(limits: Arc<Limits>, challenge: String, address: Arc<AddressBuckets>) -> Self {
         let event_bucket = (limits.rate.events_per_second > 0)
             .then(|| TokenBucket::new(limits.rate.events_per_second, limits.rate.events_burst));
         let req_bucket = (limits.rate.reqs_per_second > 0)
@@ -109,6 +114,7 @@ impl Session {
             next_generation: 1,
             event_bucket,
             req_bucket,
+            address,
         }
     }
 
@@ -170,8 +176,13 @@ impl Session {
         // matter what its message would have done.
         match message {
             ClientMessage::Event(unverified) | ClientMessage::Auth(unverified) => {
-                if let Some(bucket) = &mut self.event_bucket
-                    && !bucket.take(now_ms)
+                // Charge the connection bucket first; only a pass
+                // spends from the address-wide bucket.
+                if !self
+                    .event_bucket
+                    .as_mut()
+                    .is_none_or(|bucket| bucket.take(now_ms))
+                    || !self.address.take_event(now_ms)
                 {
                     out.push(Command::Send {
                         verb: RelayVerb::Ok,
@@ -193,8 +204,11 @@ impl Session {
                 }
             }
             ClientMessage::Req { sub_id, filters } => {
-                if let Some(bucket) = &mut self.req_bucket
-                    && !bucket.take(now_ms)
+                if !self
+                    .req_bucket
+                    .as_mut()
+                    .is_none_or(|bucket| bucket.take(now_ms))
+                    || !self.address.take_req(now_ms)
                 {
                     self.drop_sub(&sub_id, out);
                     out.push(Command::Send {

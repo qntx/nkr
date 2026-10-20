@@ -785,6 +785,9 @@ async fn nip09_delete_by_address() {
 
     let got = req_ids(&mut ws, "a1", "{\"kinds\":[30023]}").await;
     assert!(got.is_empty(), "addressable event still visible: {got:?}");
+    // Close a1: a stored republish would otherwise be delivered live
+    // on this socket, racing the OK frame the reads below expect.
+    send_text(&mut ws, &close_wire("a1")).await;
 
     // Same-address republish at an older timestamp is blocked; a newer
     // version is accepted.
@@ -794,7 +797,7 @@ async fn nip09_delete_by_address() {
     assert!(ok[3].as_str().unwrap().starts_with("blocked:"));
     let v2 = common::event(&k, 30_023, now() + 1, &json!([["d", "art"]]), "v2");
     send_text(&mut ws, &event_wire(&v2)).await;
-    let ok = json(&recv_text(&mut ws, T).await);
+    let ok = recv_ok(&mut ws, &v2).await;
     assert_eq!(ok[2], true, "newer version rejected: {ok}");
     let _ = v1_id;
     relay.stop().await;
@@ -1105,6 +1108,68 @@ async fn event_rate_limit_is_per_connection() {
     })
     .await
     .expect("client B was not served within 1s");
+    relay.stop().await;
+}
+
+/// Shared per-address EVENT buckets: two connections of one address
+/// drain one bucket between them.
+#[tokio::test]
+async fn ip_rate_limit_shared_across_connections() {
+    let mut config = common::config();
+    config.relay.rate_limits.ip_events_per_second = 1;
+    config.relay.rate_limits.ip_events_burst = 3;
+    let relay = Relay::start_with(config).await;
+    let mut a = relay.connect().await;
+    let mut b = relay.connect().await;
+    // The shared burst admits exactly 3 events across both sockets
+    // (per-connection buckets are disabled by `common::config`).
+    for i in 0..3u64 {
+        let ws = if i == 1 { &mut b } else { &mut a };
+        let ev = common::event(&key(50), 1, now(), &json!([]), &format!("burst{i}"));
+        send_text(ws, &event_wire(&ev)).await;
+        assert_eq!(recv_ok(ws, &ev).await[2], true, "burst {i}");
+    }
+    let ev = common::event(&key(50), 1, now(), &json!([]), "over");
+    send_text(&mut b, &event_wire(&ev)).await;
+    let ok = recv_ok(&mut b, &ev).await;
+    assert_eq!(ok[2], false, "{ok}");
+    assert_eq!(ok[3], "rate-limited: slow down");
+    relay.stop().await;
+}
+
+/// A reconnect cannot buy a fresh address burst: the spent entry
+/// survives at count 0 and the next connection reuses its buckets.
+#[tokio::test]
+async fn ip_rate_limit_survives_reconnect() {
+    let mut config = common::config();
+    config.relay.metrics = true;
+    config.relay.rate_limits.ip_events_per_second = 1;
+    config.relay.rate_limits.ip_events_burst = 3;
+    let relay = Relay::start_with(config).await;
+    {
+        let mut a = relay.connect().await;
+        for i in 0..3u64 {
+            let ev = common::event(&key(51), 1, now(), &json!([]), &format!("x{i}"));
+            send_text(&mut a, &event_wire(&ev)).await;
+            assert_eq!(recv_ok(&mut a, &ev).await[2], true, "burst {i}");
+        }
+    }
+    // Wait until the relay accounts the close before reconnecting.
+    let deadline = Instant::now() + T;
+    loop {
+        let body = http_get(relay.addr, "/metrics").await;
+        if metric_value(&body, "nosfry_connections") == Some(0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "close was not processed");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut b = relay.connect().await;
+    let ev = common::event(&key(51), 1, now(), &json!([]), "over");
+    send_text(&mut b, &event_wire(&ev)).await;
+    let ok = recv_ok(&mut b, &ev).await;
+    assert_eq!(ok[2], false, "{ok}");
+    assert_eq!(ok[3], "rate-limited: slow down");
     relay.stop().await;
 }
 
@@ -1724,6 +1789,10 @@ async fn reload_rate_limits_apply_to_new_connections() {
         events_burst: 1,
         reqs_per_second: 0,
         reqs_burst: 0,
+        ip_events_per_second: 0,
+        ip_events_burst: 0,
+        ip_reqs_per_second: 0,
+        ip_reqs_burst: 0,
     };
     relay.reload(config);
     assert!(wait_until(|| async { nip11_name(relay.addr).await == "limits on" }).await);

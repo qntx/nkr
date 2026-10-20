@@ -50,7 +50,13 @@ pub(crate) fn router(state: AppState) -> Router {
 async fn metrics(State(state): State<AppState>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        state.metrics.render(state.limiter.total()),
+        state.metrics.render(
+            state.limiter.total(),
+            state
+                .conn
+                .outbound_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
     )
         .into_response()
 }
@@ -157,6 +163,7 @@ async fn websocket(state: &AppState, parts: &mut Parts, peer: SocketAddr) -> Opt
     let Ok((response, fut)) = upgrade.upgrade(options) else {
         return Some(StatusCode::BAD_REQUEST.into_response());
     };
+    let buckets = permit.buckets();
     let handle = state.conn.clone();
     let tracker = handle.tracker.clone();
     tracker.spawn(async move {
@@ -164,7 +171,7 @@ async fn websocket(state: &AppState, parts: &mut Parts, peer: SocketAddr) -> Opt
         match fut.await {
             Ok(mut ws) => {
                 tracing::debug!(?ip, "connection open");
-                connection::run(&mut ws, &handle, ip).await;
+                connection::run(&mut ws, &handle, ip, buckets).await;
             }
             Err(err) => tracing::debug!(%err, "upgrade failed"),
         }

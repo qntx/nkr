@@ -9,6 +9,7 @@ use nosfry_lmdb::{Store, WriteOutcome};
 use tokio::sync::mpsc;
 
 use crate::channels::{Batch, Out, ShardMsg, WriteRequest, WriterMsg};
+use crate::metrics::{Metrics, StoreOp};
 
 /// Maximum events applied per write transaction.
 const BATCH_CAP: usize = 1024;
@@ -56,6 +57,7 @@ pub(crate) fn run(
     store: &Store,
     mut rx: mpsc::Receiver<WriterMsg>,
     shards: &[mpsc::Sender<ShardMsg>],
+    metrics: &Metrics,
 ) {
     let mut expire_pending = false;
     let mut expire_backlog = false;
@@ -82,7 +84,7 @@ pub(crate) fn run(
                         Err(_) => break,
                     }
                 }
-                write_batch(store, reqs, shards);
+                write_batch(store, reqs, shards, metrics);
             }
             Some(WriterMsg::Expire) | None => expire_pending = true,
         }
@@ -93,6 +95,7 @@ pub(crate) fn run(
                     expire_pending = expire_backlog;
                 }
                 Err(err) => {
+                    metrics.store_error(StoreOp::Expire);
                     tracing::error!(%err, "expiry sweep failed");
                     expire_pending = false;
                     expire_backlog = false;
@@ -117,12 +120,18 @@ fn clear_stale_readers(store: &Store) {
 /// Commit one publish batch, queue `Stored` events on every shard,
 /// then push each request's `OK`. Events stored and removed inside
 /// the same transaction (`Written::deleted`) are never broadcast.
-fn write_batch(store: &Store, reqs: Vec<WriteRequest>, shards: &[mpsc::Sender<ShardMsg>]) {
+fn write_batch(
+    store: &Store,
+    reqs: Vec<WriteRequest>,
+    shards: &[mpsc::Sender<ShardMsg>],
+    metrics: &Metrics,
+) {
     let events: Vec<Arc<nosfry_core::event::Event>> =
         reqs.iter().map(|r| Arc::clone(&r.event)).collect();
     let written = match store.write(&events) {
         Ok(written) => written,
         Err(err) => {
+            metrics.store_error(StoreOp::Write);
             tracing::error!(%err, "store write failed");
             for req in reqs {
                 req.out.push(Out::Frame {

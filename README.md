@@ -38,20 +38,30 @@ clients.
 `relay.rate_limits` throttles each connection with EVENT and REQ token
 buckets (default 20/s, burst 100); over-limit EVENTs get `OK false
 rate-limited:`, over-limit REQs get `CLOSED rate-limited:`. A
-`*_per_second` of 0 disables that bucket. `relay.max_connections`
+`*_per_second` of 0 disables that bucket. The `ip_*` keys add a second
+pair of buckets shared by every connection of one client address
+(default 100/s, burst 500 each): a message is refused when either its
+connection bucket or the shared address bucket is empty, closing the
+"128 connections × 20 events/s" bypass. `relay.max_connections`
 caps total WebSocket connections and `relay.max_connections_per_ip`
 (default 128) caps them per client IP — IPv6 is grouped per /64; an
 over-cap upgrade is refused with `429 Too Many Requests` before the
-handshake.
+handshake. `relay.max_pending_outbound_bytes_total` (default 1 GiB,
+0 disables, restart-only) bounds the sum of every connection's pending
+outbound bytes: over budget, scans pause only on connections already
+more than one chunk behind, while caught-up readers keep scanning.
 
 `relay.metrics = true` serves `GET /metrics` in the Prometheus text
 exposition format: `nostr_client_messages_total{verb}` counts inbound
 messages by recognized verb, `nostr_relay_messages_total{verb}` counts
 frames written to sockets, `nostr_events_total{kind}` counts verified
 events, `nosfry_connections` reports the live WebSocket count,
-`nosfry_connections_rejected_total` refused upgrades, and
-`nosfry_rate_limited_total{verb}` rate-limit refusals. The endpoint is
-unauthenticated — keep it behind a reverse proxy or firewall.
+`nosfry_outbound_pending_bytes` the process-wide pending outbound
+bytes, `nosfry_connections_rejected_total` refused upgrades,
+`nosfry_rate_limited_total{verb}` rate-limit refusals, and
+`nosfry_store_errors_total{op}` failed store operations
+(`write`/`expire`/`scan`). The endpoint is unauthenticated — keep it
+behind a reverse proxy or firewall.
 
 `[relay.write_policy]` runs a strfry-compatible write-policy plugin:
 plugins written for strfry run unchanged. Every verified event is sent
@@ -90,8 +100,10 @@ SIGHUP reloads the configuration file without restarting: the relay
 re-reads it, logs an error and keeps the running configuration on a
 parse failure, and applies everything except the restart-only keys —
 `[db]`, `relay.bind`, `relay.port`, `relay.nofiles`, `relay.metrics`,
-`relay.threads`, `relay.query_timeslice_budget_microseconds`, and
-`relay.limits.max_filter_limit` — which are logged as ignored. Session
+`relay.threads`, `relay.query_timeslice_budget_microseconds`,
+`relay.limits.max_filter_limit`, and
+`relay.max_pending_outbound_bytes_total` — which are logged as
+ignored. Session
 limits and connection options (`events`, `relay.limits`,
 `relay.rate_limits`, payload size, ping interval, outbound budget,
 compression, `real_ip_header`, NIP-11, the write-policy plugin) apply

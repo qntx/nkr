@@ -11,6 +11,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nosfry_core::message::{ClientVerb, RelayVerb};
 
+/// One store operation for `nosfry_store_errors_total{op}`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StoreOp {
+    /// A batched `Store::write` commit.
+    Write,
+    /// The periodic expiry sweep.
+    Expire,
+    /// One stored-event scan step.
+    Scan,
+}
+
+impl StoreOp {
+    /// Every op in render order.
+    const ALL: [Self; 3] = [Self::Write, Self::Expire, Self::Scan];
+
+    /// The `op` label value.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Expire => "expire",
+            Self::Scan => "scan",
+        }
+    }
+}
+
 /// Process-wide counters, shared as `Arc<Metrics>`.
 #[derive(Debug)]
 pub(crate) struct Metrics {
@@ -26,6 +51,8 @@ pub(crate) struct Metrics {
     events: Box<[AtomicU64]>,
     /// `nosfry_connections_rejected_total`.
     rejected: AtomicU64,
+    /// `nosfry_store_errors_total{op}`.
+    store_errors: [AtomicU64; StoreOp::ALL.len()],
 }
 
 impl Metrics {
@@ -40,6 +67,7 @@ impl Metrics {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             rejected: AtomicU64::new(0),
+            store_errors: [const { AtomicU64::new(0) }; StoreOp::ALL.len()],
         }
     }
 
@@ -77,11 +105,19 @@ impl Metrics {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One failed store operation.
+    pub(crate) fn store_error(&self, op: StoreOp) {
+        if let Some(counter) = self.store_errors.get(op as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Render the Prometheus text exposition format (0.0.4);
     /// `connections` is the live gauge read from the connection
-    /// limiter. Counter series at zero are omitted; the gauge is
-    /// always emitted.
-    pub(crate) fn render(&self, connections: usize) -> String {
+    /// limiter and `outbound_pending` the process-wide pending
+    /// outbound bytes. Counter series at zero are omitted; the
+    /// gauges are always emitted.
+    pub(crate) fn render(&self, connections: usize, outbound_pending: usize) -> String {
         let mut out = String::with_capacity(2 * 1024);
         family(
             &mut out,
@@ -149,11 +185,35 @@ impl Metrics {
         }
         family(
             &mut out,
+            "nosfry_store_errors_total",
+            "Failed store operations by op.",
+            "counter",
+        );
+        for (op, counter) in StoreOp::ALL.iter().zip(&self.store_errors) {
+            let value = counter.load(Ordering::Relaxed);
+            if value > 0 {
+                writeln!(
+                    out,
+                    "nosfry_store_errors_total{{op=\"{}\"}} {value}",
+                    op.as_str()
+                )
+                .ok();
+            }
+        }
+        family(
+            &mut out,
             "nosfry_connections",
             "Current WebSocket connections.",
             "gauge",
         );
         writeln!(out, "nosfry_connections {connections}").ok();
+        family(
+            &mut out,
+            "nosfry_outbound_pending_bytes",
+            "Pending outbound bytes across all connections.",
+            "gauge",
+        );
+        writeln!(out, "nosfry_outbound_pending_bytes {outbound_pending}").ok();
         out
     }
 }
@@ -179,10 +239,10 @@ mod tests {
 
     #[test]
     fn empty_render_has_families_and_gauge_only() {
-        let out = Metrics::new().render(0);
+        let out = Metrics::new().render(0, 0);
         assert!(out.contains("# HELP nostr_client_messages_total"));
         assert!(out.contains("# TYPE nostr_events_total counter"));
-        assert!(out.ends_with("nosfry_connections 0\n"));
+        assert!(out.ends_with("nosfry_outbound_pending_bytes 0\n"));
         assert!(!out.contains('{'), "no series while every counter is 0");
     }
 
@@ -199,8 +259,11 @@ mod tests {
         metrics.event(7);
         metrics.rate_limited(ClientVerb::Event);
         metrics.connection_rejected();
+        metrics.store_error(StoreOp::Write);
+        metrics.store_error(StoreOp::Scan);
+        metrics.store_error(StoreOp::Scan);
         assert_eq!(
-            metrics.render(3),
+            metrics.render(3, 512),
             "# HELP nostr_client_messages_total Inbound client messages by verb.\n\
              # TYPE nostr_client_messages_total counter\n\
              nostr_client_messages_total{verb=\"EVENT\"} 2\n\
@@ -220,9 +283,16 @@ mod tests {
              # HELP nosfry_connections_rejected_total Upgrades refused by the connection caps.\n\
              # TYPE nosfry_connections_rejected_total counter\n\
              nosfry_connections_rejected_total 1\n\
+             # HELP nosfry_store_errors_total Failed store operations by op.\n\
+             # TYPE nosfry_store_errors_total counter\n\
+             nosfry_store_errors_total{op=\"write\"} 1\n\
+             nosfry_store_errors_total{op=\"scan\"} 2\n\
              # HELP nosfry_connections Current WebSocket connections.\n\
              # TYPE nosfry_connections gauge\n\
-             nosfry_connections 3\n"
+             nosfry_connections 3\n\
+             # HELP nosfry_outbound_pending_bytes Pending outbound bytes across all connections.\n\
+             # TYPE nosfry_outbound_pending_bytes gauge\n\
+             nosfry_outbound_pending_bytes 512\n"
         );
     }
 }

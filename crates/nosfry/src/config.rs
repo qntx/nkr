@@ -57,6 +57,11 @@ pub struct Relay {
     pub auto_ping_seconds: u64,
     /// Pending outbound bytes above which the connection is closed.
     pub max_pending_outbound_bytes: usize,
+    /// Process-wide pending outbound byte budget: when the sum of
+    /// every connection's pending exceeds it, scans pause on
+    /// connections already more than one chunk behind (restart-only;
+    /// 0 = unlimited).
+    pub max_pending_outbound_bytes_total: usize,
     /// Maximum simultaneous WebSocket connections (0 = unlimited).
     pub max_connections: usize,
     /// Maximum simultaneous WebSocket connections per client IP
@@ -196,6 +201,7 @@ impl Default for Relay {
             max_websocket_payload_size: 131_072,
             auto_ping_seconds: 55,
             max_pending_outbound_bytes: 33_554_432,
+            max_pending_outbound_bytes_total: 1_073_741_824,
             max_connections: 0,
             max_connections_per_ip: 128,
             metrics: false,
@@ -293,7 +299,8 @@ impl Config {
     /// Restart-only: `[db]`, `relay.bind`, `relay.port`,
     /// `relay.nofiles`, `relay.metrics` (route registration),
     /// `relay.query_timeslice_budget_microseconds`, `relay.threads`,
-    /// `relay.limits.max_filter_limit` (reader threads hold it).
+    /// `relay.limits.max_filter_limit` (reader threads hold it),
+    /// `relay.max_pending_outbound_bytes_total` (ditto).
     #[must_use]
     pub fn reloadable_from(&self, mut new: Self) -> (Self, Vec<&'static str>) {
         let mut ignored = Vec::new();
@@ -331,6 +338,10 @@ impl Config {
         if relay.limits.max_filter_limit != running.limits.max_filter_limit {
             ignored.push("relay.limits.max_filter_limit");
             relay.limits.max_filter_limit = running.limits.max_filter_limit;
+        }
+        if relay.max_pending_outbound_bytes_total != running.max_pending_outbound_bytes_total {
+            ignored.push("relay.max_pending_outbound_bytes_total");
+            relay.max_pending_outbound_bytes_total = running.max_pending_outbound_bytes_total;
         }
         (new, ignored)
     }
@@ -387,6 +398,7 @@ mod tests {
         new.relay.query_timeslice_budget_microseconds = 1;
         new.relay.threads.readers = 9;
         new.relay.limits.max_filter_limit = 1;
+        new.relay.max_pending_outbound_bytes_total = 1;
         new.relay.info.name = "reloaded".into();
         new.relay.rate_limits.events_per_second = 5;
         new.relay.write_policy.plugin = "/bin/true".into();
@@ -402,6 +414,7 @@ mod tests {
                 "relay.query_timeslice_budget_microseconds",
                 "relay.threads",
                 "relay.limits.max_filter_limit",
+                "relay.max_pending_outbound_bytes_total",
             ]
         );
         assert_eq!(merged.db.path, running.db.path);
