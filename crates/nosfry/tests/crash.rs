@@ -91,6 +91,11 @@ fn write_config(dir: &Path, port: u16) -> PathBuf {
     path
 }
 
+/// At most 10 ids of a sorted vector, for failure messages.
+fn head(ids: &[String]) -> &[String] {
+    &ids[..ids.len().min(10)]
+}
+
 /// Current unix seconds.
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -299,6 +304,9 @@ struct PublisherStats {
     regular: HashSet<String>,
     /// Ids this publisher provably deleted via an acked kind-5.
     deleted: HashSet<String>,
+    /// Targets of kind-5s whose send or OK was lost to the kill: the
+    /// deletion may or may not have committed.
+    in_flight_deleted: HashSet<String>,
     /// Highest `created_at` of an acked kind-0.
     kind0_max: u64,
 }
@@ -342,10 +350,18 @@ async fn publish_loop(
         let ev = event(&kp, kind, created_at, &tags, &content);
         let id_hex = ev.id().to_string();
         if !try_send(&mut ws, &event_wire(&ev)).await {
+            // A failed send may still have reached the relay.
+            if let Some(target) = target {
+                stats.in_flight_deleted.insert(target);
+            }
             break;
         }
         stats.sent += 1;
         let Some(ok) = recv_ok(&mut ws, &id_hex).await else {
+            // Sent, maybe committed; the OK was lost to the kill.
+            if let Some(target) = target {
+                stats.in_flight_deleted.insert(target);
+            }
             break;
         };
         stats.answered += 1;
@@ -428,6 +444,7 @@ async fn kill9_loses_no_acknowledged_event() {
 
     let mut acked_regular = HashSet::new();
     let mut acked_deleted = HashSet::new();
+    let mut in_flight_deleted = HashSet::new();
     let mut kind0_max: HashMap<usize, u64> = HashMap::new();
     let mut total_unacked = 0usize;
 
@@ -465,6 +482,7 @@ async fn kill9_loses_no_acknowledged_event() {
             total_unacked += stats.sent - stats.answered;
             acked_regular.extend(stats.regular);
             acked_deleted.extend(stats.deleted);
+            in_flight_deleted.extend(stats.in_flight_deleted);
             if stats.kind0_max > 0 {
                 let entry = kind0_max.entry(index).or_insert(0);
                 *entry = (*entry).max(stats.kind0_max);
@@ -483,11 +501,19 @@ async fn kill9_loses_no_acknowledged_event() {
     let mut ws = connect(addr).await.expect("verify connection failed");
 
     // Every acked kind-1 that was never deleted comes back by id;
-    // every deleted one is absent.
-    let expected: HashSet<String> = acked_regular.difference(&acked_deleted).cloned().collect();
-    let all: Vec<String> = acked_regular.union(&acked_deleted).cloned().collect();
+    // every deleted one is absent. An in-flight kind-5 (sent, OK lost
+    // to the kill) may or may not have committed, so its target is
+    // allowed either way — but a target whose deletion WAS acked must
+    // still never be served (the `served_deleted` check).
+    let expected: HashSet<String> = acked_regular
+        .difference(&acked_deleted)
+        .filter(|id| !in_flight_deleted.contains(*id))
+        .cloned()
+        .collect();
+    let all_ids: HashSet<String> = acked_regular.union(&acked_deleted).cloned().collect();
+    let all_vec: Vec<&String> = all_ids.iter().collect();
     let mut returned = HashSet::new();
-    for chunk in all.chunks(500) {
+    for chunk in all_vec.chunks(500) {
         let events = collect_events(&mut ws, &json!({"ids": chunk})).await;
         for ev in events {
             returned.insert(
@@ -498,9 +524,27 @@ async fn kill9_loses_no_acknowledged_event() {
             );
         }
     }
-    assert_eq!(
-        returned, expected,
-        "acked events missing or deleted ones served"
+    // Report each failure class separately: acked events that are
+    // gone (a durability bug), deletions that still serve their
+    // target, and ids that were never acked at all. At most 10 ids each.
+    let mut missing: Vec<String> = expected.difference(&returned).cloned().collect();
+    missing.sort_unstable();
+    let mut served_deleted: Vec<String> = returned.intersection(&acked_deleted).cloned().collect();
+    served_deleted.sort_unstable();
+    let mut stray: Vec<String> = returned.difference(&all_ids).cloned().collect();
+    stray.sort_unstable();
+    assert!(
+        missing.is_empty() && served_deleted.is_empty() && stray.is_empty(),
+        "acked events missing or deleted ones served:\n  \
+         missing {}: {:?}\n  \
+         served_deleted {}: {:?}\n  \
+         stray {}: {:?}",
+        missing.len(),
+        head(&missing),
+        served_deleted.len(),
+        head(&served_deleted),
+        stray.len(),
+        head(&stray),
     );
 
     // For each key, the stored kind-0 is at least as new as the max acked.
