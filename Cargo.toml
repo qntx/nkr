@@ -1,6 +1,6 @@
 [workspace]
 members  = ["crates/nosfry", "crates/nosfry-core", "crates/nosfry-lmdb"]
-exclude  = ["bench/nosfry-bench"]
+exclude  = ["bench/nosfry-bench", "fuzz"]
 resolver = "3"
 
 [workspace.package]

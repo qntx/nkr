@@ -38,3 +38,10 @@ jobs:
       targets: wasm32-unknown-unknown
       packages: nosfry-core
       features: --all-features
+
+  fuzz:
+    uses: qntx/workflows/.github/workflows/ci-rust-fuzz.yml@v2
+    permissions:
+      contents: read
+    with:
+      max-total-time: 60

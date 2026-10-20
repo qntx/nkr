@@ -1,0 +1,21 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fuzz:
+    uses: qntx/workflows/.github/workflows/ci-rust-fuzz.yml@v2
+    permissions:
+      contents: read
+    with:
+      max-total-time: 900
