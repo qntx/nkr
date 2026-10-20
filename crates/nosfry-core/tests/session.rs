@@ -235,13 +235,8 @@ fn close_removes_and_ignores_unknown() {
 }
 
 #[test]
-fn count_auth_neg_are_unsupported() {
+fn auth_neg_are_unsupported() {
     let mut s = session();
-    let out = feed(&mut s, 1, "[\"COUNT\",\"c\",{}]");
-    assert!(
-        sends(&out)[0].starts_with("[\"CLOSED\",\"c\",\"unsupported:"),
-        "{out:?}"
-    );
     let auth = format!("[\"AUTH\",{}]", event_json(1, 22_242, "auth"));
     let out = feed(&mut s, 1, &auth);
     assert!(
@@ -1046,4 +1041,153 @@ fn refused_re_req_closes_old_subscription() {
         ),
         "{out:?}"
     );
+}
+
+#[test]
+fn count_disabled_closes_unsupported() {
+    let mut s = Session::new(
+        Arc::new(Limits {
+            req: nosfry_core::limits::ReqLimits {
+                max_filter_limit_count: 0,
+                ..nosfry_core::limits::ReqLimits::default()
+            },
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    );
+    // An open REQ under the same id is torn down by the refusal.
+    feed(&mut s, 1, "[\"REQ\",\"c\",{}]");
+    let out = feed(&mut s, 2, "[\"COUNT\",\"c\",{}]");
+    let frames = sends(&out);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::Unsubscribe { .. }, Command::Send { .. }]
+        ) && frames[0] == "[\"CLOSED\",\"c\",\"unsupported: COUNT\"]",
+        "{out:?}"
+    );
+}
+
+#[test]
+fn count_emits_count_command_with_gate() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"COUNT\",\"c\",{\"kinds\":[1]}]");
+    let [Command::Count { sub, filters, gate }] = out.as_slice() else {
+        panic!("expected Count, got {out:?}");
+    };
+    assert_eq!(sub.id.as_str(), "c");
+    assert_eq!(sub.generation, 1);
+    assert_eq!(filters.len(), 1);
+    assert!(s.is_current(sub));
+    // The snapshot gate reads like a REQ's: without auth rules it
+    // allows everything.
+    let note = nosfry_core::packed::PackedEvent::build(
+        &nosfry_core::event::EventId([1; 32]),
+        &PublicKey([2; 32]),
+        0,
+        Kind(1),
+        0,
+        Vec::<Vec<String>>::new(),
+    );
+    assert!(gate.allows(note.packed()));
+}
+
+#[test]
+fn count_replaces_open_req_with_new_generation() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
+    let Command::Subscribe { sub: first, .. } = &out[0] else {
+        panic!("expected Subscribe");
+    };
+    let out = feed(&mut s, 2, "[\"COUNT\",\"a\",{\"kinds\":[1]}]");
+    let [
+        Command::Unsubscribe { .. },
+        Command::Count { sub: second, .. },
+    ] = out.as_slice()
+    else {
+        panic!("expected Unsubscribe then Count, got {out:?}");
+    };
+    assert_eq!(second.id.as_str(), "a");
+    assert_ne!(first.generation, second.generation);
+    assert!(!s.is_current(first));
+    assert!(s.is_current(second));
+}
+
+#[test]
+fn count_over_limit_is_closed_rate_limited() {
+    let mut s = session();
+    let t = 1_000u64;
+    // The 100-token REQ burst is shared with COUNT.
+    for _ in 0..100 {
+        feed_ms(&mut s, t, "[\"COUNT\",\"a\",{}]");
+    }
+    // The refused COUNT tears the open id down first, like a refused
+    // re-REQ.
+    let (out, received) = receive(&mut s, t, "[\"COUNT\",\"a\",{}]");
+    let frames = sends(&out);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::Unsubscribe { .. }, Command::Send { .. }]
+        ) && frames[0].contains("rate-limited: slow down"),
+        "{out:?}"
+    );
+    assert!(received.rate_limited);
+    assert_eq!(received.verb, Some(ClientVerb::Count));
+    let out = feed_ms(&mut s, t, "[\"CLOSE\",\"a\"]");
+    assert!(out.is_empty(), "{out:?}");
+}
+
+#[test]
+fn count_fully_restricted_unauthenticated() {
+    // AUTH enabled: challenge once, then auth-required.
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let out = feed(&mut s, 1, "[\"COUNT\",\"a\",{\"kinds\":[4]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        [
+            "[\"AUTH\",\"challenge\"]",
+            "[\"CLOSED\",\"a\",\"auth-required: requested filter requires authentication\"]",
+        ],
+        "{out:?}"
+    );
+    // AUTH disabled: the restricted refusal.
+    let mut s = session_auth("", &[4], true);
+    let out = feed(&mut s, 1, "[\"COUNT\",\"a\",{\"kinds\":[4]}]");
+    assert_eq!(
+        sends(&out).as_slice(),
+        ["[\"CLOSED\",\"a\",\"restricted: requested kinds are not served\"]"]
+    );
+}
+
+#[test]
+fn authed_count_gate_hides_uninvolved_dms() {
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let out = feed(&mut s, 1_700_000_000, &auth_frame([9; 32], 1_700_000_000));
+    assert!(sends(&out)[0].contains("true"), "{out:?}");
+    let out = feed(&mut s, 2, "[\"COUNT\",\"c\",{\"kinds\":[4]}]");
+    let [Command::Count { gate, .. }] = out.as_slice() else {
+        panic!("expected Count, got {out:?}");
+    };
+    let authed_pk = pubkey_hex([9; 32]);
+    let involved = nosfry_core::packed::PackedEvent::build(
+        &nosfry_core::event::EventId([1; 32]),
+        &PublicKey([2; 32]),
+        0,
+        Kind(4),
+        0,
+        vec![vec!["p".to_owned(), authed_pk]],
+    );
+    let other = nosfry_core::packed::PackedEvent::build(
+        &nosfry_core::event::EventId([3; 32]),
+        &PublicKey([4; 32]),
+        0,
+        Kind(4),
+        0,
+        Vec::<Vec<String>>::new(),
+    );
+    assert!(gate.allows(involved.packed()));
+    assert!(!gate.allows(other.packed()));
 }

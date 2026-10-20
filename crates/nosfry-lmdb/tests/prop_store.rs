@@ -28,7 +28,7 @@ use common::{event, key};
 use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, cmp_newest_first, supersedes};
 use nosfry_core::filter::Filter;
-use nosfry_lmdb::{Progress, Scan, Store, StoreOptions, WriteOutcome};
+use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreOptions, WriteOutcome};
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -224,6 +224,32 @@ fn model_scan(
     out
 }
 
+/// The true count `CountScan` must return: unique stored seqs
+/// matching at least one filter, visible at `snapshot`/`now`/`gate`.
+/// `Scan`'s union is not the reference: `Filter::intrinsic_limit`
+/// caps replaceable/addressable author+kind queries at
+/// `kinds × authors × #d values`, which is a serving optimization a
+/// true count must not inherit.
+fn model_union(
+    stored: &HashMap<u64, Arc<Event>>,
+    filters: &[Filter],
+    snapshot: u64,
+    gate: &nosfry_core::auth::ReadGate,
+    now: u64,
+) -> usize {
+    let mut seen = HashSet::new();
+    for (seq, ev) in stored {
+        if *seq <= snapshot
+            && ev.expiration().is_none_or(|exp| exp > now)
+            && gate.allows(ev.packed())
+            && filters.iter().any(|f| f.matches(ev.packed()))
+        {
+            seen.insert(*seq);
+        }
+    }
+    seen.len()
+}
+
 fn store_scan(
     store: &Store,
     filters: Arc<[Filter]>,
@@ -231,13 +257,25 @@ fn store_scan(
     max_limit: u64,
     now: u64,
 ) -> Vec<String> {
-    let mut scan = Scan::new(
+    store_scan_gated(
+        store,
         filters,
         nosfry_core::auth::ReadGate::default(),
         snapshot,
         max_limit,
         now,
-    );
+    )
+}
+
+fn store_scan_gated(
+    store: &Store,
+    filters: Arc<[Filter]>,
+    gate: nosfry_core::auth::ReadGate,
+    snapshot: u64,
+    max_limit: u64,
+    now: u64,
+) -> Vec<String> {
+    let mut scan = Scan::new(filters, gate, snapshot, max_limit, now);
     let out = RefCell::new(Vec::new());
     let mut guard = 0usize;
     loop {
@@ -253,6 +291,28 @@ fn store_scan(
         }
     }
     out.into_inner()
+}
+
+/// Run a [`CountScan`] to completion (`0` entry budget = uncapped).
+fn store_count(
+    store: &Store,
+    filters: Arc<[Filter]>,
+    gate: nosfry_core::auth::ReadGate,
+    snapshot: u64,
+    budget_entries: u64,
+    now: u64,
+) -> nosfry_lmdb::CountResult {
+    let mut scan = CountScan::new(filters, gate, snapshot, budget_entries, now, None);
+    let mut guard = 0usize;
+    loop {
+        guard += 1;
+        assert!(guard < 100_000, "count scan did not terminate");
+        let progress = scan.step(store, Duration::ZERO).unwrap();
+        if progress == Progress::Done {
+            break;
+        }
+    }
+    scan.result()
 }
 
 #[derive(Debug, Clone)]
@@ -581,5 +641,94 @@ proptest! {
         let expected2 = model_scan(&stored.stored, &filters, snapshot2, max_limit, now2);
         let got2 = store_scan(&store, filters, snapshot2, max_limit, now2);
         prop_assert_eq!(got2, expected2);
+
+        // COUNT ignores `limit`: it must equal the deduplicated union
+        // a limit-less Scan returns.
+        let unlimited: Arc<[Filter]> = Arc::from(
+            filter_specs
+                .iter()
+                .map(|s| {
+                    let mut json = filter_json(s, &ids);
+                    json.remove("limit");
+                    Filter::parse(&serde_json::to_string(&json).unwrap()).unwrap()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let union = model_union(
+            &stored.stored,
+            &unlimited,
+            snapshot2,
+            &nosfry_core::auth::ReadGate::default(),
+            now2,
+        );
+        let counted = store_count(
+            &store,
+            Arc::clone(&unlimited),
+            nosfry_core::auth::ReadGate::default(),
+            snapshot2,
+            0,
+            now2,
+        );
+        prop_assert!(!counted.approximate);
+        prop_assert_eq!(counted.count, union as u64);
+
+        // A restricted-kind gate shrinks the count exactly as it
+        // shrinks the scan union.
+        let rules = nosfry_core::auth::AuthRules::new("wss://relay.example.com", &[3], true)
+            .unwrap();
+        let authed: Arc<[PublicKey]> = Arc::from(vec![PublicKey(
+            keys()[0].x_only_public_key().0.to_byte_array(),
+        )]);
+        let gate = nosfry_core::auth::ReadGate::new(Arc::new(rules), authed);
+        let union_gated = model_union(&stored.stored, &unlimited, snapshot2, &gate, now2);
+        let counted_gated = store_count(&store, unlimited, gate, snapshot2, 0, now2);
+        prop_assert!(!counted_gated.approximate);
+        prop_assert_eq!(counted_gated.count, union_gated as u64);
     }
+}
+
+/// Hitting the entry budget ends the scan early and reports a partial
+/// count — never a wrong one.
+#[test]
+fn count_budget_marks_approximate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+    let events: Vec<Arc<Event>> = (0..40u64)
+        .map(|i| {
+            event(
+                &keys()[usize::try_from(i).unwrap() % 4],
+                1,
+                1_700_000_000 + i,
+                &json!([]),
+                &format!("e{i}"),
+            )
+        })
+        .collect();
+    store.write(&events).unwrap();
+
+    let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
+    let snapshot = store.snapshot().unwrap();
+    let full = store_count(
+        &store,
+        Arc::clone(&filters),
+        nosfry_core::auth::ReadGate::default(),
+        snapshot,
+        0,
+        u64::MAX,
+    );
+    assert!(!full.approximate);
+    assert_eq!(full.count, events.len() as u64);
+
+    // Fewer index entries than there are matches: the answer is
+    // approximate and never over-counts.
+    let partial = store_count(
+        &store,
+        filters,
+        nosfry_core::auth::ReadGate::default(),
+        snapshot,
+        10,
+        u64::MAX,
+    );
+    assert!(partial.approximate);
+    assert!(partial.count <= full.count);
 }

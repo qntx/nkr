@@ -20,6 +20,7 @@ pub mod auth;
 pub mod deletion;
 pub mod event;
 pub mod filter;
+pub mod hll;
 pub mod kind;
 pub mod limits;
 pub mod message;

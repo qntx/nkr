@@ -43,8 +43,10 @@ use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, UnverifiedEvent, supersedes};
 use nosfry_core::packed::PackedRef;
 
+mod count;
 mod scan;
 
+pub use count::{CountResult, CountScan};
 pub use scan::{Progress, Scan};
 
 /// On-disk format version, stored under the `format` meta key.

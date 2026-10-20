@@ -12,6 +12,19 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- NIP-45 `COUNT`: `["COUNT", <sub>, <filters>…]` counts the stored
+  events the filters would return and answers with one
+  `["COUNT",<sub>,{"count":n}]` frame. COUNTs share the REQ rate
+  buckets, subscription slots, and filter validation; a filter's
+  `limit` is ignored and restricted kinds are counted only for
+  readers allowed to see them. `relay.limits.max_filter_limit_count`
+  (default 1,000,000, `0` disables COUNT) caps the index entries one
+  COUNT may examine; reaching it ends the scan early and the answer
+  carries `"approximate": true` rather than strfry's `limited`.
+  Single-tag-condition queries also get `"hll"`, the 256-register
+  HyperLogLog sketch of the counted authors (NIP-45 offset rule).
+  NIP-11 advertises 45 while COUNT is enabled.
+
 - `[relay] nofiles` (default 1,000,000, `0` disables): the binary raises
   its soft open-file limit at startup, capped by the hard limit, so
   systemd/containerd's 1024 default no longer caps connection count.

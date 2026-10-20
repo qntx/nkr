@@ -47,6 +47,17 @@ pub enum Command {
         /// Read visibility snapshot at REQ time.
         gate: ReadGate,
     },
+    /// Answer a NIP-45 `COUNT`: the adapter runs the stored-event
+    /// count scan, writes one `["COUNT",…]` frame, then closes the
+    /// sub id from the relay side.
+    Count {
+        /// New subscription key (fresh generation).
+        sub: SubKey,
+        /// Compiled filters.
+        filters: Arc<[Filter]>,
+        /// Read visibility snapshot at COUNT time.
+        gate: ReadGate,
+    },
     /// Close a subscription owned by this connection.
     Unsubscribe {
         /// Subscription id.
@@ -153,10 +164,11 @@ impl Session {
             Ok(message) => message,
             Err(error) => {
                 let verb = error.verb();
-                // A refused REQ closes an open subscription under the
-                // same id: it must stop delivering before the CLOSED.
+                // A refused REQ or COUNT closes an open subscription
+                // under the same id: it must stop delivering before the
+                // CLOSED.
                 if let MessageError::Filter {
-                    verb: ClientVerb::Req,
+                    verb: ClientVerb::Req | ClientVerb::Count,
                     sub,
                     ..
                 } = &error
@@ -204,17 +216,7 @@ impl Session {
                 }
             }
             ClientMessage::Req { sub_id, filters } => {
-                if !self
-                    .req_bucket
-                    .as_mut()
-                    .is_none_or(|bucket| bucket.take(now_ms))
-                    || !self.address.take_req(now_ms)
-                {
-                    self.drop_sub(&sub_id, out);
-                    out.push(Command::Send {
-                        verb: RelayVerb::Closed,
-                        text: closed_frame(&sub_id, &Reason::RateLimited.message("slow down")),
-                    });
+                if !self.charge_req(now_ms, &sub_id, out) {
                     return Received {
                         verb: Some(verb),
                         rate_limited: true,
@@ -227,11 +229,14 @@ impl Session {
                     out.push(Command::Unsubscribe { sub_id });
                 }
             }
-            ClientMessage::Count { sub_id, .. } => {
-                out.push(Command::Send {
-                    verb: RelayVerb::Closed,
-                    text: closed_frame(&sub_id, &Reason::Unsupported.message("COUNT")),
-                });
+            ClientMessage::Count { sub_id, filters } => {
+                if !self.charge_req(now_ms, &sub_id, out) {
+                    return Received {
+                        verb: Some(verb),
+                        rate_limited: true,
+                    };
+                }
+                self.on_count(sub_id, filters, out);
             }
             ClientMessage::NegOpen { sub_id, .. }
             | ClientMessage::NegMsg { sub_id, .. }
@@ -475,70 +480,136 @@ impl Session {
         });
     }
 
+    /// Spend one REQ/`COUNT` token from the connection and address
+    /// buckets; on a refusal drop the sub id and answer `rate-limited`.
+    fn charge_req(&mut self, now_ms: u64, sub_id: &SubId, out: &mut Vec<Command>) -> bool {
+        if self
+            .req_bucket
+            .as_mut()
+            .is_none_or(|bucket| bucket.take(now_ms))
+            && self.address.take_req(now_ms)
+        {
+            return true;
+        }
+        self.drop_sub(sub_id, out);
+        out.push(Command::Send {
+            verb: RelayVerb::Closed,
+            text: closed_frame(sub_id, &Reason::RateLimited.message("slow down")),
+        });
+        false
+    }
+
     fn on_req(&mut self, sub_id: SubId, filters: Vec<Filter>, out: &mut Vec<Command>) {
-        if filters.len() > self.limits.req.max_req_filter_size {
+        if !self.validate_read(&sub_id, &filters, out) {
+            return;
+        }
+        let (sub, gate) = self.claim_sub(sub_id, out);
+        out.push(Command::Subscribe {
+            sub,
+            filters: filters.into(),
+            gate,
+        });
+    }
+
+    fn on_count(&mut self, sub_id: SubId, filters: Vec<Filter>, out: &mut Vec<Command>) {
+        if self.limits.req.max_filter_limit_count == 0 {
             self.drop_sub(&sub_id, out);
             out.push(Command::Send {
                 verb: RelayVerb::Closed,
+                text: closed_frame(&sub_id, &Reason::Unsupported.message("COUNT")),
+            });
+            return;
+        }
+        if !self.validate_read(&sub_id, &filters, out) {
+            return;
+        }
+        let (sub, gate) = self.claim_sub(sub_id, out);
+        out.push(Command::Count {
+            sub,
+            filters: filters.into(),
+            gate,
+        });
+    }
+
+    /// The validation REQ and `COUNT` share: filter count, per-filter
+    /// tag conditions, the subscription slot, and the fully
+    /// restricted group check. Every refusal drops the sub id and
+    /// answers `CLOSED`. Returns `true` to proceed.
+    fn validate_read(
+        &mut self,
+        sub_id: &SubId,
+        filters: &[Filter],
+        out: &mut Vec<Command>,
+    ) -> bool {
+        if filters.len() > self.limits.req.max_req_filter_size {
+            self.drop_sub(sub_id, out);
+            out.push(Command::Send {
+                verb: RelayVerb::Closed,
                 text: closed_frame(
-                    &sub_id,
+                    sub_id,
                     &Reason::Invalid.message("too many filters in request"),
                 ),
             });
-            return;
+            return false;
         }
         if filters
             .iter()
             .any(|filter| filter.tag_filter_count() > self.limits.req.max_tags_per_filter)
         {
-            self.drop_sub(&sub_id, out);
+            self.drop_sub(sub_id, out);
             out.push(Command::Send {
                 verb: RelayVerb::Closed,
                 text: closed_frame(
-                    &sub_id,
+                    sub_id,
                     &Reason::Invalid.message("filter has too many tag conditions"),
                 ),
             });
-            return;
+            return false;
         }
-        if !self.subs.contains_key(&sub_id)
+        if !self.subs.contains_key(sub_id)
             && self.subs.len() >= self.limits.req.max_subs_per_connection
         {
-            self.drop_sub(&sub_id, out);
+            self.drop_sub(sub_id, out);
             out.push(Command::Send {
                 verb: RelayVerb::Closed,
                 text: closed_frame(
-                    &sub_id,
+                    sub_id,
                     &Reason::Error.message("too many open subscriptions"),
                 ),
             });
-            return;
+            return false;
         }
         // A fully restricted filter group cannot return anything to an
         // unauthenticated client (strfry `isFilterGroupFullyRestricted`).
-        if self.limits.auth.fully_restricts(&filters) && self.authed.is_empty() {
+        if self.limits.auth.fully_restricts(filters) && self.authed.is_empty() {
             if self.limits.auth.enabled() {
                 self.issue_challenge(out);
-                self.drop_sub(&sub_id, out);
+                self.drop_sub(sub_id, out);
                 out.push(Command::Send {
                     verb: RelayVerb::Closed,
                     text: closed_frame(
-                        &sub_id,
+                        sub_id,
                         &Reason::AuthRequired.message("requested filter requires authentication"),
                     ),
                 });
             } else {
-                self.drop_sub(&sub_id, out);
+                self.drop_sub(sub_id, out);
                 out.push(Command::Send {
                     verb: RelayVerb::Closed,
                     text: closed_frame(
-                        &sub_id,
+                        sub_id,
                         &Reason::Restricted.message("requested kinds are not served"),
                     ),
                 });
             }
-            return;
+            return false;
         }
+        true
+    }
+
+    /// Take the `subs` slot with a fresh generation — re-using an open
+    /// id unsubscribes the old sub first — and snapshot the read gate.
+    fn claim_sub(&mut self, sub_id: SubId, out: &mut Vec<Command>) -> (SubKey, ReadGate) {
         let generation = self.next_generation;
         self.next_generation += 1;
         if self.subs.insert(sub_id.clone(), generation).is_some() {
@@ -546,17 +617,16 @@ impl Session {
                 sub_id: sub_id.clone(),
             });
         }
-        out.push(Command::Subscribe {
-            sub: SubKey {
+        (
+            SubKey {
                 id: sub_id,
                 generation,
             },
-            filters: filters.into(),
-            gate: ReadGate {
+            ReadGate {
                 rules: Arc::clone(&self.limits.auth),
                 authed: Arc::clone(&self.authed),
             },
-        });
+        )
     }
 }
 

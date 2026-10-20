@@ -13,7 +13,7 @@ use nosfry_core::packed::PackedRef;
 use crate::{Index, Reader, Store, StoreError};
 
 /// Check the wall-clock budget after this many candidates.
-const BUDGET_CHECK_EVERY: usize = 64;
+pub(crate) const BUDGET_CHECK_EVERY: usize = 64;
 
 /// A `(created_at, id, seq)` match collected for one filter.
 type Match = (u64, EventId, u64);
@@ -22,7 +22,8 @@ type Match = (u64, EventId, u64);
 type SeqSet = HashSet<u64, foldhash::fast::RandomState>;
 
 /// A live reverse-range iterator, borrowing the step's read txn.
-type RevIter<'a> = Box<dyn Iterator<Item = Result<(&'a [u8], &'a [u8]), heed::Error>> + 'a>;
+pub(crate) type RevIter<'a> =
+    Box<dyn Iterator<Item = Result<(&'a [u8], &'a [u8]), heed::Error>> + 'a>;
 
 /// Whether a [`Scan::step`] has work left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +38,7 @@ pub enum Progress {
 /// `prefix ‖ until ‖ u64::MAX` and becomes exclusive on the last pulled
 /// key. The bounds seed one live iterator per [`Scan::step`].
 #[derive(Debug)]
-struct Cursor {
+pub(crate) struct Cursor {
     lo: Vec<u8>,
     hi: Vec<u8>,
     hi_inclusive: bool,
@@ -45,7 +46,7 @@ struct Cursor {
 }
 
 impl Cursor {
-    fn new(prefix: &[u8], since: u64, until: u64) -> Self {
+    pub(crate) fn new(prefix: &[u8], since: u64, until: u64) -> Self {
         let mut lo = Vec::with_capacity(prefix.len() + 16);
         lo.extend_from_slice(prefix);
         lo.extend_from_slice(&since.to_be_bytes());
@@ -63,7 +64,7 @@ impl Cursor {
     }
 
     /// The bounds for the next probe of this cursor.
-    const fn bounds(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
+    pub(crate) const fn bounds(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
         (
             Bound::Included(self.lo.as_slice()),
             if self.hi_inclusive {
@@ -77,7 +78,7 @@ impl Cursor {
 
 /// Pull the newest key a live iterator still holds for `cursor`; the
 /// pulled key becomes the cursor's exclusive upper bound.
-fn pull(
+pub(crate) fn pull(
     iter: &mut Option<RevIter<'_>>,
     cursor: &mut Cursor,
 ) -> Result<Option<Vec<u8>>, StoreError> {
@@ -145,7 +146,7 @@ struct Plan {
 }
 
 #[derive(Debug)]
-enum Mode {
+pub(crate) enum Mode {
     /// `ix_id` point lookups.
     Ids { pending: VecDeque<[u8; 32]> },
     /// A k-way merge over descending range cursors on one index.
@@ -154,7 +155,7 @@ enum Mode {
 
 /// Which index a filter scans, one per filter, in strfry order: `ids`,
 /// `authors`+`kinds`, `authors`, smallest tag set, `kinds`, `created_at`.
-fn plan(filter: &Filter) -> Mode {
+pub(crate) fn plan(filter: &Filter) -> Mode {
     let since = filter.since().unwrap_or(0);
     let until = filter.until().unwrap_or(u64::MAX);
     if let Some(ids) = filter.ids() {
@@ -586,13 +587,13 @@ fn key_created_at(key: &[u8]) -> u64 {
 }
 
 /// seq = the last 8 bytes of a range key.
-fn key_seq(key: &[u8]) -> u64 {
+pub(crate) fn key_seq(key: &[u8]) -> u64 {
     key.get(key.len().saturating_sub(8)..)
         .and_then(|s| <&[u8; 8]>::try_from(s).ok())
         .map_or(0, |b| u64::from_be_bytes(*b))
 }
 
-fn decode_seq(bytes: &[u8]) -> Result<u64, StoreError> {
+pub(crate) fn decode_seq(bytes: &[u8]) -> Result<u64, StoreError> {
     let arr: &[u8; 8] = bytes
         .try_into()
         .map_err(|_| StoreError::Corrupt("bad seq value"))?;

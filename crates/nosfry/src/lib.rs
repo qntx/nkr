@@ -198,6 +198,7 @@ impl Server {
             high_water: config.relay.max_pending_outbound_bytes / 4,
             total_budget: config.relay.max_pending_outbound_bytes_total,
             max_filter_limit: config.relay.limits.max_filter_limit,
+            max_filter_limit_count: config.relay.limits.max_filter_limit_count,
         };
         let metrics = Arc::new(metrics::Metrics::new());
         // Process-wide pending outbound bytes, shared by every

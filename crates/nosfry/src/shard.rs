@@ -11,7 +11,7 @@ use nosfry_core::session::SubKey;
 use nosfry_lmdb::Store;
 use tokio::sync::mpsc;
 
-use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg, route};
+use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ScanKind, ShardMsg, route};
 
 /// Buffered matches per pending subscription before `CLOSED`.
 const PENDING_CAP: usize = 4096;
@@ -73,28 +73,35 @@ impl Shard {
     fn handle(&mut self, msg: ShardMsg) {
         match msg {
             ShardMsg::Register(mut start) => {
-                let state = self
-                    .conns
-                    .entry(start.conn)
-                    .and_modify(|state| state.out = start.out.clone())
-                    .or_insert_with(|| ConnState {
-                        out: start.out.clone(),
-                        pending: map(),
-                    });
-                state.pending.insert(
-                    start.sub.id.clone(),
-                    PendingSub {
-                        generation: start.sub.generation,
-                        buffer: VecDeque::new(),
-                    },
-                );
-                self.monitors.insert(
-                    start.conn,
-                    start.sub.clone(),
-                    Arc::clone(&start.filters),
-                    start.gate.clone(),
-                );
+                // The snapshot is assigned before the Start is queued
+                // on the reader, so a `Cancel` forwarded later can
+                // never overtake it.
                 start.snapshot = self.last_seq;
+                // A COUNT needs the snapshot but no live machinery:
+                // no monitor index, no pending buffer.
+                if start.kind == ScanKind::Req {
+                    let state = self
+                        .conns
+                        .entry(start.conn)
+                        .and_modify(|state| state.out = start.out.clone())
+                        .or_insert_with(|| ConnState {
+                            out: start.out.clone(),
+                            pending: map(),
+                        });
+                    state.pending.insert(
+                        start.sub.id.clone(),
+                        PendingSub {
+                            generation: start.sub.generation,
+                            buffer: VecDeque::new(),
+                        },
+                    );
+                    self.monitors.insert(
+                        start.conn,
+                        start.sub.clone(),
+                        Arc::clone(&start.filters),
+                        start.gate.clone(),
+                    );
+                }
                 drop(route(&self.readers, start.conn).send(ReaderMsg::Start(start)));
             }
             ShardMsg::Activate { conn, sub } => {
@@ -227,7 +234,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::channels::ScanStart;
+    use crate::channels::{ScanKind, ScanStart};
 
     fn event(kind: u16, content: &str) -> Arc<Event> {
         let keypair = Keypair::from_secret_key(&SecretKey::from_secret_bytes([7u8; 32]).unwrap());
@@ -280,6 +287,7 @@ mod tests {
         shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 1),
+            kind: ScanKind::Req,
             filters: filters(),
             out: out.clone(),
             gate: ReadGate::default(),
@@ -292,6 +300,7 @@ mod tests {
         shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 2),
+            kind: ScanKind::Req,
             filters: filters(),
             out,
             gate: ReadGate::default(),
@@ -338,6 +347,7 @@ mod tests {
         shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 1),
+            kind: ScanKind::Req,
             filters: filters(),
             out,
             gate: ReadGate::default(),
@@ -365,6 +375,7 @@ mod tests {
         shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 1),
+            kind: ScanKind::Req,
             filters: filters(),
             out,
             gate: ReadGate::default(),

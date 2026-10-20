@@ -107,6 +107,16 @@ pub(crate) enum ReaderMsg {
     },
 }
 
+/// What a `Register`/`Start` asks the shard and reader to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanKind {
+    /// Stored-event scan plus a live monitor (REQ).
+    Req,
+    /// Stored-event count only (NIP-45 `COUNT`): no monitor, no
+    /// pending buffer, no EOSE — one `["COUNT",…]` frame.
+    Count,
+}
+
 /// Arguments for [`ReaderMsg::Start`].
 #[derive(Debug)]
 pub(crate) struct ScanStart {
@@ -114,6 +124,8 @@ pub(crate) struct ScanStart {
     pub(crate) conn: ConnId,
     /// Subscription key (with generation).
     pub(crate) sub: SubKey,
+    /// Which scan the reader runs.
+    pub(crate) kind: ScanKind,
     /// Compiled filters.
     pub(crate) filters: Arc<[Filter]>,
     /// Read visibility snapshotted at REQ time.
@@ -162,6 +174,14 @@ pub(crate) enum Out {
         /// The CLOSED reason.
         reason: String,
     },
+    /// A finished NIP-45 `COUNT` answer; the connection writes it only
+    /// while `is_current` holds, then frees the sub slot.
+    Count {
+        /// Subscription key.
+        sub: SubKey,
+        /// The serialized `["COUNT",…]` frame.
+        text: String,
+    },
 }
 
 impl Out {
@@ -171,7 +191,7 @@ impl Out {
     #[must_use]
     pub(crate) fn accounted_bytes(&self) -> usize {
         match self {
-            Self::Frame { text, .. } => text.len(),
+            Self::Frame { text, .. } | Self::Count { text, .. } => text.len(),
             Self::Frames { texts, .. } => texts.iter().map(String::len).sum(),
             Self::Event { sub, event } => event.json().len() + sub.id.json().len() + 12,
             Self::Closed { sub, reason } => sub.id.json().len() + reason.len() + 14,

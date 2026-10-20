@@ -71,6 +71,11 @@ pub fn req_wire(sub_id: &str, filters: &str) -> String {
     format!("[\"REQ\",\"{sub_id}\",{filters}]")
 }
 
+/// A `COUNT` wire message.
+pub fn count_wire(sub_id: &str, filters: &str) -> String {
+    format!("[\"COUNT\",\"{sub_id}\",{filters}]")
+}
+
 /// A CLOSE wire message.
 pub fn close_wire(sub_id: &str) -> String {
     format!("[\"CLOSE\",\"{sub_id}\"]")

@@ -206,10 +206,13 @@ fn client_ip(config: &Config, headers: &header::HeaderMap, peer: IpAddr) -> IpAd
 pub(crate) fn nip11(config: &Config) -> String {
     let relay = &config.relay;
     let mut nips = vec![1, 9, 11, 40, 70];
+    if relay.limits.max_filter_limit_count > 0 {
+        nips.push(45);
+    }
     if !relay.auth.service_url.is_empty() {
         nips.push(42);
-        nips.sort_unstable();
     }
+    nips.sort_unstable();
     let mut doc = json!({
         "name": relay.info.name,
         "supported_nips": nips,
