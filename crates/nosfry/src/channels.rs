@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use nosfry_core::auth::ReadGate;
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
 use nosfry_core::message::{RelayVerb, SubId};
@@ -53,20 +54,12 @@ pub(crate) struct WriteRequest {
 /// Inbox item for a monitor shard thread.
 #[derive(Debug)]
 pub(crate) enum ShardMsg {
-    /// Register a subscription as pending; the shard forwards a
-    /// [`ReaderMsg::Start`] carrying the current snapshot — the highest
-    /// seq the shard has already received — so a `Cancel` it forwards
-    /// later can never be overtaken by the `Start`.
-    Register {
-        /// Owning connection.
-        conn: ConnId,
-        /// Subscription key (with generation).
-        sub: SubKey,
-        /// Compiled filters.
-        filters: Arc<[Filter]>,
-        /// Where matches and scan results go.
-        out: Outbound,
-    },
+    /// Register a subscription as pending (boxed: it dwarfs the other
+    /// variants); the shard fills `snapshot` with the current last seq
+    /// — the highest it has already received — and forwards it as
+    /// [`ReaderMsg::Start`], so a `Cancel` it forwards later can never
+    /// be overtaken by the `Start`.
+    Register(Box<ScanStart>),
     /// The historical scan finished: flush the pending buffer and mark
     /// the subscription active.
     Activate {
@@ -123,6 +116,8 @@ pub(crate) struct ScanStart {
     pub(crate) sub: SubKey,
     /// Compiled filters.
     pub(crate) filters: Arc<[Filter]>,
+    /// Read visibility snapshotted at REQ time.
+    pub(crate) gate: ReadGate,
     /// Snapshot seq S assigned by the shard.
     pub(crate) snapshot: u64,
     /// Where results go.

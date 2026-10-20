@@ -201,6 +201,7 @@ fn apply(
             sub: start.sub,
             scan: Scan::new(
                 start.filters,
+                start.gate,
                 start.snapshot,
                 max_filter_limit,
                 SystemTime::now()
@@ -233,6 +234,7 @@ fn apply(
 mod tests {
     use std::sync::Arc;
 
+    use nosfry_core::auth::ReadGate;
     use nosfry_core::filter::Filter;
     use nosfry_core::message::SubId;
     use nosfry_lmdb::StoreOptions;
@@ -291,6 +293,7 @@ mod tests {
                 generation: 1,
             },
             filters,
+            gate: ReadGate::default(),
             snapshot: u64::MAX,
             out,
         })))
@@ -349,6 +352,7 @@ mod tests {
                 generation: 1,
             },
             filters,
+            gate: ReadGate::default(),
             snapshot: 0,
             out,
         })))
@@ -400,6 +404,7 @@ mod tests {
                 generation: 1,
             },
             filters: Arc::clone(&all),
+            gate: ReadGate::default(),
             snapshot: u64::MAX,
             out: long_out,
         })))
@@ -417,6 +422,7 @@ mod tests {
                     generation: 1,
                 },
                 filters: Arc::clone(&one),
+                gate: ReadGate::default(),
                 snapshot: u64::MAX,
                 out,
             })))

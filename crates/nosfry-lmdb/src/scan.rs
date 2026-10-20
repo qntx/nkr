@@ -5,6 +5,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use nosfry_core::auth::ReadGate;
 use nosfry_core::event::{EventId, cmp_newest_first};
 use nosfry_core::filter::Filter;
 use nosfry_core::packed::PackedRef;
@@ -221,6 +222,8 @@ fn plan(filter: &Filter) -> Mode {
 #[derive(Debug)]
 pub struct Scan {
     filters: Arc<[Filter]>,
+    /// Read visibility snapshotted at REQ time.
+    gate: ReadGate,
     snapshot: u64,
     /// NIP-40 cutoff: events with `expiration <= now` are hidden.
     now: u64,
@@ -230,13 +233,21 @@ pub struct Scan {
 }
 
 impl Scan {
-    /// New scan over `filters`, bounded to entries with `seq <= snapshot`
-    /// and per-filter `Filter::effective_limit(max_filter_limit)`.
-    /// Events with an NIP-40 `expiration` at or before `now` are never
-    /// emitted and never count toward limits; `now = 0` disables the
-    /// check (expiration values are always `>= 100`).
+    /// New scan over `filters` under the read `gate`, bounded to
+    /// entries with `seq <= snapshot` and per-filter
+    /// `Filter::effective_limit(max_filter_limit)`.
+    /// Events with an NIP-40 `expiration` at or before `now` or refused
+    /// by `gate` are never emitted and never count toward limits;
+    /// `now = 0` disables the expiration check (expiration values are
+    /// always `>= 100`).
     #[must_use]
-    pub fn new(filters: Arc<[Filter]>, snapshot: u64, max_filter_limit: u64, now: u64) -> Self {
+    pub fn new(
+        filters: Arc<[Filter]>,
+        gate: ReadGate,
+        snapshot: u64,
+        max_filter_limit: u64,
+        now: u64,
+    ) -> Self {
         let plans = filters
             .iter()
             .map(|filter| {
@@ -257,6 +268,7 @@ impl Scan {
             .collect();
         Self {
             filters,
+            gate,
             snapshot,
             now,
             plans,
@@ -290,6 +302,7 @@ impl Scan {
             let mut step = Step {
                 store,
                 txn: &txn,
+                gate: &self.gate,
                 snapshot: self.snapshot,
                 now: self.now,
                 emitted: &mut self.emitted,
@@ -336,6 +349,8 @@ fn run_filters(
 struct Step<'a> {
     store: &'a Store,
     txn: &'a Reader<'a>,
+    /// Read visibility snapshotted at REQ time.
+    gate: &'a ReadGate,
     /// Upper bound on seqs this scan may emit.
     snapshot: u64,
     /// NIP-40 cutoff: events with `expiration <= now` are skipped.
@@ -532,6 +547,10 @@ fn try_candidate(
     // limit, even before the sweep removes it.
     let expiration = packed.expiration();
     if expiration != 0 && expiration <= step.now {
+        return Ok(());
+    }
+    // The read gate hides restricted kinds without consuming a limit.
+    if !step.gate.allows(packed) {
         return Ok(());
     }
     if filter.matches(packed) {

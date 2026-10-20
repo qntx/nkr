@@ -1182,6 +1182,7 @@ dependencies = [
  "faster-hex",
  "foldhash",
  "futures-util",
+ "getrandom 0.4.3",
  "hyper",
  "hyper-util",
  "nosfry-core",

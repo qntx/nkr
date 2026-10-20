@@ -66,6 +66,9 @@ pub enum ServerError {
     /// TOML parse failure.
     #[error("config: {0}")]
     Config(#[from] toml::de::Error),
+    /// Invalid `[relay.auth]` configuration.
+    #[error("config: relay.auth: {0}")]
+    Auth(#[from] nosfry_core::auth::AuthRulesError),
     /// The worker shutdown task failed.
     #[error("worker shutdown: {0}")]
     Shutdown(#[source] tokio::task::JoinError),
@@ -98,10 +101,8 @@ fn start_policy(cfg: &config::WritePolicy) -> Option<policy::WritePolicy> {
         .then(|| policy::WritePolicy::new(&cfg.plugin, Duration::from_secs(cfg.timeout_seconds)))
 }
 
-/// Apply reloaded configs until the `reload` channel closes: merge
-/// through [`Config::reloadable_from`], update the connection caps,
-/// and publish a fresh [`Live`]. The write-policy task is replaced
-/// only when its command or timeout changed.
+/// Apply reloaded configs until the `reload` channel closes, publishing
+/// a fresh [`Live`] for every valid one (see [`reload_once`]).
 async fn reload_loop(
     mut reload: watch::Receiver<Config>,
     live_tx: watch::Sender<Arc<Live>>,
@@ -110,28 +111,57 @@ async fn reload_loop(
 ) {
     while reload.changed().await.is_ok() {
         let incoming = reload.borrow_and_update().clone();
-        let (merged, ignored) = live.config.reloadable_from(incoming);
-        if !ignored.is_empty() {
-            tracing::warn!(?ignored, "restart-only keys ignored on config reload");
+        if let Some(next) = reload_once(incoming, &live, &limiter) {
+            live = next;
+            live_tx.send_replace(Arc::clone(&live));
         }
-        let merged = Arc::new(merged);
-        limiter.update_caps(
-            merged.relay.max_connections,
-            merged.relay.max_connections_per_ip,
-        );
-        let policy = if merged.relay.write_policy == live.config.relay.write_policy {
-            live.policy.clone()
-        } else {
-            start_policy(&merged.relay.write_policy)
-        };
-        live = Arc::new(Live {
-            config: Arc::clone(&merged),
-            limits: Arc::new(merged.limits()),
-            nip11: http::nip11(&merged).into(),
-            policy,
-        });
-        live_tx.send_replace(Arc::clone(&live));
-        tracing::info!("configuration reloaded");
+    }
+}
+
+/// One reload: merge, validate, then apply. Validation runs before any
+/// side effect, so a rejected reload leaves the connection caps, the
+/// write-policy task, and the limits exactly as they were (`None`).
+fn reload_once(
+    incoming: Config,
+    live: &Live,
+    limiter: &limiter::ConnectionLimiter,
+) -> Option<Arc<Live>> {
+    let (merged, ignored) = live.config.reloadable_from(incoming);
+    if !ignored.is_empty() {
+        tracing::warn!(?ignored, "restart-only keys ignored on config reload");
+    }
+    let limits = merged.limits().inspect_err(log_invalid_reload).ok()?;
+    Some(Arc::new(apply_reload(merged, limits, live, limiter)))
+}
+
+fn log_invalid_reload(err: &ServerError) {
+    tracing::error!(%err, "invalid reloaded config; keeping the running one");
+}
+
+/// Apply a validated reload: update the connection caps, replace the
+/// write-policy task only when its command or timeout changed, and
+/// build the next [`Live`].
+fn apply_reload(
+    merged: Config,
+    limits: nosfry_core::limits::Limits,
+    live: &Live,
+    limiter: &limiter::ConnectionLimiter,
+) -> Live {
+    limiter.update_caps(
+        merged.relay.max_connections,
+        merged.relay.max_connections_per_ip,
+    );
+    let policy = if merged.relay.write_policy == live.config.relay.write_policy {
+        live.policy.clone()
+    } else {
+        start_policy(&merged.relay.write_policy)
+    };
+    tracing::info!("configuration reloaded");
+    Live {
+        nip11: http::nip11(&merged).into(),
+        config: Arc::new(merged),
+        limits: Arc::new(limits),
+        policy,
     }
 }
 
@@ -246,7 +276,7 @@ impl Server {
         let metrics = Arc::new(metrics::Metrics::new());
         let (live_tx, live_rx) = watch::channel(Arc::new(Live {
             config: Arc::clone(&config),
-            limits: Arc::new(config.limits()),
+            limits: Arc::new(config.limits()?),
             nip11: http::nip11(&config).into(),
             policy: start_policy(&config.relay.write_policy),
         }));

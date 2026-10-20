@@ -566,7 +566,7 @@ async fn nip11_document() {
     for key in ["description", "pubkey", "contact", "icon"] {
         assert!(doc.get(key).is_none(), "{key} must be omitted when empty");
     }
-    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40]));
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 70]));
     assert_eq!(doc["software"], "https://github.com/qntx/nosfry");
     assert_eq!(doc["limitation"]["max_subscriptions"], 200);
     assert_eq!(
@@ -1763,6 +1763,34 @@ async fn reload_port_change_is_ignored() {
     relay.stop().await;
 }
 
+/// A reload whose merged config fails validation is rejected as a
+/// whole: no field — not the NIP-11 name, not the connection caps —
+/// is half-applied.
+#[tokio::test]
+async fn invalid_auth_reload_rejects_everything() {
+    let mut config = common::config();
+    config.relay.max_connections_per_ip = 2;
+    let relay = Relay::start_with(config).await;
+
+    let mut bad = reload_config("must not apply");
+    bad.relay.max_connections_per_ip = 1;
+    bad.relay.auth.service_url = "http://bad".into();
+    relay.reload(bad);
+    // Let the reload task consume (and reject) it. The name stays the
+    // startup value, and the lowered cap never applies: both checks
+    // must run before the sentinel reload below — a valid reload
+    // would set the caps again and hide a half-applied `1`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(nip11_name(relay.addr).await, "nosfry");
+    let _first = relay.connect().await;
+    let _second = relay.connect().await;
+
+    // The channel kept moving: a valid reload applies afterwards.
+    relay.reload(reload_config("sentinel"));
+    assert!(wait_until(|| async { nip11_name(relay.addr).await == "sentinel" }).await);
+    relay.stop().await;
+}
+
 /// The binary re-reads its config file on SIGHUP: a broken file logs
 /// an error and keeps the running configuration, a fixed one applies.
 #[cfg(unix)]
@@ -1829,4 +1857,200 @@ async fn sighup_reloads_config_and_ignores_broken() {
     drop(child.kill());
     drop(child.wait());
     assert!(applied, "SIGHUP never applied the fixed config");
+}
+
+/// `["AUTH", <signed 22242>]` answering `challenge` for `relay_url`.
+fn auth_wire(keypair: &secp256k1::Keypair, challenge: &str, relay_url: &str) -> String {
+    let ev = common::event(
+        keypair,
+        22_242,
+        now(),
+        &json!([["challenge", challenge], ["relay", relay_url]]),
+        "",
+    );
+    format!("[\"AUTH\",{}]", ev.json())
+}
+
+/// Relay config with NIP-42 enabled.
+fn auth_config() -> nosfry::config::Config {
+    let mut config = common::config();
+    config.relay.auth.service_url = "wss://relay.example.com".into();
+    config
+}
+
+#[tokio::test]
+async fn nip11_lists_42_only_with_auth_service_url() {
+    let relay = Relay::start_with(auth_config()).await;
+    let text = http_get(relay.addr, "/").await;
+    let doc = nip11_body(&text);
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 42, 70]));
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn auth_dm_flow_restricts_reads_to_involved() {
+    let relay = Relay::start_with(auth_config()).await;
+    let url = "wss://relay.example.com";
+    // Two stored DMs: key1->key2 and key3->key4.
+    let pk2 = faster_hex::hex_string(&key(2).x_only_public_key().0.to_byte_array());
+    let pk4 = faster_hex::hex_string(&key(4).x_only_public_key().0.to_byte_array());
+    let dm12 = common::event(&key(1), 4, now(), &json!([["p", pk2]]), "for 2");
+    let dm34 = common::event(&key(3), 4, now(), &json!([["p", pk4]]), "for 4");
+    let id12 = dm12.id().to_string();
+    let id34 = dm34.id().to_string();
+    let mut pub_ws = relay.connect().await;
+    for ev in [&dm12, &dm34] {
+        send_text(&mut pub_ws, &event_wire(ev)).await;
+        assert_eq!(recv_ok(&mut pub_ws, ev).await[2], true);
+    }
+
+    // Unauthenticated REQ for restricted kinds: challenge + CLOSED.
+    let mut ws_a = relay.connect().await;
+    send_text(&mut ws_a, &req_wire("sub", "{\"kinds\":[4]}")).await;
+    let auth = json(&recv_text(&mut ws_a, T).await);
+    assert_eq!(auth[0], "AUTH", "{auth}");
+    let challenge = auth[1].as_str().unwrap().to_owned();
+    let closed = json(&recv_text(&mut ws_a, T).await);
+    assert_eq!(closed[0], "CLOSED");
+    assert_eq!(
+        closed[2],
+        "auth-required: requested filter requires authentication"
+    );
+
+    // AUTH as key2, then the same REQ returns only DMs involving key2.
+    send_text(&mut ws_a, &auth_wire(&key(2), &challenge, url)).await;
+    let ok = json(&recv_text(&mut ws_a, T).await);
+    assert_eq!(ok[2], true, "{ok}");
+    let got = req_ids(&mut ws_a, "sub", "{\"kinds\":[4]}").await;
+    assert_eq!(got, vec![id12.clone()], "{got:?}");
+
+    // A third party authed as key3 sees only their own DM.
+    let mut ws_b = relay.connect().await;
+    send_text(&mut ws_b, &req_wire("probe", "{\"kinds\":[4]}")).await;
+    let auth = json(&recv_text(&mut ws_b, T).await);
+    let challenge_b = auth[1].as_str().unwrap().to_owned();
+    drop(json(&recv_text(&mut ws_b, T).await)); // CLOSED
+    send_text(&mut ws_b, &auth_wire(&key(3), &challenge_b, url)).await;
+    assert_eq!(json(&recv_text(&mut ws_b, T).await)[2], true);
+    let got = req_ids(&mut ws_b, "sub", "{\"kinds\":[4]}").await;
+    assert_eq!(got, vec![id34], "{got:?}");
+
+    // A live DM to key2 reaches ws_a's subscription but not ws_b's.
+    // OK on the publisher means the batch is already queued at every
+    // shard, so ws_b's barrier EOSE proves the probe ran.
+    let dm2 = common::event(&key(1), 4, now(), &json!([["p", pk2]]), "live");
+    send_text(&mut pub_ws, &event_wire(&dm2)).await;
+    assert_eq!(recv_ok(&mut pub_ws, &dm2).await[2], true);
+    send_text(&mut ws_b, &req_wire("barrier", "{\"kinds\":[1]}")).await;
+    let mut ws_b_events = Vec::new();
+    loop {
+        let frame = json(&recv_text(&mut ws_b, T).await);
+        match frame[0].as_str().unwrap() {
+            "EVENT" => ws_b_events.push(frame),
+            "EOSE" if frame[1] == "barrier" => break,
+            _ => {}
+        }
+    }
+    assert!(
+        ws_b_events.is_empty(),
+        "uninvolved conn got {ws_b_events:?}"
+    );
+    let live = json(&recv_text(&mut ws_a, T).await);
+    assert_eq!(live[0], "EVENT");
+    assert_eq!(live[1], "sub");
+    assert_eq!(live[2]["id"], dm2.id().to_string());
+
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn protected_event_requires_auth() {
+    let relay = Relay::start_with(auth_config()).await;
+    let url = "wss://relay.example.com";
+    let mut ws = relay.connect().await;
+    let protected = common::event(&key(7), 1, now(), &json!([["-"]]), "secret");
+    send_text(&mut ws, &event_wire(&protected)).await;
+    let auth = json(&recv_text(&mut ws, T).await);
+    assert_eq!(auth[0], "AUTH", "{auth}");
+    let challenge = auth[1].as_str().unwrap().to_owned();
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[2], false);
+    assert_eq!(ok[3], "auth-required: event marked as protected");
+    // Authenticate as the author, then the same event is accepted.
+    send_text(&mut ws, &auth_wire(&key(7), &challenge, url)).await;
+    assert_eq!(json(&recv_text(&mut ws, T).await)[2], true);
+    send_text(&mut ws, &event_wire(&protected)).await;
+    assert_eq!(recv_ok(&mut ws, &protected).await[2], true);
+    let got = req_ids(&mut ws, "s", "{}").await;
+    assert_eq!(got, vec![protected.id().to_string()]);
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn protected_event_blocked_without_auth_service() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let protected = common::event(&key(7), 1, now(), &json!([["-"]]), "secret");
+    send_text(&mut ws, &event_wire(&protected)).await;
+    let ok = recv_ok(&mut ws, &protected).await;
+    assert_eq!(ok[2], false);
+    assert_eq!(ok[3], "blocked: event marked as protected");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn write_policy_receives_authed_pubkey() {
+    let out_file = tempfile::tempdir().unwrap();
+    let out_path = out_file.path().join("req.jsonl");
+    let (_dir, plugin) = write_plugin(&format!(
+        "while IFS= read -r line; do printf '%s\\n' \"$line\" >> {}; printf '{{\"id\":\"%s\",\"action\":\"accept\"}}\\n' \"$(printf '%s' \"$line\" | sed -n 's/.*\"event\":{{\"id\":\"\\([0-9a-f]\\{{64\\}}\\)\".*/\\1/p')\"; done",
+        out_path.display()
+    ));
+    let mut config = policy_config(&plugin, 10);
+    config.relay.auth.service_url = "wss://relay.example.com".into();
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+    // Trigger the challenge with a restricted REQ, then AUTH.
+    send_text(&mut ws, &req_wire("x", "{\"kinds\":[4]}")).await;
+    let auth = json(&recv_text(&mut ws, T).await);
+    let challenge = auth[1].as_str().unwrap().to_owned();
+    drop(json(&recv_text(&mut ws, T).await));
+    send_text(
+        &mut ws,
+        &auth_wire(&key(5), &challenge, "wss://relay.example.com"),
+    )
+    .await;
+    assert_eq!(json(&recv_text(&mut ws, T).await)[2], true);
+    let ev = common::event(&key(5), 1, now(), &json!([]), "authed publish");
+    send_text(&mut ws, &event_wire(&ev)).await;
+    assert_eq!(recv_ok(&mut ws, &ev).await[2], true);
+    relay.stop().await;
+    let lines = std::fs::read_to_string(&out_path).unwrap();
+    let request: Value = serde_json::from_str(lines.trim()).unwrap();
+    assert_eq!(
+        request["authed"],
+        faster_hex::hex_string(&key(5).x_only_public_key().0.to_byte_array())
+    );
+}
+
+#[tokio::test]
+async fn restricted_kinds_stored_but_never_served_by_default() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    // Fully restricted REQ: refused outright, no AUTH (disabled).
+    send_text(&mut ws, &req_wire("sub", "{\"kinds\":[4]}")).await;
+    let closed = json(&recv_text(&mut ws, T).await);
+    assert_eq!(closed[0], "CLOSED");
+    assert_eq!(closed[2], "restricted: requested kinds are not served");
+    // A kind-4 event is still stored.
+    let dm = common::event(&key(8), 4, now(), &json!([]), "dm");
+    send_text(&mut ws, &event_wire(&dm)).await;
+    assert_eq!(recv_ok(&mut ws, &dm).await[2], true);
+    let note = common::event(&key(8), 1, now(), &json!([]), "note");
+    send_text(&mut ws, &event_wire(&note)).await;
+    assert_eq!(recv_ok(&mut ws, &note).await[2], true);
+    // A mixed REQ serves kind 1 but hides the kind 4.
+    let got = req_ids(&mut ws, "m", "{\"kinds\":[1,4]}").await;
+    assert_eq!(got, vec![note.id().to_string()], "{got:?}");
+    relay.stop().await;
 }

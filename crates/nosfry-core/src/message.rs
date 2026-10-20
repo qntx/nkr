@@ -167,18 +167,21 @@ pub enum RelayVerb {
     Notice,
     /// `["CLOSED", <sub>, <message>]`.
     Closed,
+    /// `["AUTH", "<challenge>"]` (NIP-42).
+    Auth,
     /// `["NEG-ERR", <sub>, <message>]`.
     NegErr,
 }
 
 impl RelayVerb {
     /// Every verb, for fixed-size per-verb tables.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Event,
         Self::Eose,
         Self::Ok,
         Self::Notice,
         Self::Closed,
+        Self::Auth,
         Self::NegErr,
     ];
 
@@ -191,6 +194,7 @@ impl RelayVerb {
             Self::Ok => "OK",
             Self::Notice => "NOTICE",
             Self::Closed => "CLOSED",
+            Self::Auth => "AUTH",
             Self::NegErr => "NEG-ERR",
         }
     }
@@ -581,6 +585,16 @@ pub fn notice_frame(message: &str) -> String {
     let mut out = String::with_capacity(12 + message.len());
     out.push_str("[\"NOTICE\",");
     out.push_str(&json_escape(message));
+    out.push(']');
+    out
+}
+
+/// `["AUTH","<challenge>"]` — the relay's NIP-42 challenge.
+#[must_use]
+pub fn auth_frame(challenge: &str) -> String {
+    let mut out = String::with_capacity(10 + challenge.len());
+    out.push_str("[\"AUTH\",");
+    out.push_str(&json_escape(challenge));
     out.push(']');
     out
 }

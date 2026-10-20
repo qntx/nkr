@@ -198,9 +198,14 @@ fn client_ip(config: &Config, headers: &header::HeaderMap, peer: IpAddr) -> IpAd
 /// stays unconditionally.
 pub(crate) fn nip11(config: &Config) -> String {
     let relay = &config.relay;
+    let mut nips = vec![1, 9, 11, 40, 70];
+    if !relay.auth.service_url.is_empty() {
+        nips.push(42);
+        nips.sort_unstable();
+    }
     let mut doc = json!({
         "name": relay.info.name,
-        "supported_nips": [1, 9, 11, 40],
+        "supported_nips": nips,
         "software": "https://github.com/qntx/nosfry",
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {

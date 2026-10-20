@@ -39,7 +39,13 @@ fn store() -> (tempfile::TempDir, Store) {
 /// `now = 0` disables the NIP-40 cutoff; pass a real `now` where
 /// expiry visibility is under test.
 fn collect_now(store: &Store, filters: Arc<[Filter]>, snapshot: u64, now: u64) -> Vec<String> {
-    let mut scan = Scan::new(filters, snapshot, 500, now);
+    let mut scan = Scan::new(
+        filters,
+        nosfry_core::auth::ReadGate::default(),
+        snapshot,
+        500,
+        now,
+    );
     let out = RefCell::new(Vec::new());
     loop {
         let progress = scan
@@ -257,7 +263,13 @@ fn scan_writes_between_steps_invisible() {
         .collect();
     store.write(&events).unwrap();
     let snap = store.snapshot().unwrap();
-    let mut scan = Scan::new(Arc::from([Filter::parse("{}").unwrap()]), snap, 500, 0);
+    let mut scan = Scan::new(
+        Arc::from([Filter::parse("{}").unwrap()]),
+        nosfry_core::auth::ReadGate::default(),
+        snap,
+        500,
+        0,
+    );
     let out = RefCell::new(Vec::new());
     let p1 = scan
         .step(&store, Duration::ZERO, &mut |_seq, j| {
@@ -432,7 +444,13 @@ fn scan_emits_first_group_before_step_ends() {
     let snapshot = store.snapshot().unwrap();
     let filters: Arc<[Filter]> =
         Arc::from([Filter::parse("{\"kinds\":[1],\"limit\":500}").unwrap()]);
-    let mut scan = Scan::new(filters, snapshot, 500, 0);
+    let mut scan = Scan::new(
+        filters,
+        nosfry_core::auth::ReadGate::default(),
+        snapshot,
+        500,
+        0,
+    );
     let mut emitted = 0usize;
     // A zero-budget step stops after BUDGET_CHECK_EVERY candidates; a
     // streaming scan has already flushed completed created_at groups.
@@ -870,4 +888,48 @@ fn scan_hides_expired_and_they_do_not_consume_limits() {
     assert_eq!(limited, vec![live.json().to_owned()]);
     // Export stays a raw dump: expired events are exported until swept.
     assert_eq!(export_lines(&store, 0, u64::MAX, false).len(), 2);
+}
+
+#[test]
+fn scan_gate_hides_restricted_and_they_do_not_consume_limits() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let dm = event(&k, 4, 200, &json!([["p", pk_hex(&key(2))]]), "dm");
+    let note = event(&k, 1, 100, &json!([]), "note");
+    let snap = store
+        .write(&[Arc::clone(&dm), Arc::clone(&note)])
+        .map(|_| store.snapshot().unwrap())
+        .unwrap();
+    let rules = Arc::new(nosfry_core::auth::AuthRules::new("", &[4], true).unwrap());
+    let collect_gated = |authed: &[nosfry_core::event::PublicKey], limit: &str| {
+        let gate = nosfry_core::auth::ReadGate::new(Arc::clone(&rules), Arc::from(authed));
+        let filters = Arc::from([Filter::parse(limit).unwrap()]);
+        let mut scan = Scan::new(filters, gate, snap, 500, 0);
+        let out = RefCell::new(Vec::new());
+        loop {
+            let progress = scan
+                .step(&store, Duration::ZERO, &mut |_seq, json| {
+                    out.borrow_mut().push(json.to_owned());
+                })
+                .unwrap();
+            if progress == Progress::Done {
+                break;
+            }
+        }
+        out.into_inner()
+    };
+    // Unauthenticated: the kind-4 event is hidden and does not count
+    // toward `limit` — newest-first with limit 1 still serves the note.
+    let hidden = collect_gated(&[], "{}");
+    assert_eq!(hidden, vec![note.json().to_owned()]);
+    let limited = collect_gated(&[], "{\"limit\":1}");
+    assert_eq!(limited, vec![note.json().to_owned()]);
+    // The p-tagged recipient sees both.
+    let involved = collect_gated(
+        &[nosfry_core::event::PublicKey(
+            key(2).x_only_public_key().0.to_byte_array(),
+        )],
+        "{}",
+    );
+    assert_eq!(involved, vec![dm.json().to_owned(), note.json().to_owned()]);
 }

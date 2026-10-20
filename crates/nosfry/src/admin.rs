@@ -7,6 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nosfry_core::auth::ReadGate;
 use nosfry_core::event::{Event, EventLimits, UnverifiedEvent};
 use nosfry_core::filter::{Filter, FilterError};
 use nosfry_lmdb::{Progress, Scan, Store, StoreError, WriteOutcome};
@@ -209,7 +210,13 @@ pub fn scan(
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let mut scan = Scan::new(Arc::from([filter]), store.snapshot()?, u64::MAX, now);
+    let mut scan = Scan::new(
+        Arc::from([filter]),
+        ReadGate::default(),
+        store.snapshot()?,
+        u64::MAX,
+        now,
+    );
     let mut count = 0u64;
     let mut write_err: Option<std::io::Error> = None;
     loop {
@@ -245,7 +252,13 @@ pub fn scan(
 ///
 /// [`AdminError::Store`] on store failure.
 pub fn delete(store: &Store, filter: Filter, dry_run: bool) -> Result<u64, AdminError> {
-    let mut scan = Scan::new(Arc::from([filter]), store.snapshot()?, u64::MAX, 0);
+    let mut scan = Scan::new(
+        Arc::from([filter]),
+        ReadGate::default(),
+        store.snapshot()?,
+        u64::MAX,
+        0,
+    );
     let mut count = 0u64;
     let mut seqs = Vec::new();
     loop {

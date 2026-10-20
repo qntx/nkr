@@ -11,7 +11,7 @@ use nosfry_core::session::SubKey;
 use nosfry_lmdb::Store;
 use tokio::sync::mpsc;
 
-use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ScanStart, ShardMsg, route};
+use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg, route};
 
 /// Buffered matches per pending subscription before `CLOSED`.
 const PENDING_CAP: usize = 4096;
@@ -72,38 +72,30 @@ impl Shard {
     /// Apply one inbox message.
     fn handle(&mut self, msg: ShardMsg) {
         match msg {
-            ShardMsg::Register {
-                conn,
-                sub,
-                filters,
-                out,
-            } => {
+            ShardMsg::Register(mut start) => {
                 let state = self
                     .conns
-                    .entry(conn)
-                    .and_modify(|state| state.out = out.clone())
+                    .entry(start.conn)
+                    .and_modify(|state| state.out = start.out.clone())
                     .or_insert_with(|| ConnState {
-                        out: out.clone(),
+                        out: start.out.clone(),
                         pending: map(),
                     });
                 state.pending.insert(
-                    sub.id.clone(),
+                    start.sub.id.clone(),
                     PendingSub {
-                        generation: sub.generation,
+                        generation: start.sub.generation,
                         buffer: VecDeque::new(),
                     },
                 );
-                self.monitors
-                    .insert(conn, sub.clone(), Arc::clone(&filters));
-                drop(
-                    route(&self.readers, conn).send(ReaderMsg::Start(Box::new(ScanStart {
-                        conn,
-                        sub,
-                        filters,
-                        snapshot: self.last_seq,
-                        out,
-                    }))),
+                self.monitors.insert(
+                    start.conn,
+                    start.sub.clone(),
+                    Arc::clone(&start.filters),
+                    start.gate.clone(),
                 );
+                start.snapshot = self.last_seq;
+                drop(route(&self.readers, start.conn).send(ReaderMsg::Start(start)));
             }
             ShardMsg::Activate { conn, sub } => {
                 let Some(state) = self.conns.get_mut(&conn) else {
@@ -226,6 +218,7 @@ pub(crate) fn run(
 )]
 #[cfg(test)]
 mod tests {
+    use nosfry_core::auth::ReadGate;
     use nosfry_core::event::{EventLimits, UnverifiedEvent};
     use nosfry_core::filter::Filter;
     use nosfry_lmdb::StoreOptions;
@@ -234,6 +227,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::channels::ScanStart;
 
     fn event(kind: u16, content: &str) -> Arc<Event> {
         let keypair = Keypair::from_secret_key(&SecretKey::from_secret_bytes([7u8; 32]).unwrap());
@@ -282,22 +276,26 @@ mod tests {
         let mut shard = Shard::new(&store, Arc::from([reader_tx]));
         let (out, mut out_rx) = Outbound::new(1 << 20);
 
-        shard.handle(ShardMsg::Register {
+        shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 1),
             filters: filters(),
             out: out.clone(),
-        });
+            gate: ReadGate::default(),
+            snapshot: 0,
+        })));
         shard.handle(ShardMsg::Remove {
             conn: 1,
             sub_id: SubId::parse("s").unwrap(),
         });
-        shard.handle(ShardMsg::Register {
+        shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 2),
             filters: filters(),
             out,
-        });
+            gate: ReadGate::default(),
+            snapshot: 0,
+        })));
         // The stale generation's scan finished late; Activate is ignored.
         shard.handle(ShardMsg::Activate {
             conn: 1,
@@ -335,12 +333,14 @@ mod tests {
 
         let batch: crate::channels::Batch = vec![(42u64, event(1, "hi"))];
         shard.handle(ShardMsg::Batch(Arc::new(batch)));
-        shard.handle(ShardMsg::Register {
+        shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 1),
             filters: filters(),
             out,
-        });
+            gate: ReadGate::default(),
+            snapshot: 0,
+        })));
 
         match reader_rx.try_recv() {
             Ok(ReaderMsg::Start(start)) => assert_eq!(start.snapshot, 42),
@@ -359,12 +359,14 @@ mod tests {
         let mut shard = Shard::new(&store, Arc::from([reader_tx]));
         let (out, _out_rx) = Outbound::new(1 << 20);
 
-        shard.handle(ShardMsg::Register {
+        shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
             sub: sub_key("s", 1),
             filters: filters(),
             out,
-        });
+            gate: ReadGate::default(),
+            snapshot: 0,
+        })));
         shard.handle(ShardMsg::Remove {
             conn: 1,
             sub_id: SubId::parse("s").unwrap(),

@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
+use nosfry_core::auth::ReadGate;
+use nosfry_core::event::PublicKey;
 use nosfry_core::filter::Filter;
 use nosfry_core::message::{RelayVerb, SubId, closed_frame, event_frame, notice_frame, ok_frame};
 use nosfry_core::session::{Command, Session, SubKey};
@@ -88,25 +90,32 @@ struct Connection<'a> {
 }
 
 impl<'a> Connection<'a> {
-    fn new(handle: &'a Handle, peer: IpAddr) -> (Self, mpsc::UnboundedReceiver<Out>) {
+    /// `None` when the per-connection NIP-42 challenge cannot be
+    /// generated — the connection ends without a close frame.
+    fn new(handle: &'a Handle, peer: IpAddr) -> Option<(Self, mpsc::UnboundedReceiver<Out>)> {
         let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         // Limits and the outbound budget are fixed at connect time;
         // reloads apply to the next connection.
         let live = handle.live.borrow().clone();
+        let mut challenge = [0u8; 16];
+        if let Err(err) = getrandom::fill(&mut challenge) {
+            tracing::error!(%err, conn, "cannot generate an AUTH challenge");
+            return None;
+        }
         let (out, out_rx) = Outbound::new(live.config.relay.max_pending_outbound_bytes);
-        (
+        Some((
             Self {
                 conn,
                 peer,
                 handle,
                 shard: route(&handle.shards, conn).clone(),
-                session: Session::new(Arc::clone(&live.limits)),
+                session: Session::new(Arc::clone(&live.limits), faster_hex::hex_string(&challenge)),
                 out,
                 ping_interval: Duration::from_secs(live.config.relay.auto_ping_seconds),
                 batch: VecDeque::new(),
             },
             out_rx,
-        )
+        ))
     }
 
     /// Handle one inbound frame; `false` means the connection ends.
@@ -184,8 +193,8 @@ impl<'a> Connection<'a> {
     /// Execute one session command.
     async fn command(&self, cmd: Command) {
         match cmd {
-            Command::Publish(event) => self.publish(event).await,
-            Command::Subscribe { sub, filters } => self.subscribe(sub, filters).await,
+            Command::Publish { event, authed } => self.publish(event, authed).await,
+            Command::Subscribe { sub, filters, gate } => self.subscribe(sub, filters, gate).await,
             Command::Unsubscribe { sub_id } => self.unsubscribe(sub_id).await,
             Command::Send { verb, text } => {
                 self.out.push(Out::Frame {
@@ -203,14 +212,18 @@ impl<'a> Connection<'a> {
     /// leaves `msg` empty; strfry would send a bare empty message),
     /// `shadowReject` answers `OK true` without storing or
     /// broadcasting.
-    async fn policy_accepts(&self, event: &nosfry_core::event::Event) -> bool {
+    async fn policy_accepts(
+        &self,
+        event: &nosfry_core::event::Event,
+        authed: Option<PublicKey>,
+    ) -> bool {
         // The policy is re-read per event so a config reload takes
         // effect on the next publish on every connection.
         let live = self.handle.live.borrow().clone();
         let Some(policy) = &live.policy else {
             return true;
         };
-        let (ok, message) = match policy.check(event, self.peer).await {
+        let (ok, message) = match policy.check(event, self.peer, authed).await {
             Decision::Accept => return true,
             Decision::Reject(m) if m.is_empty() => {
                 (false, "blocked: rejected by write policy".to_owned())
@@ -229,9 +242,9 @@ impl<'a> Connection<'a> {
     /// Run the write-policy plugin (when configured), then broadcast an
     /// ephemeral event or queue a stored write; the writer pushes the
     /// `OK` onto this connection's `Outbound` itself.
-    async fn publish(&self, event: Arc<nosfry_core::event::Event>) {
+    async fn publish(&self, event: Arc<nosfry_core::event::Event>, authed: Option<PublicKey>) {
         self.handle.metrics.event(u16::from(event.kind()));
-        if !self.policy_accepts(&event).await {
+        if !self.policy_accepts(&event, authed).await {
             return;
         }
         if event.kind().is_ephemeral() {
@@ -276,16 +289,18 @@ impl<'a> Connection<'a> {
     }
 
     /// Register a subscription with this connection's shard; the shard
-    /// starts the stored scan on the reader itself.
-    async fn subscribe(&self, sub: SubKey, filters: Arc<[Filter]>) {
+    /// assigns the scan snapshot and starts it on the reader itself.
+    async fn subscribe(&self, sub: SubKey, filters: Arc<[Filter]>, gate: ReadGate) {
         drop(
             self.shard
-                .send(ShardMsg::Register {
+                .send(ShardMsg::Register(Box::new(crate::channels::ScanStart {
                     conn: self.conn,
                     sub,
                     filters,
+                    gate,
+                    snapshot: 0,
                     out: self.out.clone(),
-                })
+                })))
                 .await,
         );
     }
@@ -464,7 +479,9 @@ impl<'a> Connection<'a> {
 
 /// Run one WebSocket connection until close, error, or shutdown.
 pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle, peer: IpAddr) {
-    let (mut conn, mut out_rx) = Connection::new(handle, peer);
+    let Some((mut conn, mut out_rx)) = Connection::new(handle, peer) else {
+        return;
+    };
     let mut ping = tokio::time::interval(conn.ping_interval);
     let mut last_inbound = Instant::now();
     let mut shutdown = handle.shutdown.clone();

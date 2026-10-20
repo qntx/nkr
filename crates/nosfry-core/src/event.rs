@@ -303,6 +303,34 @@ impl<'a> UnverifiedEvent<'a> {
         self.kind
     }
 
+    /// Whether any tag's first element is exactly `"-"` (the NIP-70
+    /// protected marker).
+    #[must_use]
+    pub fn is_protected(&self) -> bool {
+        self.tags
+            .iter()
+            .any(|tag| tag.first().is_some_and(|name| name.as_ref() == "-"))
+    }
+
+    /// Whether a kind-6/16 repost embeds a protected event: the raw
+    /// content contains the literal `["-"]` (strfry's substring rule —
+    /// the embedded JSON is deliberately not parsed).
+    #[must_use]
+    pub fn embeds_protected(&self) -> bool {
+        matches!(self.kind.0, 6 | 16) && self.content.contains("[\"-\"]")
+    }
+
+    /// The second element of every tag named `name`.
+    pub fn tag_values<'s>(&'s self, name: &'s str) -> impl Iterator<Item = &'s str> {
+        self.tags.iter().filter_map(move |tag| {
+            if tag.first().is_some_and(|n| n.as_ref() == name) {
+                tag.get(1).map(AsRef::as_ref)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Verify the id hash, build the canonical JSON and check its size,
     /// then verify the BIP-340 signature and build the packed record.
     /// `limits` bounds the canonical JSON size. The size check runs

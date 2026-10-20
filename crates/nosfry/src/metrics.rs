@@ -194,6 +194,7 @@ mod tests {
         metrics.client_message(ClientVerb::Req);
         metrics.relay_message(RelayVerb::Ok);
         metrics.relay_message(RelayVerb::Eose);
+        metrics.relay_message(RelayVerb::Auth);
         metrics.event(1);
         metrics.event(7);
         metrics.rate_limited(ClientVerb::Event);
@@ -208,6 +209,7 @@ mod tests {
              # TYPE nostr_relay_messages_total counter\n\
              nostr_relay_messages_total{verb=\"EOSE\"} 1\n\
              nostr_relay_messages_total{verb=\"OK\"} 1\n\
+             nostr_relay_messages_total{verb=\"AUTH\"} 1\n\
              # HELP nostr_events_total Verified events by kind.\n\
              # TYPE nostr_events_total counter\n\
              nostr_events_total{kind=\"1\"} 1\n\

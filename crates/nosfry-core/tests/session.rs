@@ -34,7 +34,7 @@ use secp256k1::Keypair;
 use secp256k1::schnorr;
 
 fn session() -> Session {
-    Session::new(Arc::new(Limits::default()))
+    Session::new(Arc::new(Limits::default()), "challenge".to_owned())
 }
 
 fn feed(session: &mut Session, now: u64, text: &str) -> Vec<Command> {
@@ -119,7 +119,7 @@ fn req_subscribes_and_is_current() {
     let mut s = session();
     let out = feed(&mut s, 1, "[\"REQ\",\"a\",{\"kinds\":[1]}]");
     assert_eq!(out.len(), 1);
-    let Command::Subscribe { sub, filters } = &out[0] else {
+    let Command::Subscribe { sub, filters, .. } = &out[0] else {
         panic!("expected Subscribe, got {out:?}");
     };
     assert_eq!(sub.id.as_str(), "a");
@@ -159,7 +159,7 @@ fn req_over_cap_closes() {
         },
         ..Limits::default()
     };
-    let mut s = Session::new(Arc::new(limits));
+    let mut s = Session::new(Arc::new(limits), "challenge".to_owned());
     feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
     let out = feed(&mut s, 2, "[\"REQ\",\"b\",{}]");
     let frames = sends(&out);
@@ -237,7 +237,7 @@ fn count_auth_neg_are_unsupported() {
     let auth = format!("[\"AUTH\",{}]", event_json(1, 22_242, "auth"));
     let out = feed(&mut s, 1, &auth);
     assert!(
-        sends(&out)[0].starts_with("[\"NOTICE\",\"unsupported:"),
+        sends(&out)[0].contains("unsupported: authentication is disabled"),
         "{out:?}"
     );
     for (text, sub) in [
@@ -257,7 +257,7 @@ fn count_auth_neg_are_unsupported() {
 fn event_publishes_when_valid() {
     let mut s = session();
     let out = feed(&mut s, 1_700_000_000, &signed_event(1_700_000_000, 1, "gm"));
-    assert!(matches!(out.as_slice(), [Command::Publish(_)]));
+    assert!(matches!(out.as_slice(), [Command::Publish { .. }]));
 }
 
 #[test]
@@ -294,7 +294,7 @@ fn ephemeral_event_past_window_rejected() {
     assert!(frames[0].contains(",false,"), "{}", frames[0]);
     // Same age on a regular kind passes the ephemeral window.
     let out = feed(&mut s, now, &signed_event(now - 61, 1, "gm"));
-    assert!(matches!(out.as_slice(), [Command::Publish(_)]));
+    assert!(matches!(out.as_slice(), [Command::Publish { .. }]));
 }
 
 #[test]
@@ -325,7 +325,7 @@ fn event_malformed_reports_id_or_notice() {
         },
         ..Limits::default()
     };
-    let mut s = Session::new(Arc::new(limits));
+    let mut s = Session::new(Arc::new(limits), "challenge".to_owned());
     let tagged =
         signed_event(1_700_000_000, 1, "gm").replace("\"tags\":[]", "\"tags\":[[\"t\",\"x\"]]");
     // The event id/signature are stale after tampering, but the limit
@@ -408,15 +408,21 @@ fn expired_event_is_rejected_invalid() {
     // Still-valid expiration reaches verification (Publish).
     let tags = format!("[[\"expiration\",\"{}\"]]", now + 100);
     let out = feed(&mut s, now, &signed_event_tags(now, 1, &tags, "fresh"));
-    assert!(matches!(out.last(), Some(Command::Publish(_))), "{out:?}");
+    assert!(
+        matches!(out.last(), Some(Command::Publish { .. })),
+        "{out:?}"
+    );
 }
 
 /// Session with caller-chosen rate limits over the default `Limits`.
 fn session_with_rate(rate: nosfry_core::limits::RateLimits) -> Session {
-    Session::new(Arc::new(Limits {
-        rate,
-        ..Limits::default()
-    }))
+    Session::new(
+        Arc::new(Limits {
+            rate,
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+    )
 }
 
 #[test]
@@ -474,20 +480,19 @@ fn req_over_limit_is_closed_rate_limited() {
     for _ in 0..100 {
         feed_ms(&mut s, t, "[\"REQ\",\"a\",{}]");
     }
+    // The refused re-REQ tears the open subscription down first.
     let out = feed_ms(&mut s, t, "[\"REQ\",\"a\",{}]");
     let frames = sends(&out);
     assert!(
-        frames[0].starts_with("[\"CLOSED\",\"a\",\"rate-limited: slow down\"")
-            || frames[0].contains("rate-limited: slow down"),
-        "{}",
-        frames[0]
-    );
-    // CLOSE is never charged: it still unsubscribes on an empty bucket.
-    let out = feed_ms(&mut s, t, "[\"CLOSE\",\"a\"]");
-    assert!(
-        matches!(out.as_slice(), [Command::Unsubscribe { .. }]),
+        matches!(
+            out.as_slice(),
+            [Command::Unsubscribe { .. }, Command::Send { .. }]
+        ) && frames[0].contains("rate-limited: slow down"),
         "{out:?}"
     );
+    // The subscription is gone: CLOSE is a no-op on an empty bucket.
+    let out = feed_ms(&mut s, t, "[\"CLOSE\",\"a\"]");
+    assert!(out.is_empty(), "{out:?}");
     // Unsupported verbs are not charged either.
     let out = feed_ms(&mut s, t, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
     assert!(sends(&out)[0].contains("unsupported:"), "{out:?}");
@@ -505,7 +510,10 @@ fn zero_rate_per_second_disables() {
     let text = signed_event(1_700_000_000, 1, "gm");
     for _ in 0..200 {
         let out = feed_ms(&mut s, 1_700_000_000_000, &text);
-        assert!(matches!(out.as_slice(), [Command::Publish(_)]), "{out:?}");
+        assert!(
+            matches!(out.as_slice(), [Command::Publish { .. }]),
+            "{out:?}"
+        );
     }
     for _ in 0..200 {
         let out = feed_ms(&mut s, 1_000, "[\"REQ\",\"a\",{}]");
@@ -606,4 +614,409 @@ fn rate_limited_flag_marks_refusals() {
     let (_, received) = receive(&mut s, t, "[\"CLOSE\",\"a\"]");
     assert_eq!(received.verb, Some(ClientVerb::Close));
     assert!(!received.rate_limited);
+}
+
+/// Session under auth rules: `url` empty disables AUTH; `kinds` are
+/// the restricted read kinds.
+fn session_auth(url: &str, kinds: &[u16], involved_only: bool) -> Session {
+    Session::new(
+        Arc::new(Limits {
+            auth: Arc::new(
+                nosfry_core::auth::AuthRules::new(url, kinds, involved_only).expect("auth rules"),
+            ),
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+    )
+}
+
+/// The pubkey hex of a signing `secret`.
+fn pubkey_hex(secret: [u8; 32]) -> String {
+    let keypair = Keypair::from_secret_bytes(secret).expect("secret key");
+    PublicKey(keypair.x_only_public_key().0.to_byte_array()).to_string()
+}
+
+/// Raw signed event JSON with `secret`, `tags` (raw JSON array).
+fn signed_event_json(
+    secret: [u8; 32],
+    created_at: u64,
+    kind: u16,
+    tags: &str,
+    content: &str,
+) -> String {
+    let keypair = Keypair::from_secret_bytes(secret).expect("secret key");
+    let pubkey = PublicKey(keypair.x_only_public_key().0.to_byte_array());
+    let tags_v: Vec<Vec<String>> = serde_json::from_str(tags).expect("tags json");
+    let preimage = serialize_for_id(&pubkey, created_at, Kind(kind), &tags_v, content);
+    let id = event_id(preimage.as_bytes());
+    let sig = schnorr::sign_no_aux_rand(&id.0, &keypair);
+    let mut sig_hex = String::with_capacity(128);
+    for b in sig.to_byte_array() {
+        write!(sig_hex, "{b:02x}").expect("write");
+    }
+    let content_json = serde_json::to_string(content).expect("content");
+    format!(
+        "{{\"id\":\"{id}\",\"pubkey\":\"{pubkey}\",\"created_at\":{created_at},\
+         \"kind\":{kind},\"tags\":{tags},\"content\":{content_json},\"sig\":\"{sig_hex}\"}}"
+    )
+}
+
+/// A valid `["AUTH",<event>]` frame for `secret` at `created_at`.
+fn auth_frame(secret: [u8; 32], created_at: u64) -> String {
+    let tags = r#"[["challenge","challenge"],["relay","wss://relay.example.com"]]"#;
+    format!(
+        "[\"AUTH\",{}]",
+        signed_event_json(secret, created_at, 22_242, tags, "")
+    )
+}
+
+#[test]
+fn req_fully_restricted_auth_disabled() {
+    let mut s = session_auth("", &[4], true);
+    let out = feed(&mut s, 1, "[\"REQ\",\"a\",{\"kinds\":[4]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"a\",\"restricted: requested kinds are not served\"]"],
+        "{out:?}"
+    );
+    assert!(
+        !out.iter().any(|c| matches!(c, Command::Subscribe { .. })),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn req_fully_restricted_challenges_once() {
+    let mut s = session_auth("wss://relay.example.com", &[4, 1059], true);
+    let out = feed(&mut s, 1, "[\"REQ\",\"a\",{\"kinds\":[4]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        [
+            "[\"AUTH\",\"challenge\"]",
+            "[\"CLOSED\",\"a\",\"auth-required: requested filter requires authentication\"]",
+        ],
+        "{out:?}"
+    );
+    // The challenge is sent at most once: a second restricted REQ is
+    // refused without another AUTH frame.
+    let out = feed(&mut s, 1, "[\"REQ\",\"b\",{\"kinds\":[4,1059]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"b\",\"auth-required: requested filter requires authentication\"]"],
+        "{out:?}"
+    );
+    assert_eq!(s.authenticated().len(), 0);
+}
+
+#[test]
+fn auth_then_same_req_subscribes() {
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let out = feed(&mut s, 1_700_000_000, &auth_frame([9; 32], 1_700_000_000));
+    let frames = sends(&out);
+    assert_eq!(frames.len(), 1, "{out:?}");
+    assert!(
+        frames[0].starts_with("[\"OK\",\"") && frames[0].ends_with(",true,\"\"]"),
+        "{out:?}"
+    );
+    assert_eq!(s.authenticated().len(), 1);
+    let out = feed(&mut s, 1_700_000_000, "[\"REQ\",\"a\",{\"kinds\":[4]}]");
+    assert!(
+        matches!(out.as_slice(), [Command::Subscribe { .. }]),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn auth_failures_report_exact_reasons() {
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let t = 1_700_000_000u64;
+    let fail = |out: &[Command], reason: &str| {
+        let frames = sends(out);
+        assert_eq!(frames.len(), 1, "{out:?}");
+        assert!(
+            frames[0].starts_with("[\"OK\",\"")
+                && frames[0].contains(&format!(",false,\"{reason}")),
+            "{out:?}"
+        );
+    };
+    // Wrong kind.
+    let event = signed_event_json(
+        [9; 32],
+        t,
+        1,
+        r#"[["challenge","challenge"],["relay","wss://relay.example.com"]]"#,
+        "",
+    );
+    fail(
+        &feed(&mut s, t, &format!("[\"AUTH\",{event}]")),
+        "invalid: AUTH event must be kind 22242",
+    );
+    // Stale (22242 is ephemeral: the 60 s window applies).
+    fail(
+        &feed(&mut s, t, &auth_frame([9; 32], t - 120)),
+        "invalid: ephemeral event created_at is too far in the past",
+    );
+    // Wrong challenge.
+    let tags = r#"[["challenge","nope"],["relay","wss://relay.example.com"]]"#;
+    fail(
+        &feed(
+            &mut s,
+            t,
+            &format!(
+                "[\"AUTH\",{}]",
+                signed_event_json([9; 32], t, 22_242, tags, "")
+            ),
+        ),
+        "invalid: challenge mismatch",
+    );
+    // Wrong relay.
+    let tags = r#"[["challenge","challenge"],["relay","wss://other.example.com"]]"#;
+    fail(
+        &feed(
+            &mut s,
+            t,
+            &format!(
+                "[\"AUTH\",{}]",
+                signed_event_json([9; 32], t, 22_242, tags, "")
+            ),
+        ),
+        "invalid: relay tag mismatch",
+    );
+    // Bad signature: valid id, corrupted sig.
+    let mut bad = auth_frame([9; 32], t);
+    let pos = bad.len() - 6;
+    bad.replace_range(
+        pos..pos + 2,
+        if &bad[pos..pos + 2] == "aa" {
+            "bb"
+        } else {
+            "aa"
+        },
+    );
+    fail(&feed(&mut s, t, &bad), "invalid: signature");
+}
+
+#[test]
+fn auth_relay_tag_normalization() {
+    let mut s = session_auth("wss://Relay.Example.com/path?x=1", &[4], true);
+    let tags = r#"[["challenge","challenge"],["relay","wss://RELAY.EXAMPLE.COM/other"]]"#;
+    let out = feed(
+        &mut s,
+        1_700_000_000,
+        &format!(
+            "[\"AUTH\",{}]",
+            signed_event_json([9; 32], 1_700_000_000, 22_242, tags, "")
+        ),
+    );
+    assert!(sends(&out)[0].ends_with(",true,\"\"]"), "{out:?}");
+}
+
+#[test]
+fn auth_multiple_pubkeys_and_cap() {
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let t = 1_700_000_000u64;
+    // Nine distinct keys: the first eight authenticate, the ninth is
+    // refused.
+    for i in 0..nosfry_core::auth::MAX_AUTHED_PUBKEYS {
+        let out = feed(
+            &mut s,
+            t,
+            &auth_frame([u8::try_from(i).unwrap() + 1; 32], t),
+        );
+        assert!(sends(&out)[0].ends_with(",true,\"\"]"), "{out:?}");
+    }
+    assert_eq!(s.authenticated().len(), 8);
+    let out = feed(&mut s, t, &auth_frame([99; 32], t));
+    assert!(
+        sends(&out)[0].ends_with("restricted: too many authenticated pubkeys\"]"),
+        "{out:?}"
+    );
+    // A repeat of an already-authed pubkey is idempotent.
+    let out = feed(&mut s, t, &auth_frame([1; 32], t));
+    assert!(sends(&out)[0].ends_with(",true,\"\"]"), "{out:?}");
+    assert_eq!(s.authenticated().len(), 8);
+}
+
+#[test]
+fn auth_charges_event_bucket() {
+    let rate = nosfry_core::limits::RateLimits {
+        events_per_second: 1,
+        events_burst: 1,
+        reqs_per_second: 0,
+        reqs_burst: 0,
+    };
+    let mut s = Session::new(
+        Arc::new(Limits {
+            auth: Arc::new(
+                nosfry_core::auth::AuthRules::new("wss://relay.example.com", &[4], true)
+                    .expect("auth rules"),
+            ),
+            rate,
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+    );
+    let t = 1_700_000_000_000u64;
+    let out = feed_ms(&mut s, t, &auth_frame([9; 32], 1_700_000_000));
+    assert!(sends(&out)[0].ends_with(",true,\"\"]"), "{out:?}");
+    let (_, received) = receive(&mut s, t, &auth_frame([10; 32], 1_700_000_000));
+    assert!(received.rate_limited);
+    assert_eq!(received.verb, Some(ClientVerb::Auth));
+}
+
+#[test]
+fn event_auth_kind_is_never_published() {
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let t = 1_700_000_000u64;
+    let tags = r#"[["challenge","challenge"],["relay","wss://relay.example.com"]]"#;
+    let event = signed_event_json([9; 32], t, 22_242, tags, "");
+    let out = feed(&mut s, t, &format!("[\"EVENT\",{event}]"));
+    assert!(
+        sends(&out)[0].ends_with("invalid: kind 22242 events are only accepted in AUTH\"]"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn protected_event_states() {
+    let t = 1_700_000_000u64;
+    let protected = |secret: [u8; 32]| {
+        format!(
+            "[\"EVENT\",{}]",
+            signed_event_json(secret, t, 1, "[[\"-\"]]", "for me only")
+        )
+    };
+    // AUTH disabled: outright blocked.
+    let mut s = session();
+    let out = feed(&mut s, t, &protected([9; 32]));
+    assert!(
+        sends(&out)[0].ends_with("blocked: event marked as protected\"]"),
+        "{out:?}"
+    );
+    // AUTH enabled, unauthenticated: challenge then auth-required.
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let out = feed(&mut s, t, &protected([9; 32]));
+    let frames = sends(&out);
+    assert_eq!(frames[0], "[\"AUTH\",\"challenge\"]");
+    assert!(
+        frames[1].ends_with("auth-required: event marked as protected\"]"),
+        "{out:?}"
+    );
+    // A second protected event does not re-send the challenge.
+    let out = feed(&mut s, t, &protected([8; 32]));
+    let frames = sends(&out);
+    assert_eq!(frames.len(), 1, "{out:?}");
+    // Authenticated as someone else: restricted.
+    feed(&mut s, t, &auth_frame([8; 32], t));
+    let out = feed(&mut s, t, &protected([9; 32]));
+    assert!(
+        sends(&out)[0].ends_with("restricted: must be published by the author\"]"),
+        "{out:?}"
+    );
+    // Authenticated as the author: published with `authed = author`.
+    feed(&mut s, t, &auth_frame([9; 32], t));
+    let out = feed(&mut s, t, &protected([9; 32]));
+    let [Command::Publish { authed, .. }] = out.as_slice() else {
+        panic!("expected Publish, got {out:?}");
+    };
+    assert_eq!(
+        *authed,
+        Some(PublicKey::from_hex(&pubkey_hex([9; 32])).unwrap())
+    );
+}
+
+#[test]
+fn repost_embedding_protected_is_blocked() {
+    let mut s = session();
+    let t = 1_700_000_000u64;
+    let content = "{\"kind\":4,\"tags\":[[\"-\"]]}";
+    let out = feed(
+        &mut s,
+        t,
+        &format!(
+            "[\"EVENT\",{}]",
+            signed_event_json([9; 32], t, 6, "[]", content)
+        ),
+    );
+    assert!(
+        sends(&out)[0].ends_with("blocked: reposts can't embed protected events\"]"),
+        "{out:?}"
+    );
+    // A kind-6 repost without the marker is published.
+    let out = feed(
+        &mut s,
+        t,
+        &format!(
+            "[\"EVENT\",{}]",
+            signed_event_json([9; 32], t, 6, "[]", "plain")
+        ),
+    );
+    assert!(
+        matches!(out.as_slice(), [Command::Publish { .. }]),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn mixed_req_gate_hides_restricted() {
+    let mut s = session_auth("wss://relay.example.com", &[4], true);
+    let out = feed(&mut s, 1, "[\"REQ\",\"a\",{\"kinds\":[1,4]}]");
+    let [Command::Subscribe { gate, .. }] = out.as_slice() else {
+        panic!("expected Subscribe, got {out:?}");
+    };
+    let ev = |kind: u16| {
+        nosfry_core::packed::PackedEvent::build(
+            &nosfry_core::event::EventId([1; 32]),
+            &PublicKey([2; 32]),
+            0,
+            Kind(kind),
+            0,
+            Vec::<Vec<String>>::new(),
+        )
+    };
+    let note = ev(1);
+    let dm = ev(4);
+    assert!(gate.allows(note.packed()));
+    assert!(!gate.allows(dm.packed()));
+}
+
+#[test]
+fn refused_re_req_closes_old_subscription() {
+    let mut s = session();
+    // Open "a", then re-REQ it with a filter that fails parsing.
+    feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
+    assert!(s.is_current(&nosfry_core::session::SubKey {
+        id: nosfry_core::message::SubId::parse("a").unwrap(),
+        generation: 1,
+    }));
+    let out = feed(&mut s, 1, "[\"REQ\",\"a\",{\"kinds\":[\"x\"]}]");
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::Unsubscribe { .. }, Command::Send { .. }]
+        ),
+        "{out:?}"
+    );
+    assert!(!s.is_current(&nosfry_core::session::SubKey {
+        id: nosfry_core::message::SubId::parse("a").unwrap(),
+        generation: 1,
+    }));
+    // Too many filters: same teardown before CLOSED.
+    let mut s = session();
+    feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
+    let many = format!(
+        "[\"REQ\",\"a\",{}]",
+        (0..=200).map(|_| "{}").collect::<Vec<_>>().join(",")
+    );
+    let out = feed(&mut s, 1, &many);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::Unsubscribe { .. }, Command::Send { .. }]
+        ),
+        "{out:?}"
+    );
 }

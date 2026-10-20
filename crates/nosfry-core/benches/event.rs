@@ -94,7 +94,12 @@ fn monitor_churn(c: &mut Criterion) {
     };
     let mut monitors: Monitors<u64> = Monitors::new();
     for conn in 0..10_000u64 {
-        monitors.insert(conn, key(0), Arc::clone(&filters));
+        monitors.insert(
+            conn,
+            key(0),
+            Arc::clone(&filters),
+            nosfry_core::auth::ReadGate::default(),
+        );
     }
     let mut group = c.benchmark_group("monitor");
     group.sample_size(10);
@@ -104,7 +109,12 @@ fn monitor_churn(c: &mut Criterion) {
             for conn in 0..10_000u64 {
                 monitors.remove(conn, &sub_id);
                 generation += 1;
-                monitors.insert(conn, key(generation), Arc::clone(&filters));
+                monitors.insert(
+                    conn,
+                    key(generation),
+                    Arc::clone(&filters),
+                    nosfry_core::auth::ReadGate::default(),
+                );
             }
         });
     });
