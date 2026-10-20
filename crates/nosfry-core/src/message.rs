@@ -173,11 +173,13 @@ pub enum RelayVerb {
     NegErr,
     /// `["COUNT", <sub>, {"count": n}]` (NIP-45).
     Count,
+    /// `["NEG-MSG", <sub>, <hex>]` (NIP-77).
+    NegMsg,
 }
 
 impl RelayVerb {
     /// Every verb, for fixed-size per-verb tables.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Event,
         Self::Eose,
         Self::Ok,
@@ -186,6 +188,7 @@ impl RelayVerb {
         Self::Auth,
         Self::NegErr,
         Self::Count,
+        Self::NegMsg,
     ];
 
     /// The wire string.
@@ -200,6 +203,7 @@ impl RelayVerb {
             Self::Auth => "AUTH",
             Self::NegErr => "NEG-ERR",
             Self::Count => "COUNT",
+            Self::NegMsg => "NEG-MSG",
         }
     }
 }
@@ -635,6 +639,33 @@ pub fn neg_err_frame(sub: &SubId, message: &str) -> String {
     out.push_str(sub.json());
     out.push(',');
     out.push_str(&json_escape(message));
+    out.push(']');
+    out
+}
+
+/// `["NEG-ERR", "<sub>", "<message>", <limit>]` — strfry's
+/// `blocked:` answer carries the cap as a fourth element.
+#[must_use]
+pub fn neg_err_frame_with_limit(sub: &SubId, message: &str, limit: u64) -> String {
+    let mut out = String::with_capacity(24 + sub.json().len() + message.len());
+    out.push_str("[\"NEG-ERR\",");
+    out.push_str(sub.json());
+    out.push(',');
+    out.push_str(&json_escape(message));
+    out.push(',');
+    out.push_str(&limit.to_string());
+    out.push(']');
+    out
+}
+
+/// `["NEG-MSG", "<sub>", "<hex>"]`.
+#[must_use]
+pub fn neg_msg_frame(sub: &SubId, hex: &str) -> String {
+    let mut out = String::with_capacity(16 + sub.json().len() + hex.len());
+    out.push_str("[\"NEG-MSG\",");
+    out.push_str(sub.json());
+    out.push(',');
+    out.push_str(&json_escape(hex));
     out.push(']');
     out
 }

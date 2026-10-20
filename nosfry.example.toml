@@ -48,6 +48,9 @@ max_pending_outbound_bytes = 33554432
 # unlimited). Over budget, scans pause only on connections already
 # more than one chunk behind; caught-up readers keep scanning.
 max_pending_outbound_bytes_total = 1073741824
+# Process-wide budget for sealed negentropy sync storages, accounted
+# at 40 bytes per scanned record (restart-only; 0 = unlimited).
+max_sync_memory_bytes = 1073741824
 # Maximum simultaneous WebSocket connections (0 = unlimited).
 max_connections = 0
 # Maximum simultaneous WebSocket connections per client IP (0 =
@@ -71,6 +74,10 @@ max_filter_limit = 500
 # Index entries a COUNT scan may examine before answering
 # `"approximate": true`; 0 disables COUNT (restart-only).
 max_filter_limit_count = 1000000
+# Records a negentropy sync may hold before answering
+# `blocked: too many query results`; 0 disables NEG-OPEN
+# (restart-only).
+max_sync_events = 1000000
 # Maximum `#x` conditions per filter.
 max_tags_per_filter = 3
 

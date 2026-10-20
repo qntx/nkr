@@ -77,9 +77,9 @@ impl Shard {
                 // on the reader, so a `Cancel` forwarded later can
                 // never overtake it.
                 start.snapshot = self.last_seq;
-                // A COUNT needs the snapshot but no live machinery:
-                // no monitor index, no pending buffer.
-                if start.kind == ScanKind::Req {
+                // A COUNT or sync needs the snapshot but no live
+                // machinery: no monitor index, no pending buffer.
+                if matches!(start.kind, ScanKind::Req) {
                     let state = self
                         .conns
                         .entry(start.conn)
@@ -133,6 +133,15 @@ impl Shard {
                 self.monitors.remove_connection(conn);
                 self.conns.remove(&conn);
                 drop(route(&self.readers, conn).send(ReaderMsg::CancelConn { conn }));
+            }
+            // Sync control shares the reader with its scan so a
+            // `NEG-MSG`/`NEG-CLOSE` cannot overtake the `Start`
+            // that created the session.
+            ShardMsg::NegMsg(neg) => {
+                drop(route(&self.readers, neg.conn).send(ReaderMsg::NegMsg(neg)));
+            }
+            ShardMsg::NegClose { conn, sub_id } => {
+                drop(route(&self.readers, conn).send(ReaderMsg::NegClose { conn, sub_id }));
             }
             ShardMsg::Batch(batch) => {
                 for (seq, event) in batch.iter() {

@@ -219,6 +219,39 @@ impl<'a> Connection<'a> {
             Command::Count { sub, filters, gate } => {
                 self.subscribe(sub, filters, gate, ScanKind::Count).await;
             }
+            Command::NegOpen {
+                sub,
+                filters,
+                gate,
+                msg,
+            } => {
+                self.subscribe(sub, filters, gate, ScanKind::Neg { msg })
+                    .await;
+            }
+            Command::NegMsg { sub, msg } => {
+                // The shard routes it to the same reader as the
+                // sync's `Start`, so it cannot overtake it.
+                drop(
+                    self.shard
+                        .send(ShardMsg::NegMsg(Box::new(crate::channels::NegMsg {
+                            conn: self.conn,
+                            sub,
+                            msg,
+                            out: self.out.clone(),
+                        })))
+                        .await,
+                );
+            }
+            Command::NegClose { sub_id } => {
+                drop(
+                    self.shard
+                        .send(ShardMsg::NegClose {
+                            conn: self.conn,
+                            sub_id,
+                        })
+                        .await,
+                );
+            }
             Command::Unsubscribe { sub_id } => self.unsubscribe(sub_id).await,
             Command::Send { verb, text } => {
                 self.out.push(Out::Frame {
@@ -472,6 +505,23 @@ impl<'a> Connection<'a> {
                 // The count is answered: free the sub slot. The scan
                 // already finished, so there is nothing to cancel.
                 self.session.close_by_relay(&sub);
+            }
+            Out::Neg { sub, text, closes } => {
+                if !self.session.is_current_neg(&sub) {
+                    return Ok(());
+                }
+                ws.feed(Frame::text(text.into_bytes())).await?;
+                // Every closing sync frame is a NEG-ERR.
+                self.handle.metrics.relay_message(if closes {
+                    RelayVerb::NegErr
+                } else {
+                    RelayVerb::NegMsg
+                });
+                if closes {
+                    // The sync errored: free the neg slot. The reader
+                    // already released its side.
+                    self.session.close_neg_by_relay(&sub);
+                }
             }
         }
         Ok(())

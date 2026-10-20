@@ -62,6 +62,10 @@ pub struct Relay {
     /// connections already more than one chunk behind (restart-only;
     /// 0 = unlimited).
     pub max_pending_outbound_bytes_total: usize,
+    /// Process-wide budget for sealed negentropy sync storages,
+    /// accounted at 40 bytes per scanned record (restart-only;
+    /// 0 = unlimited).
+    pub max_sync_memory_bytes: usize,
     /// Maximum simultaneous WebSocket connections (0 = unlimited).
     pub max_connections: usize,
     /// Maximum simultaneous WebSocket connections per client IP
@@ -202,6 +206,7 @@ impl Default for Relay {
             auto_ping_seconds: 55,
             max_pending_outbound_bytes: 33_554_432,
             max_pending_outbound_bytes_total: 1_073_741_824,
+            max_sync_memory_bytes: 1_073_741_824,
             max_connections: 0,
             max_connections_per_ip: 128,
             metrics: false,
@@ -300,8 +305,10 @@ impl Config {
     /// `relay.nofiles`, `relay.metrics` (route registration),
     /// `relay.query_timeslice_budget_microseconds`, `relay.threads`,
     /// `relay.limits.max_filter_limit`,
-    /// `relay.limits.max_filter_limit_count` (reader threads hold
-    /// them), `relay.max_pending_outbound_bytes_total` (ditto).
+    /// `relay.limits.max_filter_limit_count`,
+    /// `relay.limits.max_sync_events`, and
+    /// `relay.max_sync_memory_bytes` (reader threads hold them),
+    /// `relay.max_pending_outbound_bytes_total` (ditto).
     #[must_use]
     pub fn reloadable_from(&self, mut new: Self) -> (Self, Vec<&'static str>) {
         let mut ignored = Vec::new();
@@ -343,6 +350,14 @@ impl Config {
         if relay.limits.max_filter_limit_count != running.limits.max_filter_limit_count {
             ignored.push("relay.limits.max_filter_limit_count");
             relay.limits.max_filter_limit_count = running.limits.max_filter_limit_count;
+        }
+        if relay.limits.max_sync_events != running.limits.max_sync_events {
+            ignored.push("relay.limits.max_sync_events");
+            relay.limits.max_sync_events = running.limits.max_sync_events;
+        }
+        if relay.max_sync_memory_bytes != running.max_sync_memory_bytes {
+            ignored.push("relay.max_sync_memory_bytes");
+            relay.max_sync_memory_bytes = running.max_sync_memory_bytes;
         }
         if relay.max_pending_outbound_bytes_total != running.max_pending_outbound_bytes_total {
             ignored.push("relay.max_pending_outbound_bytes_total");
@@ -404,6 +419,8 @@ mod tests {
         new.relay.threads.readers = 9;
         new.relay.limits.max_filter_limit = 1;
         new.relay.limits.max_filter_limit_count = 1;
+        new.relay.limits.max_sync_events = 1;
+        new.relay.max_sync_memory_bytes = 1;
         new.relay.max_pending_outbound_bytes_total = 1;
         new.relay.info.name = "reloaded".into();
         new.relay.rate_limits.events_per_second = 5;
@@ -421,6 +438,8 @@ mod tests {
                 "relay.threads",
                 "relay.limits.max_filter_limit",
                 "relay.limits.max_filter_limit_count",
+                "relay.limits.max_sync_events",
+                "relay.max_sync_memory_bytes",
                 "relay.max_pending_outbound_bytes_total",
             ]
         );

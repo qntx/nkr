@@ -243,17 +243,20 @@ fn auth_neg_are_unsupported() {
         sends(&out)[0].contains("unsupported: authentication is disabled"),
         "{out:?}"
     );
-    for (text, sub) in [
-        ("[\"NEG-OPEN\",\"n\",{},\"aabb\"]", "n"),
-        ("[\"NEG-MSG\",\"m\",\"aabb\"]", "m"),
-        ("[\"NEG-CLOSE\",\"x\"]", "x"),
-    ] {
-        let out = feed(&mut s, 1, text);
-        assert!(
-            sends(&out)[0].starts_with(&format!("[\"NEG-ERR\",\"{sub}\",\"unsupported:")),
-            "{text}: {out:?}"
-        );
-    }
+    // NEG-OPEN succeeds (the sync is supported); NEG-MSG on an
+    // unknown id is `closed:`; NEG-CLOSE on an unknown id is silent.
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::NegOpen { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-MSG\",\"m\",\"aabb\"]");
+    assert!(
+        sends(&out)[0].starts_with("[\"NEG-ERR\",\"m\",\"closed:"),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-CLOSE\",\"x\"]");
+    assert!(out.is_empty(), "{out:?}");
 }
 
 #[test]
@@ -501,9 +504,12 @@ fn req_over_limit_is_closed_rate_limited() {
     // The subscription is gone: CLOSE is a no-op on an empty bucket.
     let out = feed_ms(&mut s, t, "[\"CLOSE\",\"a\"]");
     assert!(out.is_empty(), "{out:?}");
-    // Unsupported verbs are not charged either.
+    // NEG-OPEN shares the REQ bucket, so it is refused too.
     let out = feed_ms(&mut s, t, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
-    assert!(sends(&out)[0].contains("unsupported:"), "{out:?}");
+    assert!(
+        sends(&out)[0].contains("rate-limited: slow down"),
+        "{out:?}"
+    );
 }
 
 #[test]
@@ -1190,4 +1196,267 @@ fn authed_count_gate_hides_uninvolved_dms() {
     );
     assert!(gate.allows(involved.packed()));
     assert!(!gate.allows(other.packed()));
+}
+
+/// `NEG-OPEN` emits one `NegOpen` command carrying the one filter,
+/// the decoded message, and a read gate.
+#[test]
+fn neg_open_emits_negopen_command() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{\"kinds\":[1]},\"aabb\"]");
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::NegOpen {
+                sub,
+                filters,
+                msg,
+                ..
+            }] if sub.id.as_str() == "n"
+                && filters.len() == 1
+                && msg.as_ref() == [0xaa, 0xbb]
+        ),
+        "{out:?}"
+    );
+}
+
+/// Re-opening a sync id emits `NegClose` for the old generation
+/// before the new `NegOpen`; the session tracks the new generation.
+#[test]
+fn neg_reopen_replaces_session() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    let first = match &out[0] {
+        Command::NegOpen { sub, .. } => sub.clone(),
+        other => panic!("expected NegOpen, got {other:?}"),
+    };
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::NegClose { .. }, Command::NegOpen { sub, .. }]
+                if sub.generation > first.generation
+        ),
+        "{out:?}"
+    );
+    let Command::NegOpen { sub, .. } = &out[1] else {
+        unreachable!()
+    };
+    assert!(s.is_current_neg(sub));
+    assert!(!s.is_current_neg(&first));
+}
+
+/// `NEG-MSG` on an open id emits `NegMsg` with the current
+/// generation; an unknown id answers `closed: unknown subscription`.
+#[test]
+fn neg_msg_routes_by_id() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    let Command::NegOpen { sub, .. } = &out[0] else {
+        unreachable!()
+    };
+    let generation = sub.generation;
+    let out = feed(&mut s, 1, "[\"NEG-MSG\",\"n\",\"ccdd\"]");
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::NegMsg { sub, msg }]
+                if sub.generation == generation && msg.as_ref() == [0xcc, 0xdd]
+        ),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-MSG\",\"m\",\"ccdd\"]");
+    assert!(
+        sends(&out)[0] == "[\"NEG-ERR\",\"m\",\"closed: unknown subscription\"]",
+        "{out:?}"
+    );
+}
+
+/// `NEG-CLOSE` removes the sync and emits `NegClose` once; a second
+/// close is silent.
+#[test]
+fn neg_close_removes_session() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    let Command::NegOpen { sub, .. } = &out[0] else {
+        unreachable!()
+    };
+    assert!(s.is_current_neg(sub));
+    let out = feed(&mut s, 1, "[\"NEG-CLOSE\",\"n\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::NegClose { .. }]),
+        "{out:?}"
+    );
+    assert!(!s.is_current_neg(sub));
+    let out = feed(&mut s, 1, "[\"NEG-CLOSE\",\"n\"]");
+    assert!(out.is_empty(), "{out:?}");
+    // The closed id answers `closed:` again.
+    let out = feed(&mut s, 1, "[\"NEG-MSG\",\"n\",\"ccdd\"]");
+    assert!(
+        sends(&out)[0] == "[\"NEG-ERR\",\"n\",\"closed: unknown subscription\"]",
+        "{out:?}"
+    );
+}
+
+/// `close_neg_by_relay` removes only the matching generation.
+#[test]
+fn neg_close_by_relay_matches_generation() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    let Command::NegOpen { sub, .. } = &out[0] else {
+        unreachable!()
+    };
+    let stale = nosfry_core::session::SubKey {
+        id: sub.id.clone(),
+        generation: sub.generation + 1,
+    };
+    assert!(!s.close_neg_by_relay(&stale));
+    assert!(s.is_current_neg(sub));
+    assert!(s.close_neg_by_relay(sub));
+    assert!(!s.is_current_neg(sub));
+}
+
+/// `max_sync_events = 0` disables sync: `unsupported:` and any sync
+/// under the id is torn down.
+#[test]
+fn neg_disabled_is_unsupported() {
+    let mut s = Session::new(
+        Arc::new(Limits {
+            req: nosfry_core::limits::ReqLimits {
+                max_sync_events: 0,
+                ..nosfry_core::limits::ReqLimits::default()
+            },
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    );
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    assert!(
+        sends(&out)[0] == "[\"NEG-ERR\",\"n\",\"unsupported: negentropy sync\"]",
+        "{out:?}"
+    );
+    assert!(
+        !matches!(out[0], Command::NegOpen { .. } | Command::NegClose { .. }) || out.len() == 1
+    );
+}
+
+/// A refused `NEG-OPEN` on an open sync id emits `NegClose` then
+/// the `NEG-ERR`, so the old session does not linger.
+#[test]
+fn neg_refusal_closes_prior_sync() {
+    let mut s = session_with_rate(nosfry_core::limits::RateLimits {
+        reqs_per_second: 100,
+        reqs_burst: 100,
+        ..nosfry_core::limits::RateLimits::default()
+    });
+    let out = feed_ms(&mut s, 1, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    let Command::NegOpen { sub, .. } = &out[0] else {
+        unreachable!()
+    };
+    assert!(s.is_current_neg(sub));
+    let t = 1_000u64;
+    for _ in 0..100 {
+        feed_ms(&mut s, t, "[\"REQ\",\"r\",{}]");
+        feed_ms(&mut s, t, "[\"CLOSE\",\"r\"]");
+    }
+    // The bucket is empty: the re-open is refused and the old sync
+    // torn down first.
+    let out = feed_ms(&mut s, t, "[\"NEG-OPEN\",\"n\",{},\"aabb\"]");
+    let frames = sends(&out);
+    assert!(
+        matches!(
+            out.as_slice(),
+            [Command::NegClose { .. }, Command::Send { .. }]
+        ) && frames[0] == "[\"NEG-ERR\",\"n\",\"rate-limited: slow down\"]",
+        "{out:?}"
+    );
+    assert!(!s.is_current_neg(sub));
+}
+
+/// A fully restricted unauthenticated `NEG-OPEN` answers
+/// `auth-required:` (challenge issued) like a REQ.
+#[test]
+fn neg_fully_restricted_unauthenticated() {
+    let mut s = session_auth("ws://r", &[4], true);
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"n\",{\"kinds\":[4]},\"aabb\"]");
+    let frames = sends(&out);
+    assert!(frames[1].contains("auth-required:"), "{out:?}");
+    // No sync is open: a follow-up NEG-MSG answers `closed:`.
+    let out = feed(&mut s, 1, "[\"NEG-MSG\",\"n\",\"ccdd\"]");
+    assert!(
+        sends(&out)[0] == "[\"NEG-ERR\",\"n\",\"closed: unknown subscription\"]",
+        "{out:?}"
+    );
+}
+
+/// The sync namespace shares `max_subs_per_connection`: past the cap
+/// `NEG-OPEN` answers `error: too many open subscriptions`.
+#[test]
+fn neg_open_over_sub_cap() {
+    let mut s = Session::new(
+        Arc::new(Limits {
+            req: nosfry_core::limits::ReqLimits {
+                max_subs_per_connection: 1,
+                ..nosfry_core::limits::ReqLimits::default()
+            },
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    );
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"a\",{},\"aabb\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::NegOpen { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"b\",{},\"aabb\"]");
+    assert!(
+        sends(&out)[0].contains("too many open subscriptions"),
+        "{out:?}"
+    );
+}
+
+/// `subs` and `neg` are independent namespaces under the same id:
+/// `CLOSE` kills only the REQ, `NEG-CLOSE` only the sync.
+#[test]
+fn neg_and_req_share_id_not_state() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"REQ\",\"x\",{}]");
+    assert!(
+        matches!(out.as_slice(), [Command::Subscribe { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-OPEN\",\"x\",{},\"aabb\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::NegOpen { .. }]),
+        "{out:?}"
+    );
+    // CLOSE removes the REQ; the sync still answers NEG-MSG.
+    let out = feed(&mut s, 1, "[\"CLOSE\",\"x\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::Unsubscribe { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-MSG\",\"x\",\"ccdd\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::NegMsg { .. }]),
+        "{out:?}"
+    );
+    // NEG-CLOSE removes the sync; a REQ under the id is unaffected.
+    let out = feed(&mut s, 1, "[\"REQ\",\"x\",{}]");
+    assert!(
+        matches!(out.as_slice(), [Command::Subscribe { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-CLOSE\",\"x\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::NegClose { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 1, "[\"NEG-MSG\",\"x\",\"ccdd\"]");
+    assert!(
+        sends(&out)[0].contains("closed: unknown subscription"),
+        "{out:?}"
+    );
 }

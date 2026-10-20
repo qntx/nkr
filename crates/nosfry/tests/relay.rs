@@ -566,7 +566,7 @@ async fn nip11_document() {
     for key in ["description", "pubkey", "contact", "icon"] {
         assert!(doc.get(key).is_none(), "{key} must be omitted when empty");
     }
-    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 45, 70]));
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 45, 70, 77]));
     assert_eq!(doc["software"], "https://github.com/qntx/nosfry");
     assert_eq!(doc["limitation"]["max_subscriptions"], 200);
     assert_eq!(
@@ -2038,7 +2038,7 @@ async fn nip11_lists_42_only_with_auth_service_url() {
     let relay = Relay::start_with(auth_config()).await;
     let text = http_get(relay.addr, "/").await;
     let doc = nip11_body(&text);
-    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 42, 45, 70]));
+    assert_eq!(doc["supported_nips"], json!([1, 9, 11, 40, 42, 45, 70, 77]));
     relay.stop().await;
 }
 
@@ -2446,5 +2446,330 @@ async fn count_never_answers_for_a_replaced_id() {
         }
     }
     assert_eq!(events, 1);
+    relay.stop().await;
+}
+
+/// `["NEG-OPEN",sub,filter,"<hex>"]`.
+fn neg_open_wire(sub: &str, filter: &str, msg: &[u8]) -> String {
+    format!(
+        "[\"NEG-OPEN\",\"{sub}\",{filter},\"{}\"]",
+        faster_hex::hex_string(msg)
+    )
+}
+
+/// `["NEG-MSG",sub,"<hex>"]`.
+fn neg_msg_wire(sub: &str, msg: &[u8]) -> String {
+    format!(
+        "[\"NEG-MSG\",\"{sub}\",\"{}\"]",
+        faster_hex::hex_string(msg)
+    )
+}
+
+/// Hex-decode a wire payload.
+fn unhex(text: &str) -> Vec<u8> {
+    let mut buf = vec![0u8; text.len() / 2];
+    faster_hex::hex_decode(text.as_bytes(), &mut buf).unwrap();
+    buf
+}
+
+/// Run one negentropy session against the relay: `NEG-OPEN` plus
+/// `NEG-MSG` rounds until `reconcile_with_ids` finishes. Returns
+/// `(have, need)` — the ids the client has that the relay lacks
+/// (`have`), and the ids the relay has that the client still needs
+/// (`need`).
+async fn neg_sync(
+    ws: &mut yawc::TcpWebSocket,
+    sub: &str,
+    filter: &str,
+    records: &[(u64, [u8; 32])],
+) -> (Vec<String>, Vec<String>) {
+    use negentropy::{Id, Negentropy, NegentropyStorageVector};
+    let mut storage = NegentropyStorageVector::with_capacity(records.len());
+    for (created_at, id) in records {
+        storage
+            .insert(*created_at, Id::from_byte_array(*id))
+            .unwrap();
+    }
+    storage.seal().unwrap();
+    let mut neg = Negentropy::borrowed(&storage, 500_000).unwrap();
+    let init = neg.initiate().unwrap();
+    send_text(ws, &neg_open_wire(sub, filter, &init)).await;
+    let mut have_ids = Vec::new();
+    let mut need_ids = Vec::new();
+    loop {
+        let frame = json(&recv_text(ws, T).await);
+        assert_eq!(frame[0], "NEG-MSG", "{frame}");
+        assert_eq!(frame[1], sub, "{frame}");
+        let reply = unhex(frame[2].as_str().unwrap());
+        let next = neg
+            .reconcile_with_ids(&reply, &mut have_ids, &mut need_ids)
+            .unwrap();
+        match next {
+            Some(msg) => send_text(ws, &neg_msg_wire(sub, &msg)).await,
+            None => break,
+        }
+    }
+    let hexes = |ids: Vec<Id>| -> Vec<String> {
+        ids.iter()
+            .map(|id| faster_hex::hex_string(id.as_bytes()))
+            .collect()
+    };
+    (hexes(have_ids), hexes(need_ids))
+}
+
+/// Publish each event over `pub_ws`, asserting `OK true`.
+async fn publish_all(
+    pub_ws: &mut yawc::TcpWebSocket,
+    events: &[std::sync::Arc<nosfry_core::event::Event>],
+) {
+    for ev in events {
+        send_text(pub_ws, &event_wire(ev)).await;
+        assert_eq!(recv_ok(pub_ws, ev).await[2], true, "{ev:?}");
+    }
+}
+
+/// Both sides hold records the other lacks: after the rounds `have`
+/// equals exactly the relay-only ids and `need` the client-only ones.
+#[tokio::test]
+async fn neg_sync_reports_true_differences() {
+    let relay = Relay::start().await;
+    let mut pub_ws = relay.connect().await;
+    // Relay: 6 shared + 10 relay-only.
+    let mut events = Vec::new();
+    for i in 0..16u64 {
+        events.push(common::event(
+            &key(41),
+            1,
+            now() + i,
+            &json!([]),
+            &format!("e{i}"),
+        ));
+    }
+    publish_all(&mut pub_ws, &events).await;
+    // Client: the 6 shared + 5 fabricated client-only records.
+    let mut client: Vec<(u64, [u8; 32])> = events[..6]
+        .iter()
+        .map(|e| (e.created_at(), e.id().0))
+        .collect();
+    for i in 0..5u64 {
+        let mut id = [0xabu8; 32];
+        id[..8].copy_from_slice(&(i + 1).to_be_bytes());
+        client.push((now() + 100 + i, id));
+    }
+    let mut relay_only: Vec<String> = events[6..].iter().map(|e| e.id().to_string()).collect();
+    let mut client_only: Vec<String> = client[6..]
+        .iter()
+        .map(|(_, id)| faster_hex::hex_string(id))
+        .collect();
+    let mut ws = relay.connect().await;
+    let (mut have, mut need) = neg_sync(&mut ws, "s", "{}", &client).await;
+    have.sort_unstable();
+    need.sort_unstable();
+    relay_only.sort_unstable();
+    client_only.sort_unstable();
+    assert_eq!(have, client_only, "client-has wrong");
+    assert_eq!(need, relay_only, "client-needs wrong");
+    relay.stop().await;
+}
+
+/// A filter `limit` bounds the synced set like it bounds a REQ.
+#[tokio::test]
+async fn neg_open_honors_filter_limit() {
+    let relay = Relay::start().await;
+    let mut pub_ws = relay.connect().await;
+    let mut events = Vec::new();
+    for i in 0..10u64 {
+        events.push(common::event(
+            &key(42),
+            1,
+            now() + i,
+            &json!([]),
+            &format!("e{i}"),
+        ));
+    }
+    publish_all(&mut pub_ws, &events).await;
+    let mut ws = relay.connect().await;
+    // Newest-first, like a REQ: the 3 highest created_at.
+    let (have, mut need) = neg_sync(&mut ws, "s", "{\"limit\":3}", &[]).await;
+    let mut expected: Vec<String> = events[7..].iter().map(|e| e.id().to_string()).collect();
+    need.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(need, expected, "{need:?}");
+    assert_eq!(have, Vec::<String>::new());
+    relay.stop().await;
+}
+
+/// Over `max_sync_events` the relay answers `blocked:` with the
+/// configured cap as the fourth frame element.
+#[tokio::test]
+async fn neg_over_max_sync_events_is_blocked() {
+    let mut config = common::config();
+    config.relay.limits.max_sync_events = 2;
+    let relay = Relay::start_with(config).await;
+    let mut pub_ws = relay.connect().await;
+    let mut events = Vec::new();
+    for i in 0..5u64 {
+        events.push(common::event(
+            &key(43),
+            1,
+            now() + i,
+            &json!([]),
+            &format!("e{i}"),
+        ));
+    }
+    publish_all(&mut pub_ws, &events).await;
+    let mut ws = relay.connect().await;
+    // Any initial message reaches the same blocked path.
+    send_text(&mut ws, &neg_open_wire("s", "{}", &[0x61])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        frame,
+        json!(["NEG-ERR", "s", "blocked: too many query results", 2]),
+        "{frame}"
+    );
+    // The sync is closed: a NEG-MSG answers `closed:`.
+    send_text(&mut ws, &neg_msg_wire("s", &[0x61])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(frame[2], "closed: unknown subscription", "{frame}");
+    relay.stop().await;
+}
+
+/// Past the sync-memory budget the answer is `blocked: sync capacity
+/// exhausted`.
+#[tokio::test]
+async fn neg_over_sync_memory_budget_is_blocked() {
+    let mut config = common::config();
+    // Two records cost 80 bytes; the budget admits only one.
+    config.relay.max_sync_memory_bytes = 40;
+    let relay = Relay::start_with(config).await;
+    let mut pub_ws = relay.connect().await;
+    let mut events = Vec::new();
+    for i in 0..2u64 {
+        events.push(common::event(
+            &key(44),
+            1,
+            now() + i,
+            &json!([]),
+            &format!("e{i}"),
+        ));
+    }
+    publish_all(&mut pub_ws, &events).await;
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &neg_open_wire("s", "{}", &[0x61])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        frame,
+        json!(["NEG-ERR", "s", "blocked: sync capacity exhausted"]),
+        "{frame}"
+    );
+    relay.stop().await;
+}
+
+/// Restricted kinds are hidden from an unauthenticated sync: DMs are
+/// not reported as relay-has.
+#[tokio::test]
+async fn neg_restricted_kinds_hidden_from_unauthenticated() {
+    let relay = Relay::start_with(auth_config()).await;
+    let mut pub_ws = relay.connect().await;
+    let dm = common::event(&key(1), 4, now(), &json!([["p", pk_hex(2)]]), "dm");
+    let note = common::event(&key(5), 1, now(), &json!([]), "n1");
+    let note2 = common::event(&key(6), 1, now(), &json!([]), "n2");
+    publish_all(
+        &mut pub_ws,
+        &[
+            dm,
+            std::sync::Arc::clone(&note),
+            std::sync::Arc::clone(&note2),
+        ],
+    )
+    .await;
+    let mut ws = relay.connect().await;
+    let (have, mut need) = neg_sync(&mut ws, "s", "{}", &[]).await;
+    let mut expected: Vec<String> = [&note, &note2].iter().map(|e| e.id().to_string()).collect();
+    expected.sort_unstable();
+    need.sort_unstable();
+    assert_eq!(need, expected, "{need:?}");
+    assert_eq!(have, Vec::<String>::new());
+    relay.stop().await;
+}
+
+/// `NEG-CLOSE` then `NEG-MSG` answers `closed: unknown subscription`.
+#[tokio::test]
+async fn neg_close_then_msg_is_closed() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &neg_open_wire("s", "{}", &[0x61])).await;
+    // The initial reconcile answer arrives; the session exists.
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(frame[0], "NEG-MSG", "{frame}");
+    send_text(&mut ws, "[\"NEG-CLOSE\",\"s\"]").await;
+    send_text(&mut ws, &neg_msg_wire("s", &[0x61])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        frame,
+        json!(["NEG-ERR", "s", "closed: unknown subscription"]),
+        "{frame}"
+    );
+    relay.stop().await;
+}
+
+/// Re-opening the same id replaces the sync: the second storage's
+/// records drive the answers, not the first's.
+#[tokio::test]
+async fn neg_reopen_replaces_the_session() {
+    let relay = Relay::start().await;
+    let mut pub_ws = relay.connect().await;
+    let note = common::event(&key(46), 1, now(), &json!([]), "kind1");
+    let other = common::event(&key(46), 7, now(), &json!([]), "kind7");
+    publish_all(&mut pub_ws, &[note, std::sync::Arc::clone(&other)]).await;
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &neg_open_wire("s", "{\"kinds\":[1]}", &[0x61])).await;
+    // The first session's answer arrives; re-opening replaces it and
+    // `is_current_neg` gates any further stale-generation output.
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(frame[0], "NEG-MSG", "{frame}");
+    let (have, need) = neg_sync(&mut ws, "s", "{\"kinds\":[7]}", &[]).await;
+    assert_eq!(need, [other.id().to_string()], "{need:?}");
+    assert_eq!(have, Vec::<String>::new());
+    relay.stop().await;
+}
+
+/// `max_sync_events = 0` refuses `NEG-OPEN` as unsupported.
+#[tokio::test]
+async fn neg_disabled_is_unsupported() {
+    let mut config = common::config();
+    config.relay.limits.max_sync_events = 0;
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &neg_open_wire("s", "{}", &[0x61])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        frame,
+        json!(["NEG-ERR", "s", "unsupported: negentropy sync"]),
+        "{frame}"
+    );
+    relay.stop().await;
+}
+
+/// A malformed `NEG-MSG` answers `invalid:` and drops the session: a
+/// later `NEG-MSG` is `closed:`.
+#[tokio::test]
+async fn neg_malformed_msg_is_invalid() {
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    send_text(&mut ws, &neg_open_wire("s", "{}", &[0x61])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(frame[0], "NEG-MSG", "{frame}");
+    // A version byte outside 0x60-0x6f fails the protocol.
+    send_text(&mut ws, &neg_msg_wire("s", &[0x50])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        frame,
+        json!(["NEG-ERR", "s", "invalid: malformed negentropy message"]),
+        "{frame}"
+    );
+    send_text(&mut ws, &neg_msg_wire("s", &[0x61])).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(frame[2], "closed: unknown subscription", "{frame}");
     relay.stop().await;
 }

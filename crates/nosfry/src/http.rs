@@ -31,6 +31,9 @@ pub(crate) struct AppState {
     pub(crate) metrics: Arc<Metrics>,
     /// Simultaneous-connection caps.
     pub(crate) limiter: Arc<ConnectionLimiter>,
+    /// Process-wide reserved sync-storage bytes (the
+    /// `nosfry_sync_memory_bytes` gauge).
+    pub(crate) sync_memory: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Build the application router. `/metrics` exists only when
@@ -56,6 +59,7 @@ async fn metrics(State(state): State<AppState>) -> Response {
                 .conn
                 .outbound_total
                 .load(std::sync::atomic::Ordering::Relaxed),
+            state.sync_memory.load(std::sync::atomic::Ordering::Relaxed),
         ),
     )
         .into_response()
@@ -208,6 +212,9 @@ pub(crate) fn nip11(config: &Config) -> String {
     let mut nips = vec![1, 9, 11, 40, 70];
     if relay.limits.max_filter_limit_count > 0 {
         nips.push(45);
+    }
+    if relay.limits.max_sync_events > 0 {
+        nips.push(77);
     }
     if !relay.auth.service_url.is_empty() {
         nips.push(42);

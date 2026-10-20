@@ -86,6 +86,18 @@ pub(crate) enum ShardMsg {
     Batch(Arc<Batch>),
     /// An ephemeral event to broadcast (never stored).
     Ephemeral(Arc<Event>),
+    /// `NEG-MSG` for an open sync; routed to the same reader as the
+    /// `Register` so it cannot overtake the `Start` (boxed: it
+    /// dwarfs the other variants).
+    NegMsg(Box<NegMsg>),
+    /// `NEG-CLOSE` or a session-side sync drop: releases the
+    /// reader-side storage.
+    NegClose {
+        /// Owning connection.
+        conn: ConnId,
+        /// Sync subscription id.
+        sub_id: SubId,
+    },
 }
 
 /// Inbox item for a reader thread.
@@ -105,16 +117,31 @@ pub(crate) enum ReaderMsg {
         /// The connection.
         conn: ConnId,
     },
+    /// `NEG-MSG` for an open sync session.
+    NegMsg(Box<NegMsg>),
+    /// Release one sync session (`NEG-CLOSE`, replace, or relay drop).
+    NegClose {
+        /// Owning connection.
+        conn: ConnId,
+        /// Sync subscription id.
+        sub_id: SubId,
+    },
 }
 
 /// What a `Register`/`Start` asks the shard and reader to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum ScanKind {
     /// Stored-event scan plus a live monitor (REQ).
     Req,
     /// Stored-event count only (NIP-45 `COUNT`): no monitor, no
     /// pending buffer, no EOSE — one `["COUNT",…]` frame.
     Count,
+    /// A record-mode scan then a sealed storage the reader keeps for
+    /// `NEG-MSG` reconciliation (NIP-77).
+    Neg {
+        /// The client's initial `NEG-OPEN` reconcile message.
+        msg: Box<[u8]>,
+    },
 }
 
 /// Arguments for [`ReaderMsg::Start`].
@@ -133,6 +160,21 @@ pub(crate) struct ScanStart {
     /// Snapshot seq S assigned by the shard.
     pub(crate) snapshot: u64,
     /// Where results go.
+    pub(crate) out: Outbound,
+}
+
+/// A `NEG-MSG` forwarded to the reader owning the sync (boxed: it
+/// dwarfs the other variants).
+#[derive(Debug)]
+pub(crate) struct NegMsg {
+    /// Owning connection (also selects the reader).
+    pub(crate) conn: ConnId,
+    /// Sync subscription key (generation included: the reader rejects
+    /// messages for a stale session).
+    pub(crate) sub: SubKey,
+    /// Raw negentropy wire bytes.
+    pub(crate) msg: Box<[u8]>,
+    /// Where the reply goes (and `NEG-ERR`s on a missing session).
     pub(crate) out: Outbound,
 }
 
@@ -182,6 +224,16 @@ pub(crate) enum Out {
         /// The serialized `["COUNT",…]` frame.
         text: String,
     },
+    /// A `NEG-MSG`/`NEG-ERR` answer for a sync; `closes` is set on
+    /// every `NEG-ERR` because the session drops the sync on error.
+    Neg {
+        /// Sync subscription key.
+        sub: SubKey,
+        /// The serialized frame.
+        text: String,
+        /// The frame closes the sync (`NEG-ERR`).
+        closes: bool,
+    },
 }
 
 impl Out {
@@ -191,7 +243,9 @@ impl Out {
     #[must_use]
     pub(crate) fn accounted_bytes(&self) -> usize {
         match self {
-            Self::Frame { text, .. } | Self::Count { text, .. } => text.len(),
+            Self::Frame { text, .. } | Self::Count { text, .. } | Self::Neg { text, .. } => {
+                text.len()
+            }
             Self::Frames { texts, .. } => texts.iter().map(String::len).sum(),
             Self::Event { sub, event } => event.json().len() + sub.id.json().len() + 12,
             Self::Closed { sub, reason } => sub.id.json().len() + reason.len() + 14,

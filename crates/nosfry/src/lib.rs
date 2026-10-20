@@ -119,6 +119,21 @@ async fn reload_loop(
     }
 }
 
+/// Reader tunables derived from the startup config (restart-only:
+/// readers hold them for their lifetime).
+fn reader_tuning(config: &Config, sync_memory: &Arc<AtomicUsize>) -> reader::Tuning {
+    reader::Tuning {
+        budget: Duration::from_micros(config.relay.query_timeslice_budget_microseconds),
+        high_water: config.relay.max_pending_outbound_bytes / 4,
+        total_budget: config.relay.max_pending_outbound_bytes_total,
+        max_filter_limit: config.relay.limits.max_filter_limit,
+        max_filter_limit_count: config.relay.limits.max_filter_limit_count,
+        max_sync_events: config.relay.limits.max_sync_events,
+        max_sync_memory_bytes: config.relay.max_sync_memory_bytes,
+        sync_memory: Arc::clone(sync_memory),
+    }
+}
+
 /// One reload: merge, validate, then apply. Validation runs before any
 /// side effect, so a rejected reload leaves the connection caps, the
 /// write-policy task, and the limits exactly as they were (`None`).
@@ -193,18 +208,13 @@ impl Server {
         let store = Arc::new(Store::open(&config.db.path, &config.store_options())?);
         let monitors = config.relay.threads.monitors.max(1);
         let readers = config.relay.threads.readers.max(1);
-        let tuning = reader::Tuning {
-            budget: Duration::from_micros(config.relay.query_timeslice_budget_microseconds),
-            high_water: config.relay.max_pending_outbound_bytes / 4,
-            total_budget: config.relay.max_pending_outbound_bytes_total,
-            max_filter_limit: config.relay.limits.max_filter_limit,
-            max_filter_limit_count: config.relay.limits.max_filter_limit_count,
-        };
         let metrics = Arc::new(metrics::Metrics::new());
         // Process-wide pending outbound bytes, shared by every
-        // connection's `Outbound`.
+        // connection's `Outbound`; process-wide sealed-sync-storage
+        // bytes, shared by every reader.
         let outbound_total = Arc::new(AtomicUsize::new(0));
-
+        let sync_memory = Arc::new(AtomicUsize::new(0));
+        let tuning = reader_tuning(&config, &sync_memory);
         let mut threads = Vec::with_capacity(monitors + readers + 1);
         let (stop_tx, stop_rx) = watch::channel(false);
 
@@ -305,6 +315,7 @@ impl Server {
             state: http::AppState {
                 live: live_rx,
                 conn,
+                sync_memory,
                 metrics,
                 limiter: Arc::new(limiter::ConnectionLimiter::new(
                     config.relay.max_connections,
