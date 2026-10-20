@@ -98,7 +98,19 @@ pub(crate) fn run(
                     expire_backlog = false;
                 }
             }
+            clear_stale_readers(store);
         }
+    }
+}
+
+/// `mdb_reader_check`: clear lock-table slots left by readers whose
+/// process died mid-transaction (kill -9, `export | head`), which would
+/// otherwise pin old pages and grow `data.mdb` without bound.
+fn clear_stale_readers(store: &Store) {
+    match store.clear_stale_readers() {
+        Ok(0) => {}
+        Ok(cleared) => tracing::warn!(cleared, "cleared stale LMDB readers"),
+        Err(err) => tracing::error!(%err, "stale-reader check failed"),
     }
 }
 

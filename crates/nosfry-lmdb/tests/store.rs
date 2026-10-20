@@ -583,6 +583,25 @@ fn compact_to_refuses_existing_dest() {
     assert_eq!(std::fs::read(&dest).unwrap(), b"existing", "dest untouched");
 }
 
+/// A leftover `<dest>.tmp` — evidence of an interrupted compaction —
+/// refuses the run instead of being silently reused or clobbered.
+#[test]
+fn compact_to_refuses_stale_tmp() {
+    let (_dir, store) = store();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let dest = dest_dir.path().join("data.mdb");
+    let tmp = dest_dir.path().join("data.mdb.tmp");
+    std::fs::write(&tmp, b"partial").unwrap();
+
+    let err = store.compact_to(&dest).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Io(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+        "expected AlreadyExists for the tmp file, got {err}"
+    );
+    assert!(!dest.exists(), "dest must not be created");
+    assert_eq!(std::fs::read(&tmp).unwrap(), b"partial", "tmp untouched");
+}
+
 /// The author's pubkey hex for `a` tag values.
 fn pk_hex(keypair: &secp256k1::Keypair) -> String {
     format!("{}", keypair.x_only_public_key().0)

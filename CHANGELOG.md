@@ -158,6 +158,16 @@ down`; CLOSE is never charged.
 
 ### Fixed
 
+- A reader process killed while holding a read transaction left its
+  slot in `lock.mdb` permanently, so LMDB kept that reader's pages
+  pinned and `data.mdb` grew without bound. `Store::open` now runs
+  `mdb_reader_check` on startup and the relay's 10-second expiry sweep
+  reaps stale readers on every tick.
+- `nosfry compact` could leave a plausible-looking partial database at
+  the destination path when killed mid-copy. It now writes to
+  `<dest>.tmp`, fsyncs it, publishes by hard-linking to the final
+  name, and fsyncs the directory; a leftover `.tmp` file makes the
+  next run fail instead of clobbering it.
 - Protected events (`["-"]` tag) were accepted although NIP-70
   requires rejecting them by default; kind-6/16 reposts embedding a
   protected event are now blocked too.

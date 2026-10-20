@@ -33,7 +33,7 @@
 )]
 
 use std::ops::Bound;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use heed::CompactionOption;
@@ -281,6 +281,7 @@ impl Store {
         // SAFETY: the same env is not opened twice in one process, and the
         // map file is not modified incompatibly by other code.
         let env = unsafe { options.open(path)? };
+        env.clear_stale_readers()?;
 
         let mut wtxn = env.write_txn()?;
         let mut open_or_create = |name: &'static str| -> Result<BytesDb, StoreError> {
@@ -610,13 +611,30 @@ impl Store {
         Ok(count)
     }
 
-    /// Copy the environment to `dest` with LMDB compaction, producing a
-    /// single `data.mdb`-style file. `dest` must not already exist.
+    /// Check for stale entries in the reader lock table and clear them
+    /// (`mdb_reader_check`): readers whose process died without closing
+    /// their transaction would otherwise pin old pages forever, so
+    /// `data.mdb` grows without bound. Returns the cleared count.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Io`] when `dest` exists or cannot be created,
     /// [`StoreError::Heed`] on LMDB failure.
+    pub fn clear_stale_readers(&self) -> Result<usize, StoreError> {
+        Ok(self.env.clear_stale_readers()?)
+    }
+
+    /// Copy the environment to `dest` with LMDB compaction, producing a
+    /// single `data.mdb`-style file. `dest` must not already exist.
+    ///
+    /// The copy is written to `<dest>.tmp`, fsynced, then published by a
+    /// hard link that fails when `dest` exists — a crash mid-copy never
+    /// leaves a plausible-looking partial file under the final name.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Io`] when `dest` exists, `<dest>.tmp` exists or
+    /// cannot be created, or the publish fails, [`StoreError::Heed`] on
+    /// LMDB failure.
     pub fn compact_to(&self, dest: &Path) -> Result<(), StoreError> {
         if dest.exists() {
             return Err(std::io::Error::new(
@@ -625,8 +643,36 @@ impl Store {
             )
             .into());
         }
-        self.env.copy_to_path(dest, CompactionOption::Enabled)?;
-        Ok(())
+        let mut tmp_name = dest.as_os_str().to_os_string();
+        tmp_name.push(".tmp");
+        let tmp = PathBuf::from(tmp_name);
+        let mut file = std::fs::File::create_new(&tmp)?;
+        let copied = self
+            .env
+            .copy_to_file(&mut file, CompactionOption::Enabled)
+            .map_err(StoreError::from)
+            .and_then(|()| {
+                file.sync_all()?;
+                std::fs::hard_link(&tmp, dest)?;
+                std::fs::remove_file(&tmp)?;
+                #[cfg(unix)]
+                {
+                    let dir = dest
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    std::fs::File::open(dir)?.sync_all()?;
+                }
+                Ok(())
+            });
+        match copied {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                drop(file);
+                drop(std::fs::remove_file(&tmp));
+                Err(err)
+            }
+        }
     }
 
     fn next_seq(&self, txn: &Reader<'_>) -> Result<u64, StoreError> {
