@@ -46,6 +46,12 @@ events_per_second = 0
 events_burst = 0
 reqs_per_second = 0
 reqs_burst = 0
+# Per-address buckets would throttle the single-IP publishers;
+# the soak measures growth, not throttling.
+ip_events_per_second = 0
+ip_events_burst = 0
+ip_reqs_per_second = 0
+ip_reqs_burst = 0
 CONF
 
 taskset -c 0-3 "$BENCH/bin/$BIN" relay --config "$DIR/nosfry.toml" > "$DIR/relay.log" 2>&1 &
