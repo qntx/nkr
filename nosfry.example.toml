@@ -119,6 +119,12 @@ restricted_read_kinds = [4, 1059]
 # event (author or "p" tag); false serves them to any authed reader.
 restrict_read_to_involved = true
 
+[relay.management]
+# NIP-86 management API: POST / with application/nostr+json+rpc and a
+# NIP-98 auth event from one of these pubkeys. Empty = endpoint off.
+# The `u` check needs [relay] service_url.
+admins = []
+
 [relay.threads] # restart-only
 # Stored-scan reader threads.
 readers = 3

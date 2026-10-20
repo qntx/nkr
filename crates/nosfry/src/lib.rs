@@ -18,6 +18,7 @@ pub mod config;
 mod connection;
 mod http;
 mod limiter;
+mod management;
 mod metrics;
 mod policy;
 mod reader;
@@ -37,7 +38,7 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use nosfry_lmdb::Store;
+use nosfry_lmdb::{Moderation, Store};
 use rlimit as _;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
@@ -70,6 +71,9 @@ pub enum ServerError {
     /// Invalid `[relay] service_url`.
     #[error("config: relay.service_url: {0}")]
     ServiceUrl(#[from] nosfry_core::url::RelayUrlError),
+    /// Invalid `[relay.management] admins` entry.
+    #[error("config: relay.management.admins: {0}: not a 64-hex pubkey")]
+    Admins(String),
     /// The worker shutdown task failed.
     #[error("worker shutdown: {0}")]
     Shutdown(#[source] tokio::task::JoinError),
@@ -82,7 +86,7 @@ pub enum ServerError {
 /// `Arc` out of a `watch` borrow — never holding the borrow across an
 /// `.await` — so a reload never blocks a request. Restart-only fields
 /// (see [`Config::reloadable_from`]) stay frozen at startup values.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Live {
     /// Effective configuration.
     pub(crate) config: Arc<Config>,
@@ -129,11 +133,13 @@ async fn reload_loop(
     mut reload: watch::Receiver<Config>,
     live_tx: watch::Sender<Arc<Live>>,
     limiter: Arc<limiter::ConnectionLimiter>,
+    moderation: watch::Receiver<Arc<Moderation>>,
     mut live: Arc<Live>,
 ) {
     while reload.changed().await.is_ok() {
         let incoming = reload.borrow_and_update().clone();
-        if let Some(next) = reload_once(incoming, &live, &limiter) {
+        let snapshot = moderation.borrow().clone();
+        if let Some(next) = reload_once(incoming, &live, &limiter, &snapshot) {
             live = next;
             live_tx.send_replace(Arc::clone(&live));
         }
@@ -162,13 +168,16 @@ fn reload_once(
     incoming: Config,
     live: &Live,
     limiter: &limiter::ConnectionLimiter,
+    moderation: &Moderation,
 ) -> Option<Arc<Live>> {
     let (merged, ignored) = live.config.reloadable_from(incoming);
     if !ignored.is_empty() {
         tracing::warn!(?ignored, "restart-only keys ignored on config reload");
     }
     let limits = merged.limits().inspect_err(log_invalid_reload).ok()?;
-    Some(Arc::new(apply_reload(merged, limits, live, limiter)))
+    Some(Arc::new(apply_reload(
+        merged, limits, live, limiter, moderation,
+    )))
 }
 
 fn log_invalid_reload(err: &ServerError) {
@@ -183,6 +192,7 @@ fn apply_reload(
     limits: nosfry_core::limits::Limits,
     live: &Live,
     limiter: &limiter::ConnectionLimiter,
+    moderation: &Moderation,
 ) -> Live {
     limiter.update_caps(
         merged.relay.max_connections,
@@ -196,7 +206,7 @@ fn apply_reload(
     };
     tracing::info!("configuration reloaded");
     Live {
-        nip11: http::nip11(&merged).into(),
+        nip11: http::nip11(&merged, moderation).into(),
         config: Arc::new(merged),
         limits: Arc::new(limits),
         policy,
@@ -281,12 +291,18 @@ impl Server {
             );
         }
 
+        // NIP-86 state persisted in the store becomes the first
+        // snapshot; the management handler publishes the snapshot the
+        // writer returns after each applied op.
+        let moderation = Arc::new(store.moderation()?);
+        let (mod_tx, mod_rx) = watch::channel(Arc::clone(&moderation));
+
         // The live-config channel exists before the writer spawn so
         // the vanish path re-reads `service_url` on every batch.
         let (live_tx, live_rx) = watch::channel(Arc::new(Live {
             config: Arc::clone(&config),
             limits: Arc::new(config.limits()?),
-            nip11: http::nip11(&config).into(),
+            nip11: http::nip11(&config, &moderation).into(),
             policy: start_policy(&config.relay.write_policy),
         }));
 
@@ -326,6 +342,7 @@ impl Server {
             writer: writer_tx.clone(),
             shards: Arc::from(shard_txs.as_slice()),
             live: live_rx.clone(),
+            moderation: mod_rx.clone(),
             metrics: Arc::clone(&metrics),
             outbound_total,
             shutdown: stop_rx,
@@ -337,6 +354,9 @@ impl Server {
                 conn,
                 sync_memory,
                 metrics,
+                moderation: mod_rx,
+                mod_tx,
+                live_tx: live_tx.clone(),
                 limiter: Arc::new(limiter::ConnectionLimiter::new(
                     config.relay.max_connections,
                     config.relay.max_connections_per_ip,
@@ -501,6 +521,7 @@ pub async fn serve(
         reload,
         server.live_tx.clone(),
         Arc::clone(&server.state.limiter),
+        server.state.moderation.clone(),
         server.live_tx.borrow().clone(),
     ));
     let stop = server.stop_tx.clone();

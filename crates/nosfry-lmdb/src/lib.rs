@@ -19,11 +19,19 @@
 //! | `ix_expiration` | `expiration` ‖ `seq` | — |
 //! | `ix_deletion` | event `id` ‖ `author` ‖ kind-5 `seq` | — |
 //! | `ix_replace_deletion` | `address` ‖ kind-5 `created_at` ‖ kind-5 `seq` | — |
+//! | `ix_vanish` | `pubkey` | vanish point `T` (u64, max of requests) |
+//! | `vanish_pending` | `pubkey` | resume cursor for NIP-62 cleanup |
+//! | `mod_pubkeys` | `pubkey` | state byte ‖ reason |
+//! | `mod_events` | event `id` | reason |
+//! | `mod_kinds` | `kind` | state byte |
+//! | `mod_ips` | canonical `IpAddr` string | reason |
+//! | `mod_info` | `name`/`description`/`icon` | UTF-8 value |
 //!
 //! The last three index the event carrying the metadata: an expiring
 //! event owns its `ix_expiration` row, a kind-5 event owns its
 //! `ix_deletion`/`ix_replace_deletion` rows, so deleting the carrier
-//! removes the metadata (and lifts a deletion block) with it.
+//! removes the metadata (and lifts a deletion block) with it. The
+//! `mod_*` tables are the NIP-86 management state.
 #![cfg_attr(
     test,
     allow(
@@ -32,6 +40,8 @@
     )
 )]
 
+use std::collections::{BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,7 +61,7 @@ pub use count::{CountResult, CountScan};
 pub use scan::{Progress, Scan};
 
 /// On-disk format version, stored under the `format` meta key.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 type BytesDb = Database<Bytes, Bytes>;
 type Reader<'a> = RoTxn<'a, WithoutTls>;
@@ -119,6 +129,163 @@ pub struct VanishStep {
     pub deleted: usize,
     /// `vanish_pending` still holds work — call again.
     pub more: bool,
+}
+
+/// `mod_pubkeys`/`mod_kinds` state bytes: a single row per key carries
+/// the current state, so ban↔allow and allow↔disallow exclusivity is
+/// automatic on `put`.
+const ST_BANNED: u8 = 0;
+const ST_ALLOWED: u8 = 1;
+const ST_DISALLOWED: u8 = 2;
+
+/// A NIP-86 management operation applied by [`Store::moderate`].
+#[derive(Debug)]
+pub enum ModOp {
+    /// Ban `pubkey` (also drops its allow entry).
+    BanPubkey {
+        /// The author to ban.
+        pubkey: PublicKey,
+        /// Optional operator note, returned by `listbannedpubkeys`.
+        reason: Option<String>,
+    },
+    /// Remove `pubkey`'s ban (does not touch an allow entry).
+    UnbanPubkey {
+        /// The author to unban.
+        pubkey: PublicKey,
+    },
+    /// Allow-list `pubkey` (also drops its ban).
+    AllowPubkey {
+        /// The author to allow.
+        pubkey: PublicKey,
+        /// Optional operator note.
+        reason: Option<String>,
+    },
+    /// Remove `pubkey` from the allow list (does not touch a ban).
+    UnallowPubkey {
+        /// The author to remove.
+        pubkey: PublicKey,
+    },
+    /// Ban `id` and delete the stored event in the same transaction.
+    BanEvent {
+        /// The event id to ban.
+        id: EventId,
+        /// Optional operator note.
+        reason: Option<String>,
+    },
+    /// Remove `id` from the ban list.
+    UnbanEvent {
+        /// The event id to unban.
+        id: EventId,
+    },
+    /// Allow `kind` (also drops a disallow entry).
+    AllowKind {
+        /// The kind number.
+        kind: u16,
+    },
+    /// Disallow `kind` (also drops an allow entry).
+    DisallowKind {
+        /// The kind number.
+        kind: u16,
+    },
+    /// Block `ip` from connecting; stored in canonical form.
+    BlockIp {
+        /// The address to block.
+        ip: IpAddr,
+        /// Optional operator note.
+        reason: Option<String>,
+    },
+    /// Remove `ip` from the block list.
+    UnblockIp {
+        /// The address to unblock.
+        ip: IpAddr,
+    },
+    /// Override a NIP-11 info field (takes precedence over config).
+    SetInfo {
+        /// Which field.
+        field: InfoField,
+        /// The new value; an empty string overrides with empty.
+        value: String,
+    },
+}
+
+/// A NIP-11 info field writable through [`ModOp::SetInfo`].
+#[derive(Debug, Clone, Copy)]
+pub enum InfoField {
+    /// `changerelayname`.
+    Name,
+    /// `changerelaydescription`.
+    Description,
+    /// `changerelayicon`.
+    Icon,
+}
+
+impl InfoField {
+    /// The `mod_info` key.
+    const fn key(self) -> &'static [u8] {
+        match self {
+            Self::Name => b"name",
+            Self::Description => b"description",
+            Self::Icon => b"icon",
+        }
+    }
+}
+
+/// The full NIP-86 state, loaded at startup and rebuilt after every
+/// applied [`ModOp`]. Hot paths read an `Arc<Moderation>` out of a
+/// watch — lookups never touch LMDB.
+#[derive(Debug, Default, Clone)]
+pub struct Moderation {
+    /// `mod_pubkeys` rows with the banned state, pubkey → reason.
+    pub banned_pubkeys: HashMap<PublicKey, Option<Box<str>>>,
+    /// `mod_pubkeys` rows with the allowed state. Non-empty switches
+    /// the relay to allow-list mode.
+    pub allowed_pubkeys: HashMap<PublicKey, Option<Box<str>>>,
+    /// `mod_events` rows, event id → reason.
+    pub banned_events: HashMap<EventId, Option<Box<str>>>,
+    /// `mod_kinds` rows with the allowed state. Non-empty switches the
+    /// relay to allow-list mode for kinds.
+    pub allowed_kinds: BTreeSet<u16>,
+    /// `mod_kinds` rows with the disallowed state.
+    pub disallowed_kinds: BTreeSet<u16>,
+    /// `mod_ips` rows, canonical address → reason.
+    pub blocked_ips: HashMap<IpAddr, Option<Box<str>>>,
+    /// `mod_info["name"]` NIP-11 override.
+    pub name: Option<Box<str>>,
+    /// `mod_info["description"]` NIP-11 override.
+    pub description: Option<Box<str>>,
+    /// `mod_info["icon"]` NIP-11 override.
+    pub icon: Option<Box<str>>,
+}
+
+impl Moderation {
+    /// The `blocked:` reason when `event` is not publishable, `None`
+    /// when it is. The caller exempts AUTH events and relay-scoped
+    /// NIP-62 requests first.
+    #[must_use]
+    pub fn blocked_reason(&self, event: &Event) -> Option<&'static str> {
+        let pubkey = event.pubkey();
+        if self.banned_pubkeys.contains_key(&pubkey)
+            || (!self.allowed_pubkeys.is_empty() && !self.allowed_pubkeys.contains_key(&pubkey))
+        {
+            return Some("blocked: pubkey not allowed");
+        }
+        if self.banned_events.contains_key(&event.id()) {
+            return Some("blocked: event banned");
+        }
+        let kind = u16::from(event.kind());
+        if self.disallowed_kinds.contains(&kind)
+            || (!self.allowed_kinds.is_empty() && !self.allowed_kinds.contains(&kind))
+        {
+            return Some("blocked: kind not allowed");
+        }
+        None
+    }
+
+    /// Whether `ip` is on the block list.
+    #[must_use]
+    pub fn ip_blocked(&self, ip: &IpAddr) -> bool {
+        self.blocked_ips.contains_key(ip)
+    }
 }
 
 /// Collected seqs and the resume position of one bounded vanish
@@ -293,6 +460,16 @@ pub struct Store {
     /// `vanish_pending`: pubkeys whose vanish ranges are not drained —
     /// a persistent work queue, so a restart resumes mid-vanish.
     vanish_pending: BytesDb,
+    /// `mod_pubkeys`: `pubkey` → state byte ‖ reason (NIP-86).
+    mod_pubkeys: BytesDb,
+    /// `mod_events`: event `id` → reason (NIP-86 bans).
+    mod_events: BytesDb,
+    /// `mod_kinds`: `kind` (u16 BE) → allowed/disallowed state byte.
+    mod_kinds: BytesDb,
+    /// `mod_ips`: canonical `IpAddr` string → reason.
+    mod_ips: BytesDb,
+    /// `mod_info`: `name`/`description`/`icon` → NIP-11 override.
+    mod_info: BytesDb,
 }
 
 impl Store {
@@ -313,7 +490,7 @@ impl Store {
         options
             .map_size(opts.map_size)
             .max_readers(opts.max_readers)
-            .max_dbs(18);
+            .max_dbs(23);
         if opts.no_read_ahead {
             // SAFETY: heed requires env flags to be set before opening.
             unsafe { options.flags(EnvFlags::NO_READ_AHEAD) };
@@ -345,6 +522,11 @@ impl Store {
         let ix_replace_deletion = open_or_create("ix_replace_deletion")?;
         let ix_vanish = open_or_create("ix_vanish")?;
         let vanish_pending = open_or_create("vanish_pending")?;
+        let mod_pubkeys = open_or_create("mod_pubkeys")?;
+        let mod_events = open_or_create("mod_events")?;
+        let mod_kinds = open_or_create("mod_kinds")?;
+        let mod_ips = open_or_create("mod_ips")?;
+        let mod_info = open_or_create("mod_info")?;
         if let Some(bytes) = meta.get(&wtxn, b"format")? {
             let found = u32::from_be_bytes(
                 bytes
@@ -379,6 +561,11 @@ impl Store {
             ix_replace_deletion,
             ix_vanish,
             vanish_pending,
+            mod_pubkeys,
+            mod_events,
+            mod_kinds,
+            mod_ips,
+            mod_info,
         })
     }
 
@@ -888,6 +1075,158 @@ impl Store {
         Ok(count)
     }
 
+    /// Apply one NIP-86 `op` in a single write transaction and return
+    /// the rebuilt [`Moderation`] snapshot. [`ModOp::BanEvent`] also
+    /// deletes the stored event, when present, in the same
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on
+    /// a broken index invariant.
+    pub fn moderate(&self, op: ModOp) -> Result<Moderation, StoreError> {
+        let mut txn = self.env.write_txn()?;
+        match op {
+            ModOp::BanPubkey { pubkey, reason } => {
+                self.mod_pubkeys.put(
+                    &mut txn,
+                    &pubkey.0,
+                    &state_reason(ST_BANNED, reason.as_deref()),
+                )?;
+            }
+            ModOp::UnbanPubkey { pubkey } => {
+                clear_mod_state(&mut txn, self.mod_pubkeys, &pubkey.0, ST_BANNED)?;
+            }
+            ModOp::AllowPubkey { pubkey, reason } => {
+                self.mod_pubkeys.put(
+                    &mut txn,
+                    &pubkey.0,
+                    &state_reason(ST_ALLOWED, reason.as_deref()),
+                )?;
+            }
+            ModOp::UnallowPubkey { pubkey } => {
+                clear_mod_state(&mut txn, self.mod_pubkeys, &pubkey.0, ST_ALLOWED)?;
+            }
+            ModOp::BanEvent { id, reason } => {
+                self.mod_events.put(
+                    &mut txn,
+                    &id.0,
+                    reason.as_deref().unwrap_or_default().as_bytes(),
+                )?;
+                if let Some(seq) = self.ix_id.get(&txn, &id.0)?.map(decode_seq) {
+                    self.delete_seq(&mut txn, seq?)?;
+                }
+            }
+            ModOp::UnbanEvent { id } => {
+                self.mod_events.delete(&mut txn, &id.0)?;
+            }
+            ModOp::AllowKind { kind } => {
+                self.mod_kinds
+                    .put(&mut txn, &kind.to_be_bytes(), &[ST_ALLOWED])?;
+            }
+            ModOp::DisallowKind { kind } => {
+                self.mod_kinds
+                    .put(&mut txn, &kind.to_be_bytes(), &[ST_DISALLOWED])?;
+            }
+            ModOp::BlockIp { ip, reason } => {
+                self.mod_ips.put(
+                    &mut txn,
+                    ip.to_string().as_bytes(),
+                    reason.as_deref().unwrap_or_default().as_bytes(),
+                )?;
+            }
+            ModOp::UnblockIp { ip } => {
+                self.mod_ips.delete(&mut txn, ip.to_string().as_bytes())?;
+            }
+            ModOp::SetInfo { field, value } => {
+                self.mod_info.put(&mut txn, field.key(), value.as_bytes())?;
+            }
+        }
+        let moderation = self.load_moderation(&txn)?;
+        txn.commit()?;
+        Ok(moderation)
+    }
+
+    /// Load the full [`Moderation`] snapshot — used at startup so a
+    /// restart keeps every ban, and after each applied op.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on
+    /// a row that cannot decode.
+    pub fn moderation(&self) -> Result<Moderation, StoreError> {
+        let txn = self.env.read_txn()?;
+        self.load_moderation(&txn)
+    }
+
+    /// Rebuild the in-memory snapshot from the five `mod_*` tables.
+    fn load_moderation(&self, txn: &RoTxn<'_>) -> Result<Moderation, StoreError> {
+        let mut m = Moderation::default();
+        for entry in self.mod_pubkeys.iter(txn)? {
+            let (key, value) = entry?;
+            let pubkey = PublicKey(
+                *key.first_chunk::<32>()
+                    .ok_or(StoreError::Corrupt("bad mod_pubkeys key"))?,
+            );
+            let (state, reason) = split_state_reason(value)?;
+            match state {
+                ST_BANNED => {
+                    m.banned_pubkeys.insert(pubkey, reason);
+                }
+                ST_ALLOWED => {
+                    m.allowed_pubkeys.insert(pubkey, reason);
+                }
+                _ => return Err(StoreError::Corrupt("bad mod_pubkeys state")),
+            }
+        }
+        for entry in self.mod_events.iter(txn)? {
+            let (key, value) = entry?;
+            let id = EventId(
+                *key.first_chunk::<32>()
+                    .ok_or(StoreError::Corrupt("bad mod_events key"))?,
+            );
+            m.banned_events.insert(id, mod_reason(value)?);
+        }
+        for entry in self.mod_kinds.iter(txn)? {
+            let (key, value) = entry?;
+            let kind = u16::from_be_bytes(
+                *key.first_chunk::<2>()
+                    .ok_or(StoreError::Corrupt("bad mod_kinds key"))?,
+            );
+            match *value {
+                [ST_ALLOWED] => {
+                    m.allowed_kinds.insert(kind);
+                }
+                [ST_DISALLOWED] => {
+                    m.disallowed_kinds.insert(kind);
+                }
+                _ => return Err(StoreError::Corrupt("bad mod_kinds value")),
+            }
+        }
+        for entry in self.mod_ips.iter(txn)? {
+            let (key, value) = entry?;
+            let ip = std::str::from_utf8(key)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or(StoreError::Corrupt("bad mod_ips key"))?;
+            m.blocked_ips.insert(ip, mod_reason(value)?);
+        }
+        for entry in self.mod_info.iter(txn)? {
+            let (key, value) = entry?;
+            let value = Box::<str>::from(
+                std::str::from_utf8(value)
+                    .map_err(|_| StoreError::Corrupt("bad mod_info value"))?,
+            );
+            match key {
+                b"name" => m.name = Some(value),
+                b"description" => m.description = Some(value),
+                b"icon" => m.icon = Some(value),
+                _ => return Err(StoreError::Corrupt("bad mod_info key")),
+            }
+        }
+        Ok(m)
+    }
+
     /// Whether any pubkey has undrained vanish work (startup check so
     /// a vanish queued before a crash resumes).
     ///
@@ -1159,6 +1498,47 @@ fn decode_seq(bytes: &[u8]) -> Result<u64, StoreError> {
         .try_into()
         .map_err(|_| StoreError::Corrupt("bad seq value"))?;
     Ok(u64::from_be_bytes(*arr))
+}
+
+/// A `mod_pubkeys` value: state byte ‖ reason.
+fn state_reason(state: u8, reason: Option<&str>) -> Vec<u8> {
+    let reason = reason.unwrap_or_default();
+    let mut value = Vec::with_capacity(reason.len() + 1);
+    value.push(state);
+    value.extend_from_slice(reason.as_bytes());
+    value
+}
+
+/// Split a `mod_pubkeys` value into `(state, reason)`.
+fn split_state_reason(value: &[u8]) -> Result<(u8, Option<Box<str>>), StoreError> {
+    let (state, reason) = value
+        .split_first()
+        .ok_or(StoreError::Corrupt("bad mod_pubkeys value"))?;
+    Ok((*state, mod_reason(reason)?))
+}
+
+/// A `mod_*` reason: `None` when empty, a decode error when not UTF-8.
+fn mod_reason(value: &[u8]) -> Result<Option<Box<str>>, StoreError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(Box::from(std::str::from_utf8(value).map_err(
+        |_| StoreError::Corrupt("bad moderation reason"),
+    )?)))
+}
+
+/// Delete a `mod_pubkeys` row only when it currently holds `state` —
+/// `unbanpubkey` must not drop an allow entry (and vice versa).
+fn clear_mod_state(
+    txn: &mut RwTxn<'_>,
+    db: BytesDb,
+    key: &[u8],
+    state: u8,
+) -> Result<(), StoreError> {
+    if db.get(txn, key)?.is_some_and(|v| v.first() == Some(&state)) {
+        db.delete(txn, key)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

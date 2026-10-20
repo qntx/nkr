@@ -95,6 +95,8 @@ pub struct Relay {
     pub write_policy: WritePolicy,
     /// NIP-42 authentication and restricted read kinds.
     pub auth: Auth,
+    /// NIP-86 management API.
+    pub management: Management,
     /// NIP-11 relay information.
     pub info: Info,
 }
@@ -110,6 +112,16 @@ pub struct Auth {
     /// involved in the event (author or `p` tag); `false` serves them
     /// to any authenticated reader.
     pub restrict_read_to_involved: bool,
+}
+
+/// `[relay.management]` — the NIP-86 relay management API.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct Management {
+    /// Admin pubkeys (lowercase 64-hex) authorized for `POST /` with
+    /// `application/nostr+json+rpc`. The endpoint exists only when
+    /// non-empty, and `u`-tag checks need `[relay] service_url`.
+    pub admins: Vec<String>,
 }
 
 impl Default for Auth {
@@ -219,6 +231,7 @@ impl Default for Relay {
             compression: Compression::default(),
             write_policy: WritePolicy::default(),
             auth: Auth::default(),
+            management: Management::default(),
             info: Info::default(),
         }
     }
@@ -261,7 +274,8 @@ impl Config {
     ///
     /// [`ServerError::Io`] on read failure, [`ServerError::Config`] on
     /// TOML syntax errors or unknown keys, [`ServerError::ServiceUrl`]
-    /// on an invalid `[relay] service_url`.
+    /// on an invalid `[relay] service_url`, [`ServerError::Admins`] on
+    /// a malformed `[relay.management] admins` entry.
     pub fn load(path: &Path) -> Result<Self, ServerError> {
         let text = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&text)?;
@@ -274,13 +288,20 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// [`ServerError::ServiceUrl`] on an invalid `[relay] service_url`.
+    /// [`ServerError::ServiceUrl`] on an invalid `[relay] service_url`,
+    /// [`ServerError::Admins`] on a malformed
+    /// `[relay.management] admins` entry.
     pub fn limits(&self) -> Result<Limits, ServerError> {
         let service_url = if self.relay.service_url.is_empty() {
             None
         } else {
             Some(nosfry_core::url::RelayUrl::parse(&self.relay.service_url)?)
         };
+        for admin in &self.relay.management.admins {
+            if nosfry_core::event::PublicKey::from_hex(admin).is_none() {
+                return Err(ServerError::Admins(admin.clone()));
+            }
+        }
         Ok(Limits {
             event: self.events,
             req: self.relay.limits,

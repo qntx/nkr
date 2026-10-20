@@ -5,9 +5,10 @@
 High-performance Nostr relay in Rust, for bare-metal servers and Cloudflare Workers.
 
 Status: 0.1. The native relay serves NIP-01, NIP-09 (event deletion),
-NIP-11, NIP-40 (event expiration), NIP-45 (`COUNT`), and NIP-77
-(negentropy sync); the remaining strfry feature-parity layer
-(NIP-42, 70, plugins, metrics) is in progress. Linux and macOS are supported.
+NIP-11, NIP-40 (event expiration), NIP-45 (`COUNT`), NIP-62 (request
+to vanish), NIP-77 (negentropy sync), and NIP-86 (relay management);
+the remaining strfry feature-parity layer (NIP-42, 70, plugins,
+metrics) is in progress. Linux and macOS are supported.
 
 - `nosfry-core` — sans-IO protocol core (`wasm32-unknown-unknown` clean)
 - `nosfry-lmdb` — synchronous LMDB event store (native only)
@@ -142,6 +143,28 @@ process-wide budget for sealed storages at 40 bytes per record, over
 which opens answer `blocked: sync capacity exhausted`. Restricted
 kinds are never leaked to a sync the reader may not read.
 NIP-11 advertises 77 while sync is enabled.
+
+`POST /` with `Content-Type: application/nostr+json+rpc` is the NIP-86
+management API (enabled when `[relay.management] admins` is
+non-empty). Every call must carry a NIP-98 `Authorization: Nostr
+<base64(event)>` header — a kind-27235 event with `method` = `POST`,
+a `payload` tag hashing the raw body, a `u` tag matching `service_url`
+after host normalization, a fresh `created_at`, and an admin pubkey —
+or the answer is 401. Implemented methods: `supportedmethods`,
+`banpubkey`/`unbanpubkey`/`listbannedpubkeys`,
+`allowpubkey`/`unallowpubkey`/`listallowedpubkeys`,
+`banevent`/`unbanevent`/`listbannedevents`,
+`allowkind`/`disallowkind`/`listallowedkinds`/`listdisallowedkinds`,
+`blockip`/`unblockip`/`listblockedips`, and
+`changerelayname`/`changerelaydescription`/`changerelayicon`. State
+persists in the database (a restart keeps every ban), enforcement is
+an in-memory snapshot: banned authors/events and disallowed kinds are
+refused at publish with `blocked: …` (AUTH and relay-scoped NIP-62
+requests are exempt — a banned author may still vanish), `banevent`
+deletes the stored event in the same transaction, blocked IPs get 403
+on new requests (established connections are not cut), and the
+info-field changes take precedence in the NIP-11 document. `import`
+bypasses moderation as an operator tool.
 
 SIGHUP reloads the configuration file without restarting: the relay
 re-reads it, logs an error and keeps the running configuration on a

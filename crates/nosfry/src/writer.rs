@@ -97,16 +97,22 @@ pub(crate) fn run(
         match first {
             Some(WriterMsg::Publish(req)) => {
                 let mut reqs = vec![req];
+                let mut moderations = Vec::new();
                 while reqs.len() < BATCH_CAP {
                     match rx.try_recv() {
                         Ok(WriterMsg::Publish(next)) => reqs.push(next),
                         Ok(WriterMsg::Expire) => expire_pending = true,
+                        Ok(WriterMsg::Moderate { op, reply }) => moderations.push((op, reply)),
                         Err(_) => break,
                     }
                 }
                 vanish_pending |= write_batch(store, reqs, shards, metrics, live);
+                for (op, reply) in moderations {
+                    moderate(store, op, reply, metrics);
+                }
             }
             Some(WriterMsg::Expire) | None => expire_pending = true,
+            Some(WriterMsg::Moderate { op, reply }) => moderate(store, op, reply, metrics),
         }
         if expire_pending {
             expire_backlog = expire_sweep(store, metrics);
@@ -116,6 +122,23 @@ pub(crate) fn run(
             vanish_backlog = vanish_sweep(store, metrics);
             vanish_pending = vanish_backlog;
         }
+    }
+}
+
+/// One NIP-86 management op; the reply carries the rebuilt snapshot
+/// (or the store error) for the waiting HTTP handler.
+fn moderate(
+    store: &Store,
+    op: nosfry_lmdb::ModOp,
+    reply: tokio::sync::oneshot::Sender<Result<nosfry_lmdb::Moderation, nosfry_lmdb::StoreError>>,
+    metrics: &Metrics,
+) {
+    let result = store.moderate(op);
+    if result.is_err() {
+        metrics.store_error(StoreOp::Moderate);
+    }
+    if reply.send(result).is_err() {
+        tracing::debug!("management reply receiver dropped");
     }
 }
 

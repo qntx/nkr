@@ -9,7 +9,8 @@ use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
 use nosfry_core::message::{RelayVerb, SubId};
 use nosfry_core::session::SubKey;
-use tokio::sync::mpsc;
+use nosfry_lmdb::{ModOp, Moderation, StoreError};
+use tokio::sync::{mpsc, oneshot};
 
 /// Connection identifier; also the shard/reader routing key.
 pub(crate) type ConnId = u64;
@@ -36,6 +37,15 @@ pub(crate) enum WriterMsg {
     Publish(WriteRequest),
     /// Sweep expired events (NIP-40).
     Expire,
+    /// Apply a NIP-86 management op; the reply carries the rebuilt
+    /// [`Moderation`] snapshot (all `mod_*` writes go through the
+    /// single writer thread).
+    Moderate {
+        /// The operation.
+        op: ModOp,
+        /// Result delivered to the HTTP handler.
+        reply: oneshot::Sender<Result<Moderation, StoreError>>,
+    },
 }
 
 /// A publish request queued for the single writer thread.
