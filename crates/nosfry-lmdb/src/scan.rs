@@ -294,6 +294,34 @@ impl Scan {
         budget: Duration,
         emit: &mut dyn FnMut(u64, &str),
     ) -> Result<Progress, StoreError> {
+        self.step_mode(store, budget, &mut Emit::Payload(emit))
+    }
+
+    /// [`step`](Self::step) in record mode: `emit` receives
+    /// `(created_at, id)` of every matched event and no payload is
+    /// fetched — identical candidates, ordering, dedup, and limits.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Heed`] on LMDB failure, [`StoreError::Corrupt`] on a
+    /// broken index invariant.
+    pub fn step_records(
+        &mut self,
+        store: &Store,
+        budget: Duration,
+        emit: &mut dyn FnMut(u64, EventId),
+    ) -> Result<Progress, StoreError> {
+        self.step_mode(store, budget, &mut Emit::Record(emit))
+    }
+
+    /// The shared time-sliced driver behind [`step`](Self::step) and
+    /// [`step_records`](Self::step_records).
+    fn step_mode(
+        &mut self,
+        store: &Store,
+        budget: Duration,
+        emit: &mut Emit<'_>,
+    ) -> Result<Progress, StoreError> {
         if self.done {
             return Ok(Progress::Done);
         }
@@ -325,10 +353,19 @@ impl Scan {
     }
 }
 
+/// Where a finished match goes: the canonical JSON payload for REQ
+/// scans, the `(created_at, id)` record for sync scans.
+enum Emit<'a> {
+    /// `(seq, json)` — fetches the payload.
+    Payload(&'a mut (dyn FnMut(u64, &str) + 'a)),
+    /// `(created_at, id)` — the packed record already has both.
+    Record(&'a mut dyn FnMut(u64, EventId)),
+}
+
 /// Run one slice over every unfinished plan; `true` when a plan hit
 /// the budget mid-filter (its step resumes next call).
 fn run_filters(
-    step: &mut Step<'_>,
+    step: &mut Step<'_, '_>,
     filters: &[Filter],
     plans: &mut [Plan],
 ) -> Result<bool, StoreError> {
@@ -347,7 +384,7 @@ fn run_filters(
 /// Per-step state shared by the plan helpers: the store and its read
 /// transaction, the scan snapshot, cross-filter dedup, the wall-clock
 /// budget, and the emit callback.
-struct Step<'a> {
+struct Step<'a, 'e> {
     store: &'a Store,
     txn: &'a Reader<'a>,
     /// Read visibility snapshotted at REQ time.
@@ -364,12 +401,12 @@ struct Step<'a> {
     start: Instant,
     /// Wall-clock budget for this step.
     budget: Duration,
-    /// Where emitted payloads go.
-    emit: &'a mut dyn FnMut(u64, &str),
+    /// Where emitted matches go.
+    emit: &'a mut Emit<'e>,
 }
 
 /// Drive one filter until it finishes or the budget fires.
-fn run_plan(step: &mut Step<'_>, filter: &Filter, plan: &mut Plan) -> Result<(), StoreError> {
+fn run_plan(step: &mut Step<'_, '_>, filter: &Filter, plan: &mut Plan) -> Result<(), StoreError> {
     let Some(mode) = plan.mode.as_mut() else {
         plan.finished = true;
         return Ok(());
@@ -391,7 +428,7 @@ fn run_plan(step: &mut Step<'_>, filter: &Filter, plan: &mut Plan) -> Result<(),
 
 /// `ix_id` point lookups, then the sort/truncate/emit finalize pass.
 fn scan_ids(
-    step: &mut Step<'_>,
+    step: &mut Step<'_, '_>,
     filter: &Filter,
     state: &mut PlanState,
     pending: &mut VecDeque<[u8; 32]>,
@@ -421,7 +458,7 @@ fn scan_ids(
 /// newest head, refill from its cursor, flush completed `created_at`
 /// groups, and park heads back into cursor bounds when the budget fires.
 fn scan_ranges(
-    step: &mut Step<'_>,
+    step: &mut Step<'_, '_>,
     filter: &Filter,
     state: &mut PlanState,
     index: Index,
@@ -492,26 +529,32 @@ fn scan_ranges(
 /// Emit one complete `created_at` group: id-ascending, at most
 /// `limit - taken` entries, each counted toward `taken` whether or not
 /// it is re-sent (limit-then-dedup across filters).
-fn flush_group(step: &mut Step<'_>, state: &mut PlanState) -> Result<(), StoreError> {
+fn flush_group(step: &mut Step<'_, '_>, state: &mut PlanState) -> Result<(), StoreError> {
     state.group.sort_by_key(|m| m.1);
     let remaining = usize::try_from(state.limit.saturating_sub(state.taken)).unwrap_or(usize::MAX);
-    for (_, _, seq) in state.group.drain(..).take(remaining) {
+    for m in state.group.drain(..).take(remaining) {
         state.taken += 1;
-        if step.emitted.insert(seq) {
-            emit_payload(step, seq)?;
+        if step.emitted.insert(m.2) {
+            emit_match(step, m)?;
         }
     }
     Ok(())
 }
 
-/// Fetch and emit one payload; an entry deleted between slices is
+/// Emit one match; in payload mode an entry deleted between slices is
 /// skipped but still counts toward the limit.
-fn emit_payload(step: &mut Step<'_>, seq: u64) -> Result<(), StoreError> {
-    if let Some(bytes) = step.store.payloads.get(step.txn, &seq.to_be_bytes())? {
-        (step.emit)(
-            seq,
-            std::str::from_utf8(bytes).map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?,
-        );
+fn emit_match(step: &mut Step<'_, '_>, (created_at, id, seq): Match) -> Result<(), StoreError> {
+    match step.emit {
+        Emit::Payload(emit) => {
+            if let Some(bytes) = step.store.payloads.get(step.txn, &seq.to_be_bytes())? {
+                emit(
+                    seq,
+                    std::str::from_utf8(bytes)
+                        .map_err(|_| StoreError::Corrupt("payload is not UTF-8"))?,
+                );
+            }
+        }
+        Emit::Record(emit) => emit(created_at, id),
     }
     Ok(())
 }
@@ -530,7 +573,7 @@ fn restore_heads(heap: &mut BinaryHeap<Head>, cursors: &mut [Cursor]) {
 
 /// seq/snapshot/dup checks, packed load, `Filter::matches`, collect.
 fn try_candidate(
-    step: &Step<'_>,
+    step: &Step<'_, '_>,
     filter: &Filter,
     collected: &mut Vec<Match>,
     last_seq: &mut Option<u64>,
@@ -562,17 +605,21 @@ fn try_candidate(
 
 /// Sort collected matches newest-first, truncate to the limit, emit the
 /// payloads, and record the seqs so later filters skip them.
-fn finalize(step: &mut Step<'_>, collected: &mut Vec<Match>, limit: u64) -> Result<(), StoreError> {
+fn finalize(
+    step: &mut Step<'_, '_>,
+    collected: &mut Vec<Match>,
+    limit: u64,
+) -> Result<(), StoreError> {
     collected.sort_by(|a, b| cmp_newest_first((a.0, &a.1), (b.0, &b.1)));
     collected.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-    for (_, _, seq) in collected.drain(..) {
+    for m in collected.drain(..) {
         // An earlier filter may already have emitted this seq: it still
         // counts toward this filter's limit boundary, but is not sent
         // twice.
-        if !step.emitted.insert(seq) {
+        if !step.emitted.insert(m.2) {
             continue;
         }
-        emit_payload(step, seq)?;
+        emit_match(step, m)?;
     }
     Ok(())
 }
@@ -602,6 +649,6 @@ pub(crate) fn decode_seq(bytes: &[u8]) -> Result<u64, StoreError> {
 
 /// The step's wall-clock budget, checked every `BUDGET_CHECK_EVERY`
 /// candidates.
-fn budget_elapsed(step: &Step<'_>) -> bool {
+fn budget_elapsed(step: &Step<'_, '_>) -> bool {
     step.processed.is_multiple_of(BUDGET_CHECK_EVERY) && step.start.elapsed() >= step.budget
 }

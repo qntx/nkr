@@ -65,6 +65,29 @@ fn collect(store: &Store, filters: Arc<[Filter]>, snapshot: u64) -> Vec<String> 
     collect_now(store, filters, snapshot, 0)
 }
 
+/// `collect_now` in record mode: `(created_at, id)` per emitted match.
+fn collect_records(store: &Store, filters: Arc<[Filter]>, snapshot: u64) -> Vec<(u64, String)> {
+    let mut scan = Scan::new(
+        filters,
+        nosfry_core::auth::ReadGate::default(),
+        snapshot,
+        500,
+        0,
+    );
+    let out = RefCell::new(Vec::new());
+    loop {
+        let progress = scan
+            .step_records(store, Duration::ZERO, &mut |created_at, id| {
+                out.borrow_mut().push((created_at, id.to_string()));
+            })
+            .unwrap();
+        if progress == Progress::Done {
+            break;
+        }
+    }
+    out.into_inner()
+}
+
 #[test]
 fn write_and_scan_all() {
     let (_dir, store) = store();
@@ -346,6 +369,35 @@ fn scan_addressable_kinds_without_d_unbounded() {
         3,
     );
     assert_eq!(got_d, vec![events[0].json().to_owned()]);
+}
+
+#[test]
+fn scan_records_match_payload_scan() {
+    let (_dir, store) = store();
+    let k = key(1);
+    let events: Vec<Arc<Event>> = (0..10u64)
+        .map(|i| event(&k, 1, 100 + i, &json!([["t", "x"]]), &format!("e{i}")))
+        .collect();
+    store.write(&events).unwrap();
+    // Two overlapping filters exercise cross-filter dedup in both modes.
+    let filters: Arc<[Filter]> = Arc::from([
+        Filter::parse("{\"#t\":[\"x\"]}").unwrap(),
+        Filter::parse("{\"kinds\":[1]}").unwrap(),
+    ]);
+    let snap = store.snapshot().unwrap();
+    // The payload mode's `(created_at, id)` sequence, parsed back.
+    let expected: Vec<(u64, String)> = collect(&store, Arc::clone(&filters), snap)
+        .iter()
+        .map(|json| {
+            let v: serde_json::Value = serde_json::from_str(json).unwrap();
+            (
+                v["created_at"].as_u64().unwrap(),
+                v["id"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    let got = collect_records(&store, filters, snap);
+    assert_eq!(got, expected);
 }
 
 #[test]

@@ -5,9 +5,9 @@
 High-performance Nostr relay in Rust, for bare-metal servers and Cloudflare Workers.
 
 Status: 0.1. The native relay serves NIP-01, NIP-09 (event deletion),
-NIP-11, NIP-40 (event expiration), and NIP-45 (`COUNT`); the
-remaining strfry feature-parity layer (NIP-42, 70, 77, plugins,
-metrics) is in progress. Linux and macOS are supported.
+NIP-11, NIP-40 (event expiration), NIP-45 (`COUNT`), and NIP-77
+(negentropy sync); the remaining strfry feature-parity layer
+(NIP-42, 70, plugins, metrics) is in progress. Linux and macOS are supported.
 
 - `nosfry-core` — sans-IO protocol core (`wasm32-unknown-unknown` clean)
 - `nosfry-lmdb` — synchronous LMDB event store (native only)
@@ -113,13 +113,33 @@ value, the answer also carries `"hll"`, the 256-register HyperLogLog
 sketch of the counted authors' pubkeys (the NIP-45 offset rule), for
 client-side follower-count combining.
 
+`["NEG-OPEN", <sub>, <filter>, "<msg>"]` (NIP-77) runs a negentropy
+sync against the stored events one filter would return: the relay
+scans them in record mode (no payload fetches — matching, limits,
+ordering, dedup, read-gate, and expiration identical to a REQ),
+seals the `(created_at, id)` records into a
+`NegentropyStorageVector`, and answers the initial message and every
+later `NEG-MSG` with `NEG-MSG` replies until `NEG-CLOSE`. Syncs live
+in their own subscription namespace, share the REQ rate buckets and
+the `max_subs_per_connection` cap, and are reaped after 60 s without
+a `NEG-MSG` (`closed: idle timeout`). `relay.limits.max_sync_events`
+(default 1 000 000, `0` disables NEG-OPEN) caps the records one sync
+may hold — over it the relay answers `blocked: too many query
+results` with the cap as a fourth `NEG-ERR` element — and
+`relay.max_sync_memory_bytes` (default 1 GiB, `0` unlimited) is a
+process-wide budget for sealed storages at 40 bytes per record, over
+which opens answer `blocked: sync capacity exhausted`. Restricted
+kinds are never leaked to a sync the reader may not read.
+NIP-11 advertises 77 while sync is enabled.
+
 SIGHUP reloads the configuration file without restarting: the relay
 re-reads it, logs an error and keeps the running configuration on a
 parse failure, and applies everything except the restart-only keys —
 `[db]`, `relay.bind`, `relay.port`, `relay.nofiles`, `relay.metrics`,
 `relay.threads`, `relay.query_timeslice_budget_microseconds`,
 `relay.limits.max_filter_limit`, `relay.limits.max_filter_limit_count`,
-and `relay.max_pending_outbound_bytes_total` — which are logged as
+`relay.limits.max_sync_events`, `relay.max_sync_memory_bytes`, and
+`relay.max_pending_outbound_bytes_total` — which are logged as
 ignored. Session
 limits and connection options (`events`, `relay.limits`,
 `relay.rate_limits`, payload size, ping interval, outbound budget,

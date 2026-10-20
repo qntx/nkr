@@ -114,10 +114,16 @@ impl Metrics {
 
     /// Render the Prometheus text exposition format (0.0.4);
     /// `connections` is the live gauge read from the connection
-    /// limiter and `outbound_pending` the process-wide pending
-    /// outbound bytes. Counter series at zero are omitted; the
-    /// gauges are always emitted.
-    pub(crate) fn render(&self, connections: usize, outbound_pending: usize) -> String {
+    /// limiter, `outbound_pending` the process-wide pending
+    /// outbound bytes, and `sync_memory` the reserved sync-storage
+    /// bytes. Counter series at zero are omitted; the gauges are
+    /// always emitted.
+    pub(crate) fn render(
+        &self,
+        connections: usize,
+        outbound_pending: usize,
+        sync_memory: usize,
+    ) -> String {
         let mut out = String::with_capacity(2 * 1024);
         family(
             &mut out,
@@ -214,6 +220,13 @@ impl Metrics {
             "gauge",
         );
         writeln!(out, "nosfry_outbound_pending_bytes {outbound_pending}").ok();
+        family(
+            &mut out,
+            "nosfry_sync_memory_bytes",
+            "Bytes reserved for sealed negentropy sync storages.",
+            "gauge",
+        );
+        writeln!(out, "nosfry_sync_memory_bytes {sync_memory}").ok();
         out
     }
 }
@@ -239,10 +252,10 @@ mod tests {
 
     #[test]
     fn empty_render_has_families_and_gauge_only() {
-        let out = Metrics::new().render(0, 0);
+        let out = Metrics::new().render(0, 0, 0);
         assert!(out.contains("# HELP nostr_client_messages_total"));
         assert!(out.contains("# TYPE nostr_events_total counter"));
-        assert!(out.ends_with("nosfry_outbound_pending_bytes 0\n"));
+        assert!(out.ends_with("nosfry_sync_memory_bytes 0\n"));
         assert!(!out.contains('{'), "no series while every counter is 0");
     }
 
@@ -263,7 +276,7 @@ mod tests {
         metrics.store_error(StoreOp::Scan);
         metrics.store_error(StoreOp::Scan);
         assert_eq!(
-            metrics.render(3, 512),
+            metrics.render(3, 512, 0),
             "# HELP nostr_client_messages_total Inbound client messages by verb.\n\
              # TYPE nostr_client_messages_total counter\n\
              nostr_client_messages_total{verb=\"EVENT\"} 2\n\
@@ -292,7 +305,10 @@ mod tests {
              nosfry_connections 3\n\
              # HELP nosfry_outbound_pending_bytes Pending outbound bytes across all connections.\n\
              # TYPE nosfry_outbound_pending_bytes gauge\n\
-             nosfry_outbound_pending_bytes 512\n"
+             nosfry_outbound_pending_bytes 512\n\
+             # HELP nosfry_sync_memory_bytes Bytes reserved for sealed negentropy sync storages.\n\
+             # TYPE nosfry_sync_memory_bytes gauge\n\
+             nosfry_sync_memory_bytes 0\n"
         );
     }
 }

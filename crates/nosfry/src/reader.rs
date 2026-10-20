@@ -1,11 +1,18 @@
 //! Reader thread: time-sliced stored-event scans.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use negentropy::{Id, Negentropy, NegentropyStorageVector};
+use nosfry_core::event::EventId;
 use nosfry_core::hll::Hll;
-use nosfry_core::message::{RelayVerb, count_frame, eose_frame, event_frame};
+use nosfry_core::message::{
+    RelayVerb, SubId, count_frame, eose_frame, event_frame, neg_err_frame,
+    neg_err_frame_with_limit, neg_msg_frame,
+};
 use nosfry_core::session::SubKey;
 use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreError};
 use tokio::sync::mpsc as tokio_mpsc;
@@ -23,6 +30,21 @@ const CHUNK_FRAMES: usize = 64;
 /// Accounted bytes per `Out::Frames` chunk.
 const CHUNK_BYTES: usize = 256 * 1024;
 
+/// Reconcile output cap per `NEG-MSG` (strfry `frameSizeLimit`).
+const NEG_FRAME_LIMIT: u64 = 500_000;
+
+/// A sync session without a `NEG-MSG` for this long is dropped with
+/// `closed: idle timeout`.
+const NEG_IDLE: Duration = Duration::from_secs(60);
+
+/// Bytes charged per stored record against the sync memory budget:
+/// the sealed vector's 40-byte `(created_at, id)` item.
+const SYNC_RECORD_BYTES: usize = 40;
+
+/// foldhash for the sync map (client-controlled sub ids), like the
+/// shard's maps.
+type Negs = HashMap<(ConnId, SubId), NegSession, foldhash::fast::RandomState>;
+
 // Loop iterations, test-only spin detector. Thread-local so readers
 // run by concurrent tests count independently.
 #[cfg(test)]
@@ -37,6 +59,48 @@ enum Job {
     Scan(Scan),
     /// A NIP-45 `COUNT`.
     Count(Box<CountScan>),
+    /// A NIP-77 `NEG-OPEN` record scan (boxed: it carries the record
+    /// buffer and the initial message).
+    Neg(Box<NegScan>),
+}
+
+/// A `NEG-OPEN` scan plus the records it collects.
+#[derive(Debug)]
+struct NegScan {
+    /// Record-mode scan: same matching/dedup/limits as a REQ, no
+    /// payload fetches.
+    scan: Scan,
+    /// `(created_at, id)` in emit order.
+    records: Vec<(u64, EventId)>,
+    /// The client's initial reconcile message.
+    msg: Box<[u8]>,
+}
+
+/// A sealed sync kept for later `NEG-MSG`s: the storage, its memory
+/// reservation, and the idle clock.
+#[derive(Debug)]
+struct NegSession {
+    /// Session generation (stale `NEG-MSG`s never match it).
+    generation: u64,
+    /// Sealed record storage.
+    storage: NegentropyStorageVector,
+    /// Bytes reserved on `Tuning::sync_memory`, released on drop.
+    reserved: usize,
+    /// Last `NEG-OPEN`/`NEG-MSG` time; [`NEG_IDLE`] reaps idle ones.
+    last_active: Instant,
+    /// Where the idle-timeout `NEG-ERR` goes.
+    out: Outbound,
+}
+
+/// The reader's pending scan queues plus open sync sessions.
+#[derive(Debug)]
+struct Work {
+    /// Scans not yet started.
+    new_scans: VecDeque<ScanEntry>,
+    /// Time-sliced scans awaiting their next slice.
+    resumed: VecDeque<ScanEntry>,
+    /// Sealed syncs kept for `NEG-MSG`s.
+    negs: Negs,
 }
 
 /// One running scan.
@@ -69,6 +133,14 @@ pub(crate) struct Tuning {
     /// Index entries a `COUNT` scan may examine before answering
     /// `"approximate": true`.
     pub(crate) max_filter_limit_count: u64,
+    /// Records a sync scan may hold before answering
+    /// `blocked: too many query results`.
+    pub(crate) max_sync_events: u64,
+    /// Process-wide budget for sealed sync storages, accounted at
+    /// `SYNC_RECORD_BYTES` per record (0 = unlimited).
+    pub(crate) max_sync_memory_bytes: usize,
+    /// Shared counter for [`Tuning::max_sync_memory_bytes`].
+    pub(crate) sync_memory: Arc<AtomicUsize>,
 }
 
 /// Reader thread main loop. `tuning.high_water` pauses scans for
@@ -85,8 +157,11 @@ pub(crate) fn run(
     metrics: &Metrics,
     shutdown: &watch::Receiver<bool>,
 ) {
-    let mut new_scans: VecDeque<ScanEntry> = VecDeque::new();
-    let mut resumed: VecDeque<ScanEntry> = VecDeque::new();
+    let mut work = Work {
+        new_scans: VecDeque::new(),
+        resumed: VecDeque::new(),
+        negs: Negs::with_hasher(foldhash::fast::RandomState::default()),
+    };
     let mut skipped = 0usize;
     // Alternate between the queues: new scans get their first slice
     // quickly, but a steady stream of them may not starve resumed ones
@@ -97,21 +172,26 @@ pub(crate) fn run(
         LOOP_TICKS.with(|t| t.set(t.get() + 1));
         match rx.try_recv() {
             Ok(msg) => {
-                apply(msg, &mut new_scans, &mut resumed, tuning);
+                apply(msg, &mut work, tuning);
                 skipped = 0;
                 continue;
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
+        reap_negs(&mut work.negs, tuning);
         let entry = if prefer_new {
-            new_scans.pop_front().or_else(|| resumed.pop_front())
+            work.new_scans
+                .pop_front()
+                .or_else(|| work.resumed.pop_front())
         } else {
-            resumed.pop_front().or_else(|| new_scans.pop_front())
+            work.resumed
+                .pop_front()
+                .or_else(|| work.new_scans.pop_front())
         };
         prefer_new = !prefer_new;
         let Some(entry) = entry else {
-            if !idle(rx, &mut new_scans, &mut resumed, tuning, shutdown) {
+            if !idle(rx, &mut work, tuning, shutdown) {
                 return;
             }
             continue;
@@ -125,17 +205,17 @@ pub(crate) fn run(
             && pending > CHUNK_BYTES;
         if pending <= tuning.high_water && !behind {
             skipped = 0;
-            step(entry, store, tuning.budget, shards, metrics, &mut resumed);
+            step(entry, store, tuning, shards, metrics, &mut work);
             continue;
         }
-        resumed.push_back(entry);
+        work.resumed.push_back(entry);
         skipped += 1;
-        if skipped < new_scans.len() + resumed.len() {
+        if skipped < work.new_scans.len() + work.resumed.len() {
             continue;
         }
         // A full pass with nothing runnable: block for new work
         // instead of spinning.
-        if !idle(rx, &mut new_scans, &mut resumed, tuning, shutdown) {
+        if !idle(rx, &mut work, tuning, shutdown) {
             return;
         }
         skipped = 0;
@@ -146,14 +226,13 @@ pub(crate) fn run(
 /// reader exits (senders gone or shutdown raised).
 fn idle(
     rx: &Receiver<ReaderMsg>,
-    new_scans: &mut VecDeque<ScanEntry>,
-    resumed: &mut VecDeque<ScanEntry>,
+    work: &mut Work,
     tuning: &Tuning,
     shutdown: &watch::Receiver<bool>,
 ) -> bool {
     match rx.recv_timeout(IDLE_WAIT) {
         Ok(msg) => {
-            apply(msg, new_scans, resumed, tuning);
+            apply(msg, work, tuning);
             true
         }
         Err(RecvTimeoutError::Disconnected) => false,
@@ -166,101 +245,350 @@ fn idle(
 /// completion of a count, `Closed` on error — and requeue it into
 /// `resumed` when it stays pending.
 fn step(
-    mut entry: ScanEntry,
+    entry: ScanEntry,
     store: &Store,
-    budget: Duration,
+    tuning: &Tuning,
     shards: &[tokio_mpsc::Sender<ShardMsg>],
     metrics: &Metrics,
-    resumed: &mut VecDeque<ScanEntry>,
+    work: &mut Work,
 ) {
-    if let Job::Count(ref mut scan) = entry.job {
-        match scan.step(store, budget) {
-            Ok(Progress::Pending) => resumed.push_back(entry),
+    let budget = tuning.budget;
+    let ScanEntry {
+        conn,
+        sub,
+        job,
+        out,
+        first_pushed,
+    } = entry;
+    match job {
+        Job::Neg(mut neg) => {
+            let result = neg.scan.step_records(store, budget, &mut |created_at, id| {
+                neg.records.push((created_at, id));
+            });
+            match result {
+                Ok(Progress::Pending) => work.resumed.push_back(ScanEntry {
+                    conn,
+                    sub,
+                    job: Job::Neg(neg),
+                    out,
+                    first_pushed,
+                }),
+                Ok(Progress::Done) => finish_neg(conn, &sub, &out, *neg, &mut work.negs, tuning),
+                Err(err) => neg_failed(conn, &sub, &out, &err, metrics),
+            }
+        }
+        Job::Count(mut scan) => match scan.step(store, budget) {
+            Ok(Progress::Pending) => work.resumed.push_back(ScanEntry {
+                conn,
+                sub,
+                job: Job::Count(scan),
+                out,
+                first_pushed,
+            }),
             Ok(Progress::Done) => {
                 let result = scan.result();
-                entry.out.push(Out::Count {
-                    sub: entry.sub.clone(),
-                    text: count_frame(
-                        &entry.sub.id,
-                        result.count,
-                        result.approximate,
-                        result.hll.as_ref(),
-                    ),
+                let text = count_frame(
+                    &sub.id,
+                    result.count,
+                    result.approximate,
+                    result.hll.as_ref(),
+                );
+                out.push(Out::Count { sub, text });
+            }
+            Err(err) => scan_failed(conn, &sub, &out, &err, metrics),
+        },
+        Job::Scan(mut scan) => {
+            let mut first = !first_pushed;
+            let mut texts = Vec::new();
+            let mut bytes = 0usize;
+            let result = scan.step(store, budget, &mut |_seq, json| {
+                let text = event_frame(&sub.id, json);
+                if first {
+                    first = false;
+                    out.push(Out::Frames {
+                        sub: sub.clone(),
+                        texts: vec![text],
+                    });
+                    return;
+                }
+                bytes += text.len();
+                texts.push(text);
+                if texts.len() >= CHUNK_FRAMES || bytes >= CHUNK_BYTES {
+                    out.push(Out::Frames {
+                        sub: sub.clone(),
+                        texts: std::mem::take(&mut texts),
+                    });
+                    bytes = 0;
+                }
+            });
+            let first_pushed = first_pushed || !first;
+            if !texts.is_empty() {
+                out.push(Out::Frames {
+                    sub: sub.clone(),
+                    texts,
                 });
             }
-            Err(err) => scan_failed(&entry, &err, metrics),
+            match result {
+                Ok(Progress::Pending) => work.resumed.push_back(ScanEntry {
+                    conn,
+                    sub,
+                    job: Job::Scan(scan),
+                    out,
+                    first_pushed,
+                }),
+                Ok(Progress::Done) => {
+                    out.push(Out::Frame {
+                        sub: Some(sub.clone()),
+                        verb: RelayVerb::Eose,
+                        text: eose_frame(&sub.id),
+                    });
+                    drop(route(shards, conn).blocking_send(ShardMsg::Activate { conn, sub }));
+                }
+                Err(err) => scan_failed(conn, &sub, &out, &err, metrics),
+            }
         }
-        return;
-    }
-    let Job::Scan(ref mut scan) = entry.job else {
-        unreachable!("count handled above")
-    };
-    let out = entry.out.clone();
-    let sub = entry.sub.clone();
-    let mut first = !entry.first_pushed;
-    let mut texts = Vec::new();
-    let mut bytes = 0usize;
-    let result = scan.step(store, budget, &mut |_seq, json| {
-        let text = event_frame(&sub.id, json);
-        if first {
-            first = false;
-            out.push(Out::Frames {
-                sub: sub.clone(),
-                texts: vec![text],
-            });
-            return;
-        }
-        bytes += text.len();
-        texts.push(text);
-        if texts.len() >= CHUNK_FRAMES || bytes >= CHUNK_BYTES {
-            out.push(Out::Frames {
-                sub: sub.clone(),
-                texts: std::mem::take(&mut texts),
-            });
-            bytes = 0;
-        }
-    });
-    entry.first_pushed |= !first;
-    if !texts.is_empty() {
-        out.push(Out::Frames {
-            sub: sub.clone(),
-            texts,
-        });
-    }
-    match result {
-        Ok(Progress::Pending) => resumed.push_back(entry),
-        Ok(Progress::Done) => {
-            entry.out.push(Out::Frame {
-                sub: Some(entry.sub.clone()),
-                verb: RelayVerb::Eose,
-                text: eose_frame(&entry.sub.id),
-            });
-            drop(route(shards, entry.conn).blocking_send(ShardMsg::Activate {
-                conn: entry.conn,
-                sub: entry.sub,
-            }));
-        }
-        Err(err) => scan_failed(&entry, &err, metrics),
     }
 }
 
 /// A store error on any scan kind: count it, log it, close the sub.
-fn scan_failed(entry: &ScanEntry, err: &StoreError, metrics: &Metrics) {
+fn scan_failed(conn: ConnId, sub: &SubKey, out: &Outbound, err: &StoreError, metrics: &Metrics) {
     metrics.store_error(StoreOp::Scan);
-    tracing::error!(%err, conn = entry.conn, "scan failed");
-    entry.out.push(Out::Closed {
-        sub: entry.sub.clone(),
+    tracing::error!(%err, conn, "scan failed");
+    out.push(Out::Closed {
+        sub: sub.clone(),
         reason: "error: internal error".to_owned(),
     });
 }
 
-/// Apply an inbox message.
-fn apply(
-    msg: ReaderMsg,
-    new_scans: &mut VecDeque<ScanEntry>,
-    resumed: &mut VecDeque<ScanEntry>,
+/// A store error on a sync scan: `NEG-ERR`, not `CLOSED` (the id
+/// lives in the `neg` namespace).
+fn neg_failed(conn: ConnId, sub: &SubKey, out: &Outbound, err: &StoreError, metrics: &Metrics) {
+    metrics.store_error(StoreOp::Scan);
+    tracing::error!(%err, conn, "sync scan failed");
+    out.push(Out::Neg {
+        sub: sub.clone(),
+        text: neg_err_frame(&sub.id, "error: internal error"),
+        closes: true,
+    });
+}
+
+/// Why a sync round produced no reply to send.
+#[derive(Clone, Copy)]
+enum NegError {
+    /// The wire message failed the negentropy protocol.
+    Invalid,
+    /// `insert`/`seal` failed on a fresh storage — internal.
+    Internal,
+    /// No session (or a stale generation) answered the message.
+    Unknown,
+}
+
+/// A finished `NEG-OPEN` scan: over-limit and over-budget answers
+/// never build a storage; otherwise seal the records, reconcile the
+/// initial message, and keep the session for `NEG-MSG`s.
+fn finish_neg(
+    conn: ConnId,
+    sub: &SubKey,
+    out: &Outbound,
+    neg: NegScan,
+    negs: &mut Negs,
     tuning: &Tuning,
 ) {
+    let NegScan { records, msg, .. } = neg;
+    if u64::try_from(records.len()).unwrap_or(u64::MAX) > tuning.max_sync_events {
+        out.push(Out::Neg {
+            sub: sub.clone(),
+            text: neg_err_frame_with_limit(
+                &sub.id,
+                "blocked: too many query results",
+                tuning.max_sync_events,
+            ),
+            closes: true,
+        });
+        return;
+    }
+    let reserved = records.len() * SYNC_RECORD_BYTES;
+    if !reserve_sync(tuning, reserved) {
+        out.push(Out::Neg {
+            sub: sub.clone(),
+            text: neg_err_frame(&sub.id, "blocked: sync capacity exhausted"),
+            closes: true,
+        });
+        return;
+    }
+    let opened = build_storage(&records)
+        .map_err(|()| NegError::Internal)
+        .and_then(|storage| {
+            reconcile(&storage, &msg)
+                .map(|reply| (storage, reply))
+                .ok_or(NegError::Invalid)
+        });
+    match opened {
+        // NIP-77 answers every client message: `reconcile` always
+        // yields at least the protocol-version byte.
+        Ok((storage, reply)) => {
+            out.push(Out::Neg {
+                sub: sub.clone(),
+                text: neg_msg_frame(&sub.id, &faster_hex::hex_string(&reply)),
+                closes: false,
+            });
+            negs.insert(
+                (conn, sub.id.clone()),
+                NegSession {
+                    generation: sub.generation,
+                    storage,
+                    reserved,
+                    last_active: Instant::now(),
+                    out: out.clone(),
+                },
+            );
+        }
+        Err(err) => {
+            tuning.sync_memory.fetch_sub(reserved, Ordering::Relaxed);
+            push_neg_err(conn, sub, out, err);
+        }
+    }
+}
+
+/// Answer `sub` with the `NEG-ERR` a failed round maps to; wire
+/// details stay in the logs.
+fn push_neg_err(conn: ConnId, sub: &SubKey, out: &Outbound, err: NegError) {
+    let text = match err {
+        NegError::Invalid => neg_err_frame(&sub.id, "invalid: malformed negentropy message"),
+        NegError::Unknown => neg_err_frame(&sub.id, "closed: unknown subscription"),
+        NegError::Internal => {
+            tracing::error!(conn, "sync storage build failed");
+            neg_err_frame(&sub.id, "error: internal error")
+        }
+    };
+    out.push(Out::Neg {
+        sub: sub.clone(),
+        text,
+        closes: true,
+    });
+}
+
+/// Seal `records` into a `NegentropyStorageVector`.
+fn build_storage(records: &[(u64, EventId)]) -> Result<NegentropyStorageVector, ()> {
+    let mut storage = NegentropyStorageVector::with_capacity(records.len());
+    for (created_at, id) in records {
+        storage
+            .insert(*created_at, Id::from_byte_array(id.0))
+            .map_err(|err| {
+                tracing::error!(%err, "sync vector insert failed");
+            })?;
+    }
+    storage.seal().map_err(|err| {
+        tracing::error!(%err, "sync vector seal failed");
+    })?;
+    Ok(storage)
+}
+
+/// One reconcile round on a sealed storage — a fresh `Negentropy`
+/// per message, like strfry. Wire errors are logged, never exposed.
+fn reconcile(storage: &NegentropyStorageVector, msg: &[u8]) -> Option<Vec<u8>> {
+    Negentropy::borrowed(storage, NEG_FRAME_LIMIT)
+        .and_then(|mut neg| neg.reconcile(msg))
+        .map_err(|err| {
+            tracing::debug!(%err, "negentropy reconcile failed");
+            err
+        })
+        .ok()
+}
+
+/// Reserve `bytes` on the shared sync-memory budget; `false` rolls
+/// the reservation back.
+fn reserve_sync(tuning: &Tuning, bytes: usize) -> bool {
+    let prev = tuning.sync_memory.fetch_add(bytes, Ordering::Relaxed);
+    if tuning.max_sync_memory_bytes != 0 && prev + bytes > tuning.max_sync_memory_bytes {
+        tuning.sync_memory.fetch_sub(bytes, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// A `NEG-MSG` round: reconcile against the stored session, or
+/// `closed: unknown subscription` when none matches (including a
+/// session still scanning, which is cancelled).
+fn neg_msg(
+    conn: ConnId,
+    sub: &SubKey,
+    msg: &[u8],
+    out: &Outbound,
+    work: &mut Work,
+    tuning: &Tuning,
+) {
+    let key = (conn, sub.id.clone());
+    let reply = match work.negs.get_mut(&key) {
+        Some(session) if session.generation == sub.generation => reconcile(&session.storage, msg)
+            .inspect(|_| session.last_active = Instant::now())
+            .ok_or(NegError::Invalid),
+        _ => Err(NegError::Unknown),
+    };
+    match reply {
+        // As on open, every client message is answered.
+        Ok(reply) => out.push(Out::Neg {
+            sub: sub.clone(),
+            text: neg_msg_frame(&sub.id, &faster_hex::hex_string(&reply)),
+            closes: false,
+        }),
+        Err(NegError::Unknown) => {
+            // A `NEG-MSG` for a still-scanning sync is unanswerable
+            // (no storage yet): drop the scan and answer closed.
+            let keep = |e: &ScanEntry| {
+                e.conn != conn || e.sub.id != sub.id || !matches!(e.job, Job::Neg(_))
+            };
+            work.new_scans.retain(keep);
+            work.resumed.retain(keep);
+            push_neg_err(conn, sub, out, NegError::Unknown);
+        }
+        Err(err) => {
+            if let Some(session) = work.negs.remove(&key) {
+                tuning
+                    .sync_memory
+                    .fetch_sub(session.reserved, Ordering::Relaxed);
+            }
+            push_neg_err(conn, sub, out, err);
+        }
+    }
+}
+
+/// Idle-sync reaper: sessions without a `NEG-MSG` for `NEG_IDLE` are
+/// dropped and their reservation released; the connection answers
+/// `closed: idle timeout`.
+fn reap_negs(negs: &mut Negs, tuning: &Tuning) {
+    if negs.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let mut dead = Vec::new();
+    negs.retain(|(conn, id), session| {
+        if now.duration_since(session.last_active) < NEG_IDLE {
+            return true;
+        }
+        dead.push((
+            SubKey {
+                id: id.clone(),
+                generation: session.generation,
+            },
+            session.out.clone(),
+            session.reserved,
+        ));
+        let _ = conn;
+        false
+    });
+    for (sub, out, reserved) in dead {
+        tuning.sync_memory.fetch_sub(reserved, Ordering::Relaxed);
+        out.push(Out::Neg {
+            sub: sub.clone(),
+            text: neg_err_frame(&sub.id, "closed: idle timeout"),
+            closes: true,
+        });
+    }
+}
+
+/// Apply an inbox message.
+fn apply(msg: ReaderMsg, work: &mut Work, tuning: &Tuning) {
     match msg {
         ReaderMsg::Start(start) => {
             let now = SystemTime::now()
@@ -285,8 +613,22 @@ fn apply(
                         hll,
                     )))
                 }
+                // One record over the cap so completion can tell
+                // "at the limit" from "over the limit"; a filter's
+                // own `limit` still applies first.
+                ScanKind::Neg { msg: open } => Job::Neg(Box::new(NegScan {
+                    scan: Scan::new(
+                        start.filters,
+                        start.gate,
+                        start.snapshot,
+                        tuning.max_sync_events.saturating_add(1),
+                        now,
+                    ),
+                    records: Vec::new(),
+                    msg: open,
+                })),
             };
-            new_scans.push_back(ScanEntry {
+            work.new_scans.push_back(ScanEntry {
                 conn: start.conn,
                 sub: start.sub,
                 job,
@@ -295,14 +637,57 @@ fn apply(
             });
         }
         ReaderMsg::Cancel { conn, sub_id } => {
-            new_scans.retain(|e| e.conn != conn || e.sub.id != sub_id);
-            resumed.retain(|e| e.conn != conn || e.sub.id != sub_id);
+            // REQ/CLOSE lives in the `subs` namespace; a sync under
+            // the same id in `neg` is not cancelled.
+            let keep = |e: &ScanEntry| {
+                e.conn != conn || e.sub.id != sub_id || matches!(e.job, Job::Neg(_))
+            };
+            work.new_scans.retain(keep);
+            work.resumed.retain(keep);
         }
         ReaderMsg::CancelConn { conn } => {
-            new_scans.retain(|e| e.conn != conn);
-            resumed.retain(|e| e.conn != conn);
+            work.new_scans.retain(|e| e.conn != conn);
+            work.resumed.retain(|e| e.conn != conn);
+            drop_conn_negs(&mut work.negs, conn, tuning);
+        }
+        ReaderMsg::NegMsg(neg) => {
+            let crate::channels::NegMsg {
+                conn,
+                sub,
+                msg: payload,
+                out,
+            } = *neg;
+            neg_msg(conn, &sub, &payload, &out, work, tuning);
+        }
+        ReaderMsg::NegClose { conn, sub_id } => {
+            // Drop the session (any generation) and any queued sync
+            // scan for the id; `subs` under the same id are not
+            // touched.
+            let keep = |e: &ScanEntry| {
+                e.conn != conn || e.sub.id != sub_id || !matches!(e.job, Job::Neg(_))
+            };
+            work.new_scans.retain(keep);
+            work.resumed.retain(keep);
+            if let Some(session) = work.negs.remove(&(conn, sub_id)) {
+                tuning
+                    .sync_memory
+                    .fetch_sub(session.reserved, Ordering::Relaxed);
+            }
         }
     }
+}
+
+/// Release every sync session belonging to `conn`.
+fn drop_conn_negs(negs: &mut Negs, conn: ConnId, tuning: &Tuning) {
+    let mut released = 0usize;
+    negs.retain(|(owner, _), session| {
+        if *owner == conn {
+            released += session.reserved;
+            return false;
+        }
+        true
+    });
+    tuning.sync_memory.fetch_sub(released, Ordering::Relaxed);
 }
 
 #[allow(
@@ -394,6 +779,9 @@ mod tests {
                     total_budget: 0,
                     max_filter_limit: 500,
                     max_filter_limit_count: 1_000_000,
+                    max_sync_events: 1_000_000,
+                    max_sync_memory_bytes: 0,
+                    sync_memory: Arc::new(AtomicUsize::new(0)),
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,
@@ -462,6 +850,9 @@ mod tests {
                     total_budget: 0,
                     max_filter_limit: 500,
                     max_filter_limit_count: 1_000_000,
+                    max_sync_events: 1_000_000,
+                    max_sync_memory_bytes: 0,
+                    sync_memory: Arc::new(AtomicUsize::new(0)),
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,
@@ -525,6 +916,9 @@ mod tests {
                     total_budget: 1,
                     max_filter_limit: 500,
                     max_filter_limit_count: 1_000_000,
+                    max_sync_events: 1_000_000,
+                    max_sync_memory_bytes: 0,
+                    sync_memory: Arc::new(AtomicUsize::new(0)),
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,
@@ -533,9 +927,9 @@ mod tests {
         // Conn 2's scan completes (frames + EOSE + Activate); conn 1's
         // scan stays paused and pushes nothing beyond the notice frame
         // already queued above.
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let mut eose = false;
-        while !eose && std::time::Instant::now() < deadline {
+        while !eose && Instant::now() < deadline {
             match caught_rx.try_recv() {
                 Ok(Out::Frame { ref text, .. }) if text.contains("EOSE") => eose = true,
                 Ok(_) | Err(mpsc::error::TryRecvError::Empty) => {
@@ -625,6 +1019,9 @@ mod tests {
                     total_budget: 0,
                     max_filter_limit: 5_000,
                     max_filter_limit_count: 1_000_000,
+                    max_sync_events: 1_000_000,
+                    max_sync_memory_bytes: 0,
+                    sync_memory: Arc::new(AtomicUsize::new(0)),
                 },
                 &Metrics::new(),
                 &watch::channel(false).1,
@@ -635,8 +1032,8 @@ mod tests {
         // the flood drains; a new-scans-first scheduler would not emit
         // its EOSE until all 500 flood scans are done.
         let (mut activates, mut eose) = (0usize, false);
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while !eose && activates < 500 && std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !eose && activates < 500 && Instant::now() < deadline {
             while let Ok(out) = long_rx.try_recv() {
                 eose |= matches!(out, Out::Frame { ref text, .. } if text.contains("EOSE"));
             }
@@ -648,5 +1045,64 @@ mod tests {
         assert!(eose, "resumed scan starved during the flood");
         drop(tx);
         reader.join().unwrap();
+    }
+
+    /// A sync session idle past `NEG_IDLE` is reaped: `closed: idle
+    /// timeout` on its `Outbound`, reservation released, fresher
+    /// sessions untouched.
+    #[test]
+    fn idle_sync_is_reaped() {
+        let tuning = Tuning {
+            budget: Duration::from_secs(10),
+            high_water: usize::MAX,
+            total_budget: 0,
+            max_filter_limit: 500,
+            max_filter_limit_count: 1_000_000,
+            max_sync_events: 1_000_000,
+            max_sync_memory_bytes: 0,
+            sync_memory: Arc::new(AtomicUsize::new(80)),
+        };
+        let (out, mut out_rx) = Outbound::new(1 << 20, Arc::new(AtomicUsize::new(0)));
+        let mut negs = Negs::with_hasher(foldhash::fast::RandomState::default());
+        let session = |id: &str, generation: u64, last_active: Instant, conn_out: &Outbound| {
+            let mut storage = NegentropyStorageVector::new();
+            storage.seal().unwrap();
+            (
+                (1, SubId::parse(id).unwrap()),
+                NegSession {
+                    generation,
+                    storage,
+                    reserved: 40,
+                    last_active,
+                    out: conn_out.clone(),
+                },
+            )
+        };
+        for (id, generation, last_active) in [
+            (
+                "s",
+                7,
+                Instant::now()
+                    .checked_sub(NEG_IDLE + Duration::from_secs(1))
+                    .unwrap(),
+            ),
+            ("t", 8, Instant::now()),
+        ] {
+            let (key, session) = session(id, generation, last_active, &out);
+            negs.insert(key, session);
+        }
+
+        reap_negs(&mut negs, &tuning);
+
+        assert_eq!(negs.len(), 1, "{negs:?}");
+        assert!(negs.contains_key(&(1, SubId::parse("t").unwrap())));
+        assert_eq!(tuning.sync_memory.load(Ordering::Relaxed), 40);
+        let Out::Neg { sub, text, closes } = out_rx.try_recv().unwrap() else {
+            panic!("expected the idle-timeout NEG-ERR")
+        };
+        assert_eq!(sub.id.as_str(), "s");
+        assert_eq!(sub.generation, 7);
+        assert_eq!(text, "[\"NEG-ERR\",\"s\",\"closed: idle timeout\"]");
+        assert!(closes);
     }
 }

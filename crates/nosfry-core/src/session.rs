@@ -58,6 +58,31 @@ pub enum Command {
         /// Read visibility snapshot at COUNT time.
         gate: ReadGate,
     },
+    /// Open a NIP-77 negentropy session: the adapter runs the
+    /// stored-event record scan, seals the result set, then answers
+    /// `NEG-MSG`s on this connection's reader.
+    NegOpen {
+        /// New subscription key (fresh generation, `neg` namespace).
+        sub: SubKey,
+        /// The single compiled filter.
+        filters: Arc<[Filter]>,
+        /// Read visibility snapshot at `NEG-OPEN` time.
+        gate: ReadGate,
+        /// The initial hex-decoded negentropy message.
+        msg: Box<[u8]>,
+    },
+    /// A `NEG-MSG` for an open negentropy session.
+    NegMsg {
+        /// The session's current subscription key.
+        sub: SubKey,
+        /// Hex-decoded negentropy message.
+        msg: Box<[u8]>,
+    },
+    /// Close a negentropy session owned by this connection.
+    NegClose {
+        /// Subscription id (`neg` namespace).
+        sub_id: SubId,
+    },
     /// Close a subscription owned by this connection.
     Unsubscribe {
         /// Subscription id.
@@ -95,6 +120,9 @@ pub struct Session {
     /// Pubkeys authenticated via AUTH on this connection.
     authed: Arc<[PublicKey]>,
     subs: HashMap<SubId, u64, foldhash::fast::RandomState>,
+    /// NIP-77 negentropy sessions — a subscription-id namespace
+    /// separate from `subs`, sharing the generation counter.
+    neg: HashMap<SubId, u64, foldhash::fast::RandomState>,
     next_generation: u64,
     /// EVENT token bucket (`None` when the rate limit is disabled).
     event_bucket: Option<TokenBucket>,
@@ -122,6 +150,7 @@ impl Session {
             challenge_sent: false,
             authed: Arc::from([]),
             subs: HashMap::with_hasher(foldhash::fast::RandomState::default()),
+            neg: HashMap::with_hasher(foldhash::fast::RandomState::default()),
             next_generation: 1,
             event_bucket,
             req_bucket,
@@ -155,6 +184,25 @@ impl Session {
         }
     }
 
+    /// Whether `sub` still identifies the live negentropy session
+    /// under its id (`neg` namespace).
+    #[must_use]
+    pub fn is_current_neg(&self, sub: &SubKey) -> bool {
+        self.neg.get(&sub.id) == Some(&sub.generation)
+    }
+
+    /// The relay closes a negentropy session on its own initiative:
+    /// removes it only while `sub` still identifies the live
+    /// generation. Returns whether a session was removed.
+    pub fn close_neg_by_relay(&mut self, sub: &SubKey) -> bool {
+        if self.neg.get(&sub.id) == Some(&sub.generation) {
+            self.neg.remove(&sub.id);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Feed one text frame; append the resulting commands to `out`.
     /// `now_ms` is the current unix time in milliseconds: the session
     /// derives seconds for `created_at` checks and uses milliseconds
@@ -164,17 +212,7 @@ impl Session {
             Ok(message) => message,
             Err(error) => {
                 let verb = error.verb();
-                // A refused REQ or COUNT closes an open subscription
-                // under the same id: it must stop delivering before the
-                // CLOSED.
-                if let MessageError::Filter {
-                    verb: ClientVerb::Req | ClientVerb::Count,
-                    sub,
-                    ..
-                } = &error
-                {
-                    self.drop_sub(sub, out);
-                }
+                self.drop_refused(&error, out);
                 out.push(rejection(error));
                 return Received {
                     verb,
@@ -238,14 +276,41 @@ impl Session {
                 }
                 self.on_count(sub_id, filters, out);
             }
-            ClientMessage::NegOpen { sub_id, .. }
-            | ClientMessage::NegMsg { sub_id, .. }
-            | ClientMessage::NegClose { sub_id } => {
-                out.push(Command::Send {
-                    verb: RelayVerb::NegErr,
-                    text: neg_err_frame(&sub_id, &Reason::Unsupported.message("negentropy sync")),
-                });
+            ClientMessage::NegOpen {
+                sub_id,
+                filter,
+                msg,
+            } => {
+                if !self.charge_neg(now_ms, &sub_id, out) {
+                    return Received {
+                        verb: Some(verb),
+                        rate_limited: true,
+                    };
+                }
+                self.on_neg_open(sub_id, *filter, msg, out);
             }
+            ClientMessage::NegMsg { sub_id, msg } => {
+                if !self.charge_neg(now_ms, &sub_id, out) {
+                    return Received {
+                        verb: Some(verb),
+                        rate_limited: true,
+                    };
+                }
+                match self.neg.get(&sub_id) {
+                    Some(&generation) => out.push(Command::NegMsg {
+                        sub: SubKey {
+                            id: sub_id,
+                            generation,
+                        },
+                        msg,
+                    }),
+                    None => out.push(Command::Send {
+                        verb: RelayVerb::NegErr,
+                        text: neg_err_frame(&sub_id, "closed: unknown subscription"),
+                    }),
+                }
+            }
+            ClientMessage::NegClose { sub_id } => self.drop_neg(&sub_id, out),
         }
         Received {
             verb: Some(verb),
@@ -480,15 +545,19 @@ impl Session {
         });
     }
 
-    /// Spend one REQ/`COUNT` token from the connection and address
-    /// buckets; on a refusal drop the sub id and answer `rate-limited`.
-    fn charge_req(&mut self, now_ms: u64, sub_id: &SubId, out: &mut Vec<Command>) -> bool {
-        if self
-            .req_bucket
+    /// The connection + address REQ tokens one REQ/`COUNT`/negentropy
+    /// message spends.
+    fn req_charge(&mut self, now_ms: u64) -> bool {
+        self.req_bucket
             .as_mut()
             .is_none_or(|bucket| bucket.take(now_ms))
             && self.address.take_req(now_ms)
-        {
+    }
+
+    /// Spend one REQ/`COUNT` token from the connection and address
+    /// buckets; on a refusal drop the sub id and answer `rate-limited`.
+    fn charge_req(&mut self, now_ms: u64, sub_id: &SubId, out: &mut Vec<Command>) -> bool {
+        if self.req_charge(now_ms) {
             return true;
         }
         self.drop_sub(sub_id, out);
@@ -497,6 +566,46 @@ impl Session {
             text: closed_frame(sub_id, &Reason::RateLimited.message("slow down")),
         });
         false
+    }
+
+    /// The same charge for a `NEG-OPEN`/`NEG-MSG`; a refusal drops the
+    /// negentropy session (an unapplied message leaves the stream
+    /// inconsistent) and answers `NEG-ERR`.
+    fn charge_neg(&mut self, now_ms: u64, sub_id: &SubId, out: &mut Vec<Command>) -> bool {
+        if self.req_charge(now_ms) {
+            return true;
+        }
+        self.drop_neg(sub_id, out);
+        out.push(Command::Send {
+            verb: RelayVerb::NegErr,
+            text: neg_err_frame(sub_id, &Reason::RateLimited.message("slow down")),
+        });
+        false
+    }
+
+    /// A refused filter-verb closes the open subscription under its
+    /// id — `subs` for REQ/COUNT, `neg` for `NEG-OPEN` — so it stops
+    /// delivering before the refusal frame.
+    fn drop_refused(&mut self, error: &MessageError, out: &mut Vec<Command>) {
+        let MessageError::Filter { verb, sub, .. } = error else {
+            return;
+        };
+        match verb {
+            ClientVerb::NegOpen => self.drop_neg(sub, out),
+            ClientVerb::Req | ClientVerb::Count => self.drop_sub(sub, out),
+            _ => {}
+        }
+    }
+
+    /// Remove a negentropy session and emit [`Command::NegClose`] when
+    /// it was open — every refusal that answers `NEG-ERR` for an
+    /// existing id must tear the session down first.
+    fn drop_neg(&mut self, sub_id: &SubId, out: &mut Vec<Command>) {
+        if self.neg.remove(sub_id).is_some() {
+            out.push(Command::NegClose {
+                sub_id: sub_id.clone(),
+            });
+        }
     }
 
     fn on_req(&mut self, sub_id: SubId, filters: Vec<Filter>, out: &mut Vec<Command>) {
@@ -528,6 +637,102 @@ impl Session {
             sub,
             filters: filters.into(),
             gate,
+        });
+    }
+
+    /// `NEG-OPEN`: REQ's checks under the `neg` namespace — the REQ
+    /// rate buckets (charged by the caller), the tag-condition cap,
+    /// the session cap, and the fully restricted check. Every refusal
+    /// drops the session and answers `NEG-ERR`. On success takes the
+    /// `neg` slot with a fresh generation, closing a prior session
+    /// under the same id first.
+    fn on_neg_open(
+        &mut self,
+        sub_id: SubId,
+        filter: Filter,
+        msg: Box<[u8]>,
+        out: &mut Vec<Command>,
+    ) {
+        if self.limits.req.max_sync_events == 0 {
+            self.drop_neg(&sub_id, out);
+            out.push(Command::Send {
+                verb: RelayVerb::NegErr,
+                text: neg_err_frame(&sub_id, &Reason::Unsupported.message("negentropy sync")),
+            });
+            return;
+        }
+        if filter.tag_filter_count() > self.limits.req.max_tags_per_filter {
+            self.drop_neg(&sub_id, out);
+            out.push(Command::Send {
+                verb: RelayVerb::NegErr,
+                text: neg_err_frame(
+                    &sub_id,
+                    &Reason::Invalid.message("filter has too many tag conditions"),
+                ),
+            });
+            return;
+        }
+        if !self.neg.contains_key(&sub_id)
+            && self.neg.len() >= self.limits.req.max_subs_per_connection
+        {
+            self.drop_neg(&sub_id, out);
+            out.push(Command::Send {
+                verb: RelayVerb::NegErr,
+                text: neg_err_frame(
+                    &sub_id,
+                    &Reason::Error.message("too many open subscriptions"),
+                ),
+            });
+            return;
+        }
+        // A fully restricted filter cannot return anything to an
+        // unauthenticated client (strfry `isFilterGroupFullyRestricted`).
+        if self
+            .limits
+            .auth
+            .fully_restricts(std::slice::from_ref(&filter))
+            && self.authed.is_empty()
+        {
+            if self.limits.auth.enabled() {
+                self.issue_challenge(out);
+                self.drop_neg(&sub_id, out);
+                out.push(Command::Send {
+                    verb: RelayVerb::NegErr,
+                    text: neg_err_frame(
+                        &sub_id,
+                        &Reason::AuthRequired.message("requested filter requires authentication"),
+                    ),
+                });
+            } else {
+                self.drop_neg(&sub_id, out);
+                out.push(Command::Send {
+                    verb: RelayVerb::NegErr,
+                    text: neg_err_frame(
+                        &sub_id,
+                        &Reason::Restricted.message("requested kinds are not served"),
+                    ),
+                });
+            }
+            return;
+        }
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        if self.neg.insert(sub_id.clone(), generation).is_some() {
+            out.push(Command::NegClose {
+                sub_id: sub_id.clone(),
+            });
+        }
+        out.push(Command::NegOpen {
+            sub: SubKey {
+                id: sub_id,
+                generation,
+            },
+            filters: Arc::from([filter]),
+            gate: ReadGate {
+                rules: Arc::clone(&self.limits.auth),
+                authed: Arc::clone(&self.authed),
+            },
+            msg,
         });
     }
 

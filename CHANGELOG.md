@@ -25,6 +25,22 @@ The format is based on [Keep a Changelog]; this project follows
   HyperLogLog sketch of the counted authors (NIP-45 offset rule).
   NIP-11 advertises 45 while COUNT is enabled.
 
+- NIP-77 negentropy sync: `NEG-OPEN`/`NEG-MSG`/`NEG-CLOSE` run a
+  record-mode scan (matching, limits, ordering, dedup, read-gate, and
+  expiration identical to a REQ, without fetching payloads) and keep
+  a sealed `NegentropyStorageVector` per session for reconciliation.
+  Syncs have their own subscription-id namespace, share the REQ rate
+  buckets and the `max_subs_per_connection` cap, and idle sessions
+  are reaped after 60 s (`closed: idle timeout`).
+  `relay.limits.max_sync_events` (default 1,000,000, `0` disables
+  sync) bounds the records per sync — `blocked: too many query
+  results` with the cap as the fourth `NEG-ERR` element — and
+  `[relay] max_sync_memory_bytes` (default 1 GiB, `0` unlimited) is
+  the process-wide budget for sealed storages at 40 bytes per
+  record. Both are restart-only; NIP-11 advertises 77 while sync is
+  enabled. The `nosfry_sync_memory_bytes` gauge reports the reserved
+  bytes.
+
 - `[relay] nofiles` (default 1,000,000, `0` disables): the binary raises
   its soft open-file limit at startup, capped by the hard limit, so
   systemd/containerd's 1024 default no longer caps connection count.

@@ -22,6 +22,10 @@ pub struct ReqLimits {
     /// `COUNT` entirely. The count itself is never capped — hitting
     /// the budget marks the answer `"approximate": true`.
     pub max_filter_limit_count: u64,
+    /// Maximum number of stored events a `NEG-OPEN` sync may hold;
+    /// `0` disables negentropy sync entirely. The filter's own `limit`
+    /// applies inside this cap; over it the sync is refused.
+    pub max_sync_events: u64,
     /// Maximum number of `#x` tag conditions allowed per filter.
     pub max_tags_per_filter: usize,
 }
@@ -33,6 +37,7 @@ impl Default for ReqLimits {
             max_subs_per_connection: 200,
             max_filter_limit: 500,
             max_filter_limit_count: 1_000_000,
+            max_sync_events: 1_000_000,
             max_tags_per_filter: 3,
         }
     }

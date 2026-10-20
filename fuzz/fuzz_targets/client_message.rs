@@ -68,7 +68,17 @@ fuzz_target!(|data: &[u8]| {
                     last_generation = sub.generation;
                     assert!(session.is_current(sub), "stale Subscribe {sub:?}");
                 }
-                Command::Publish { .. } | Command::Unsubscribe { .. } => {}
+                Command::NegOpen { sub, .. } => {
+                    assert!(sub.generation > last_generation);
+                    last_generation = sub.generation;
+                    assert!(session.is_current_neg(sub), "stale NegOpen {sub:?}");
+                }
+                Command::NegMsg { sub, .. } => {
+                    assert!(session.is_current_neg(sub), "stale NegMsg {sub:?}");
+                }
+                Command::Publish { .. }
+                | Command::Unsubscribe { .. }
+                | Command::NegClose { .. } => {}
             }
         }
     }
