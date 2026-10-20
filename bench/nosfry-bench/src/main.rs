@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod soak;
+
 use clap::{Parser, Subcommand, ValueEnum};
 use futures::{SinkExt, StreamExt};
 use secp256k1::{Keypair, schnorr};
@@ -70,6 +72,38 @@ enum Cmd {
         pid: u32,
         #[arg(long, default_value_t = 5)]
         hold_secs: u64,
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Mixed long-running workload; samples the relay as JSONL.
+    Soak {
+        #[arg(long)]
+        url: String,
+        /// `http://host:port/metrics`; skipped when absent.
+        #[arg(long)]
+        metrics_url: Option<String>,
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Relay db directory; `<db-dir>/data.mdb` is sized per sample.
+        #[arg(long)]
+        db_dir: Option<std::path::PathBuf>,
+        #[arg(long)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 60)]
+        sample_secs: u64,
+        #[arg(long, default_value_t = 8)]
+        publishers: usize,
+        /// Total publish rate in events per second across publishers.
+        #[arg(long, default_value_t = 200.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 200)]
+        subscribers: usize,
+        /// Short-lived connections opened per second.
+        #[arg(long, default_value_t = 10.0)]
+        churn_rate: f64,
+        /// Spawn one never-reading `REQ {}` consumer this often; 0 off.
+        #[arg(long, default_value_t = 60)]
+        slow_every_secs: u64,
         #[arg(long, default_value = "")]
         label: String,
     },
@@ -580,6 +614,38 @@ async fn main() {
         Cmd::Conns { url, conns: n, deflate, pid, hold_secs, label } => {
             let url = url.parse().expect("valid ws url");
             conns(url, n, deflate, pid, hold_secs, label).await;
+        }
+        Cmd::Soak {
+            url,
+            metrics_url,
+            pid,
+            db_dir,
+            duration_secs,
+            sample_secs,
+            publishers,
+            rate,
+            subscribers,
+            churn_rate,
+            slow_every_secs,
+            label,
+        } => {
+            let url = url.parse().expect("valid ws url");
+            let metrics_url = metrics_url.map(|u| u.parse().expect("valid metrics url"));
+            soak::run(
+                url,
+                metrics_url,
+                pid,
+                db_dir,
+                duration_secs,
+                sample_secs,
+                publishers,
+                rate,
+                subscribers,
+                churn_rate,
+                slow_every_secs,
+                label,
+            )
+            .await;
         }
     }
 }
