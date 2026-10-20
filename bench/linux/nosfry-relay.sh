@@ -20,6 +20,11 @@ max_websocket_payload_size = 131072
 # connect from one IP and ingest floods a single connection.
 max_connections_per_ip = 0
 
+# Serve restricted read kinds (DMs) like strfry does, so relayBench's
+# cross-check compares the same result sets.
+[relay.auth]
+restricted_read_kinds = []
+
 [relay.rate_limits]
 events_per_second = 0
 events_burst = 0
