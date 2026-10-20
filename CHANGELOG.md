@@ -67,6 +67,28 @@ down`; CLOSE is never charged.
   `nosfry_connections`, `nosfry_connections_rejected_total`, and
   `nosfry_rate_limited_total{verb}`, all on fixed label sets from
   lock-free counters.
+- NIP-42 authentication (`[relay.auth]`): with `service_url` set, the
+  relay challenges a connection lazily — once, the first time it REQs
+  a fully restricted filter or publishes a protected event — and a
+  valid kind-22242 AUTH event authenticates its pubkey. Up to 8
+  distinct pubkeys authenticate per connection (strfry allows one).
+- NIP-70 protected events: a `["-"]` tag makes the event rejectable —
+  `blocked: event marked as protected` when AUTH is disabled,
+  `auth-required:` (with the challenge) when the connection has not
+  authenticated, `restricted: must be published by the author` when
+  authenticated as a different key. Kind-6/16 reposts whose content
+  embeds `["-"]` are blocked outright.
+- Restricted read kinds: `restricted_read_kinds` (default `[4, 1059]`)
+  are hidden from unauthenticated clients and, with
+  `restrict_read_to_involved = true`, from authenticated clients not
+  involved as author or `p`-tagged recipient. A REQ whose filters are
+  all restricted is refused (`auth-required:` / `restricted:`); mixed
+  REQs subscribe and the per-subscription `ReadGate` hides restricted
+  events in both stored scans and the live monitor — hidden events
+  never consume `limit`.
+- The write-policy plugin request gains `authed`, the hex pubkey the
+  connection authenticated with (omitted when absent), matching
+  strfry's plugin field.
 - `[relay.write_policy]`: a strfry-compatible write-policy plugin
   (`plugin`, `timeout_seconds` = 10). Each verified event is sent to
   `/bin/sh -c <plugin>` as one JSON line carrying the raw event, the
@@ -117,6 +139,15 @@ down`; CLOSE is never charged.
 - `Scan::new` takes a `now` argument (an event expiring at or before it
   is hidden and never counted) and its emit callback receives
   `(seq, json)`.
+- **BREAKING:** kinds 4 and 1059 are no longer served to
+  unauthenticated clients by default (`restricted_read_kinds`); set
+  `restricted_read_kinds = []` to keep serving them openly.
+- **BREAKING (API):** `Session::new` takes the per-connection
+  challenge; `Command::Publish` is `{ event, authed }` and
+  `Command::Subscribe` carries a `ReadGate`; `Scan::new` and
+  `Monitors::insert` take the gate; `Limits` is no longer `Copy`
+  (new `auth` field); `Config::limits` is now fallible
+  (`ServerError::Auth` on an invalid `relay.auth.service_url`).
 - `--config` is a global flag on the `nosfry` binary: it works before
   or after the subcommand, not just on `relay`.
 - All logs go to stderr (previously stdout), keeping stdout clean for
@@ -124,6 +155,17 @@ down`; CLOSE is never charged.
 - `ServerError::Serve` is renamed to `ServerError::Shutdown`: it now
   wraps the `JoinError` of the worker-shutdown task (it previously
   wrapped `std::io::Error`).
+
+### Fixed
+
+- Protected events (`["-"]` tag) were accepted although NIP-70
+  requires rejecting them by default; kind-6/16 reposts embedding a
+  protected event are now blocked too.
+- A refused re-REQ (over the filter/tag/subscription limits,
+  rate-limited, or a filter parse error) for an already-open
+  subscription id now closes the old subscription before the `CLOSED`,
+  so it no longer keeps delivering under an id the client was told is
+  closed.
 
 ### Security
 

@@ -34,6 +34,7 @@ fn monitors_matches(c: &mut Criterion) {
                 generation: 0,
             },
             Arc::clone(&filters),
+            nosfry_core::auth::ReadGate::default(),
         );
     }
     let event = PackedEvent::build(

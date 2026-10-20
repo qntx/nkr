@@ -86,6 +86,17 @@ plugin = ""
 # `error: internal error` and the plugin process is restarted.
 timeout_seconds = 10
 
+[relay.auth]
+# NIP-42 authentication. Empty disables AUTH: restricted kinds are
+# stored but never served and protected events are rejected.
+service_url = ""
+# Kinds served only to authenticated readers (strfry default: DMs and
+# gift wraps).
+restricted_read_kinds = [4, 1059]
+# Serve restricted kinds only to authenticated pubkeys involved in the
+# event (author or "p" tag); false serves them to any authed reader.
+restrict_read_to_involved = true
+
 [relay.threads] # restart-only
 # Stored-scan reader threads.
 readers = 3

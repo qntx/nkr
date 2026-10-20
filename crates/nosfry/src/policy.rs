@@ -5,8 +5,10 @@
 //! Protocol (strfry `PluginEventSifter` identically):
 //!
 //! - Request: `{"type":"new","event":<raw>,"receivedAt":<unix>,`
-//!   `"sourceType":"IP4"|"IP6","sourceInfo":"<ip>"}` — IPv4-mapped
-//!   IPv6 reports `IP4` with the v4 address.
+//!   `"sourceType":"IP4"|"IP6","sourceInfo":"<ip>"[,`
+//!   `"authed":"<hex pubkey>"]}` — IPv4-mapped IPv6 reports `IP4`
+//!   with the v4 address; `authed` appears only after the connection
+//!   authenticated (NIP-42).
 //! - Response: `{"id":"<event id>","action":"accept"|"reject"|`
 //!   `"shadowReject","msg":"..."}` (`msg` optional). Non-JSON lines
 //!   are skipped with a warning so plugins may print noise; an id
@@ -28,7 +30,7 @@ use std::io;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nosfry_core::event::Event;
+use nosfry_core::event::{Event, PublicKey};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -70,14 +72,21 @@ impl WritePolicy {
         Self { tx }
     }
 
-    /// Ask the plugin about one verified event.
-    pub(crate) async fn check(&self, event: &Event, source: IpAddr) -> Decision {
+    /// Ask the plugin about one verified event. `authed` is the
+    /// connection's authenticated pubkey (NIP-42), sent as the
+    /// request's `authed` field when present.
+    pub(crate) async fn check(
+        &self,
+        event: &Event,
+        source: IpAddr,
+        authed: Option<PublicKey>,
+    ) -> Decision {
         let received_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
         let (reply, rx) = oneshot::channel();
         let request = Request {
-            line: request_line(event.json(), received_at, source),
+            line: request_line(event.json(), received_at, source, authed),
             id: event.id().to_string(),
             reply,
         };
@@ -240,12 +249,21 @@ async fn timed<T, E: Into<PolicyError>>(
 }
 
 /// The strfry input line for one event: minified JSON, the event
-/// embedded raw (no re-serialization).
-fn request_line(event_json: &str, received_at: u64, source: IpAddr) -> String {
+/// embedded raw (no re-serialization); `authed` is the hex pubkey the
+/// connection authenticated with (NIP-42), omitted when absent.
+fn request_line(
+    event_json: &str,
+    received_at: u64,
+    source: IpAddr,
+    authed: Option<PublicKey>,
+) -> String {
     let (source_type, source_info) = source_parts(source);
+    let authed = authed.map_or_else(String::new, |pk| {
+        format!(",\"authed\":\"{}\"", faster_hex::hex_string(&pk.0))
+    });
     format!(
         "{{\"type\":\"new\",\"event\":{event_json},\"receivedAt\":{received_at},\
-         \"sourceType\":\"{source_type}\",\"sourceInfo\":\"{source_info}\"}}"
+         \"sourceType\":\"{source_type}\",\"sourceInfo\":\"{source_info}\"{authed}}}"
     )
 }
 
@@ -354,6 +372,7 @@ mod tests {
         source_type: String,
         #[serde(rename = "sourceInfo")]
         source_info: String,
+        authed: Option<String>,
     }
 
     #[test]
@@ -362,14 +381,24 @@ mod tests {
             EVENT_JSON,
             1_700_000_000,
             IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)),
+            Some(PublicKey([0xab; 32])),
         );
         let request: Req<'_> = serde_json::from_str(&line).unwrap();
         assert_eq!(request.kind, "new");
         assert_eq!(request.received_at, 1_700_000_000);
         assert_eq!(request.source_type, "IP4");
         assert_eq!(request.source_info, "192.0.2.7");
+        assert_eq!(request.authed.as_deref(), Some(&"ab".repeat(32)[..]));
         // The event is embedded raw: byte-identical, not reserialized.
         assert_eq!(request.event.get(), EVENT_JSON);
+        // Unauthenticated connections omit the field.
+        let anonymous = request_line(
+            EVENT_JSON,
+            1_700_000_000,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            None,
+        );
+        assert!(!anonymous.contains("authed"), "{anonymous}");
     }
 
     #[test]

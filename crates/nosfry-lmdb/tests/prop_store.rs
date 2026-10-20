@@ -231,7 +231,13 @@ fn store_scan(
     max_limit: u64,
     now: u64,
 ) -> Vec<String> {
-    let mut scan = Scan::new(filters, snapshot, max_limit, now);
+    let mut scan = Scan::new(
+        filters,
+        nosfry_core::auth::ReadGate::default(),
+        snapshot,
+        max_limit,
+        now,
+    );
     let out = RefCell::new(Vec::new());
     let mut guard = 0usize;
     loop {

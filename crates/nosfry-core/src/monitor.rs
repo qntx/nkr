@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::auth::ReadGate;
 use crate::filter::Filter;
 use crate::message::SubId;
 use crate::packed::PackedRef;
@@ -50,6 +51,8 @@ struct Entry<C> {
     conn: C,
     key: SubKey,
     filters: Arc<[Filter]>,
+    /// Read visibility snapshotted at REQ time.
+    gate: ReadGate,
     emit_stamp: u64,
     slots: Vec<usize>,
 }
@@ -108,15 +111,17 @@ impl<C: Copy + Eq + std::hash::Hash> Monitors<C> {
         self.entries.is_empty()
     }
 
-    /// Register `sub` for `conn` with its compiled filters; replaces any
-    /// existing subscription under the same `(conn, sub.id)`.
-    pub fn insert(&mut self, conn: C, sub: SubKey, filters: Arc<[Filter]>) {
+    /// Register `sub` for `conn` with its compiled filters and the
+    /// read gate snapshotted at REQ time; replaces any existing
+    /// subscription under the same `(conn, sub.id)`.
+    pub fn insert(&mut self, conn: C, sub: SubKey, filters: Arc<[Filter]>, gate: ReadGate) {
         self.remove(conn, &sub.id);
         let sub_id = sub.id.clone();
         let entry = self.entries.insert(Entry {
             conn,
             key: sub,
             filters,
+            gate,
             emit_stamp: 0,
             slots: Vec::new(),
         });
@@ -211,10 +216,11 @@ impl<C: Copy + Eq + std::hash::Hash> Monitors<C> {
         if entry.emit_stamp == self.epoch {
             return;
         }
-        let matched = entry
-            .filters
-            .get(filter_index)
-            .is_some_and(|filter| filter.matches(ev));
+        let matched = entry.gate.allows(ev)
+            && entry
+                .filters
+                .get(filter_index)
+                .is_some_and(|filter| filter.matches(ev));
         if matched {
             entry.emit_stamp = self.epoch;
             out.push((entry.conn, entry.key.clone()));

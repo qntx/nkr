@@ -1,7 +1,10 @@
 //! Relay resource limits (strfry-compatible defaults).
 
+use std::sync::Arc;
+
 use serde::Deserialize;
 
+use crate::auth::AuthRules;
 use crate::event::EventLimits;
 
 /// REQ-side limits: filter shape and subscription count. All fields
@@ -100,8 +103,9 @@ impl TokenBucket {
 }
 
 /// The limits a session enforces: ingest ([`EventLimits`]), REQ-side
-/// ([`ReqLimits`]), and per-connection rate limits ([`RateLimits`]).
-#[derive(Debug, Clone, Copy, Default)]
+/// ([`ReqLimits`]), per-connection rate limits ([`RateLimits`]), and
+/// authentication rules ([`AuthRules`]).
+#[derive(Debug, Clone, Default)]
 pub struct Limits {
     /// Event acceptance limits (structure plus `created_at` windows).
     pub event: EventLimits,
@@ -109,6 +113,8 @@ pub struct Limits {
     pub req: ReqLimits,
     /// Per-connection EVENT/REQ rate limits.
     pub rate: RateLimits,
+    /// NIP-42 authentication and read restriction.
+    pub auth: Arc<AuthRules>,
 }
 
 #[cfg(test)]

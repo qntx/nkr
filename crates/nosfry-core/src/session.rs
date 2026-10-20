@@ -3,12 +3,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::event::{Event, UnverifiedEvent};
+use crate::auth::{AUTH_KIND, MAX_AUTHED_PUBKEYS, ReadGate};
+use crate::event::{Event, EventId, PublicKey, UnverifiedEvent};
 use crate::filter::Filter;
+use crate::kind::Kind;
 use crate::limits::{Limits, TokenBucket};
 use crate::message::{
-    ClientMessage, ClientVerb, MessageError, Reason, RelayVerb, SubId, closed_frame, neg_err_frame,
-    notice_frame, ok_frame,
+    ClientMessage, ClientVerb, MessageError, Reason, RelayVerb, SubId, auth_frame, closed_frame,
+    neg_err_frame, notice_frame, ok_frame,
 };
 
 /// Identity of an open subscription: the id plus a generation counter that
@@ -26,7 +28,15 @@ pub struct SubKey {
 pub enum Command {
     /// A verified event arrived. The adapter broadcasts it to live
     /// subscribers (ephemeral) or hands it to the writer, then answers OK.
-    Publish(Arc<Event>),
+    /// `authed` is the event author when authenticated, else the
+    /// connection's first authenticated pubkey — the write-policy
+    /// plugin's `authed` field.
+    Publish {
+        /// The verified event.
+        event: Arc<Event>,
+        /// Authenticated pubkey context for the write-policy plugin.
+        authed: Option<PublicKey>,
+    },
     /// Open a subscription: the adapter runs the stored-event scan and
     /// registers the live monitor.
     Subscribe {
@@ -34,6 +44,8 @@ pub enum Command {
         sub: SubKey,
         /// Compiled filters.
         filters: Arc<[Filter]>,
+        /// Read visibility snapshot at REQ time.
+        gate: ReadGate,
     },
     /// Close a subscription owned by this connection.
     Unsubscribe {
@@ -65,6 +77,12 @@ pub struct Received {
 #[derive(Debug)]
 pub struct Session {
     limits: Arc<Limits>,
+    /// The NIP-42 challenge for this connection (adapter-supplied).
+    challenge: Box<str>,
+    /// The challenge has been sent (at most once per connection).
+    challenge_sent: bool,
+    /// Pubkeys authenticated via AUTH on this connection.
+    authed: Arc<[PublicKey]>,
     subs: HashMap<SubId, u64, foldhash::fast::RandomState>,
     next_generation: u64,
     /// EVENT token bucket (`None` when the rate limit is disabled).
@@ -74,20 +92,30 @@ pub struct Session {
 }
 
 impl Session {
-    /// New session under the given limits.
+    /// New session under the given limits with the adapter-supplied
+    /// NIP-42 challenge (sent lazily, only when the connection needs it).
     #[must_use]
-    pub fn new(limits: Arc<Limits>) -> Self {
+    pub fn new(limits: Arc<Limits>, challenge: String) -> Self {
         let event_bucket = (limits.rate.events_per_second > 0)
             .then(|| TokenBucket::new(limits.rate.events_per_second, limits.rate.events_burst));
         let req_bucket = (limits.rate.reqs_per_second > 0)
             .then(|| TokenBucket::new(limits.rate.reqs_per_second, limits.rate.reqs_burst));
         Self {
             limits,
+            challenge: challenge.into_boxed_str(),
+            challenge_sent: false,
+            authed: Arc::from([]),
             subs: HashMap::with_hasher(foldhash::fast::RandomState::default()),
             next_generation: 1,
             event_bucket,
             req_bucket,
         }
+    }
+
+    /// The pubkeys authenticated on this connection.
+    #[must_use]
+    pub fn authenticated(&self) -> &[PublicKey] {
+        &self.authed
     }
 
     /// Whether `sub` still identifies the live subscription under its id —
@@ -119,6 +147,16 @@ impl Session {
             Ok(message) => message,
             Err(error) => {
                 let verb = error.verb();
+                // A refused REQ closes an open subscription under the
+                // same id: it must stop delivering before the CLOSED.
+                if let MessageError::Filter {
+                    verb: ClientVerb::Req,
+                    sub,
+                    ..
+                } = &error
+                {
+                    self.drop_sub(sub, out);
+                }
                 out.push(rejection(error));
                 return Received {
                     verb,
@@ -131,7 +169,7 @@ impl Session {
         // before any other work: an over-limit client is throttled no
         // matter what its message would have done.
         match message {
-            ClientMessage::Event(unverified) => {
+            ClientMessage::Event(unverified) | ClientMessage::Auth(unverified) => {
                 if let Some(bucket) = &mut self.event_bucket
                     && !bucket.take(now_ms)
                 {
@@ -148,12 +186,17 @@ impl Session {
                         rate_limited: true,
                     };
                 }
-                self.on_event(now_ms / 1000, unverified, out);
+                if verb == ClientVerb::Auth {
+                    self.on_auth(now_ms / 1000, unverified, out);
+                } else {
+                    self.on_event(now_ms / 1000, unverified, out);
+                }
             }
             ClientMessage::Req { sub_id, filters } => {
                 if let Some(bucket) = &mut self.req_bucket
                     && !bucket.take(now_ms)
                 {
+                    self.drop_sub(&sub_id, out);
                     out.push(Command::Send {
                         verb: RelayVerb::Closed,
                         text: closed_frame(&sub_id, &Reason::RateLimited.message("slow down")),
@@ -176,12 +219,6 @@ impl Session {
                     text: closed_frame(&sub_id, &Reason::Unsupported.message("COUNT")),
                 });
             }
-            ClientMessage::Auth(..) => {
-                out.push(Command::Send {
-                    verb: RelayVerb::Notice,
-                    text: notice_frame(&Reason::Unsupported.message("AUTH")),
-                });
-            }
             ClientMessage::NegOpen { sub_id, .. }
             | ClientMessage::NegMsg { sub_id, .. }
             | ClientMessage::NegClose { sub_id } => {
@@ -197,7 +234,57 @@ impl Session {
         }
     }
 
-    fn on_event(&self, now: u64, unverified: UnverifiedEvent<'_>, out: &mut Vec<Command>) {
+    /// Send the NIP-42 challenge, at most once per connection (strfry's
+    /// lazy challenge: never on connect).
+    fn issue_challenge(&mut self, out: &mut Vec<Command>) {
+        if self.challenge_sent {
+            return;
+        }
+        self.challenge_sent = true;
+        out.push(Command::Send {
+            verb: RelayVerb::Auth,
+            text: auth_frame(&self.challenge),
+        });
+    }
+
+    /// Remove a subscription under `sub_id` and emit the adapter-side
+    /// [`Command::Unsubscribe`] when it was open — every refusal that
+    /// answers `CLOSED` for an existing id must stop the old
+    /// subscription first.
+    fn drop_sub(&mut self, sub_id: &SubId, out: &mut Vec<Command>) {
+        if self.subs.remove(sub_id).is_some() {
+            out.push(Command::Unsubscribe {
+                sub_id: sub_id.clone(),
+            });
+        }
+    }
+
+    /// The shared `created_at`/expiration window checks for EVENT and
+    /// AUTH payloads. `Some(reason)` rejects.
+    fn check_time(
+        &self,
+        created_at: u64,
+        kind: Kind,
+        expiration: Option<u64>,
+        now: u64,
+    ) -> Option<&'static str> {
+        let limits = &self.limits.event;
+        if created_at > now.saturating_add(limits.reject_events_newer_than_seconds) {
+            Some("created_at is too far in the future")
+        } else if created_at < now.saturating_sub(limits.reject_events_older_than_seconds) {
+            Some("created_at is too far in the past")
+        } else if kind.is_ephemeral()
+            && created_at < now.saturating_sub(limits.reject_ephemeral_events_older_than_seconds)
+        {
+            Some("ephemeral event created_at is too far in the past")
+        } else if expiration.is_some_and(|expires| expires <= now) {
+            Some("event has expired")
+        } else {
+            None
+        }
+    }
+
+    fn on_event(&mut self, now: u64, unverified: UnverifiedEvent<'_>, out: &mut Vec<Command>) {
         let limits = &*self.limits;
         if let Err(error) = unverified.check_limits(&limits.event) {
             out.push(Command::Send {
@@ -206,36 +293,90 @@ impl Session {
             });
             return;
         }
-        let created_at = unverified.created_at();
-        let reject = if created_at
-            > now.saturating_add(limits.event.reject_events_newer_than_seconds)
-        {
-            Some("created_at is too far in the future")
-        } else if created_at < now.saturating_sub(limits.event.reject_events_older_than_seconds) {
-            Some("created_at is too far in the past")
-        } else if unverified.kind().is_ephemeral()
-            && created_at
-                < now.saturating_sub(limits.event.reject_ephemeral_events_older_than_seconds)
-        {
-            Some("ephemeral event created_at is too far in the past")
-        } else if unverified
-            .expiration()
-            .is_some_and(|expires| expires <= now)
-        {
-            Some("event has expired")
-        } else {
-            None
-        };
-        if let Some(reason) = reject {
+        if let Some(reason) = self.check_time(
+            unverified.created_at(),
+            unverified.kind(),
+            unverified.expiration(),
+            now,
+        ) {
             out.push(Command::Send {
                 verb: RelayVerb::Ok,
                 text: ok_frame(&unverified.id(), false, &Reason::Invalid.message(reason)),
             });
             return;
         }
+        // NIP-42 MUST: AUTH events are never broadcast or stored.
+        if unverified.kind() == AUTH_KIND {
+            out.push(Command::Send {
+                verb: RelayVerb::Ok,
+                text: ok_frame(
+                    &unverified.id(),
+                    false,
+                    &Reason::Invalid.message("kind 22242 events are only accepted in AUTH"),
+                ),
+            });
+            return;
+        }
+        if unverified.embeds_protected() {
+            out.push(Command::Send {
+                verb: RelayVerb::Ok,
+                text: ok_frame(
+                    &unverified.id(),
+                    false,
+                    &Reason::Blocked.message("reposts can't embed protected events"),
+                ),
+            });
+            return;
+        }
+        if unverified.is_protected() {
+            if !limits.auth.enabled() {
+                out.push(Command::Send {
+                    verb: RelayVerb::Ok,
+                    text: ok_frame(
+                        &unverified.id(),
+                        false,
+                        &Reason::Blocked.message("event marked as protected"),
+                    ),
+                });
+                return;
+            }
+            if self.authed.is_empty() {
+                self.issue_challenge(out);
+                out.push(Command::Send {
+                    verb: RelayVerb::Ok,
+                    text: ok_frame(
+                        &unverified.id(),
+                        false,
+                        &Reason::AuthRequired.message("event marked as protected"),
+                    ),
+                });
+                return;
+            }
+            if !self.authed.contains(&unverified.pubkey()) {
+                out.push(Command::Send {
+                    verb: RelayVerb::Ok,
+                    text: ok_frame(
+                        &unverified.id(),
+                        false,
+                        &Reason::Restricted.message("must be published by the author"),
+                    ),
+                });
+                return;
+            }
+        }
         let id = unverified.id();
         match unverified.verify(&limits.event) {
-            Ok(event) => out.push(Command::Publish(Arc::new(event))),
+            Ok(event) => {
+                let authed = if self.authed.contains(&event.pubkey()) {
+                    Some(event.pubkey())
+                } else {
+                    self.authed.first().copied()
+                };
+                out.push(Command::Publish {
+                    event: Arc::new(event),
+                    authed,
+                });
+            }
             Err(error) => out.push(Command::Send {
                 verb: RelayVerb::Ok,
                 text: ok_frame(&id, false, &error.reason()),
@@ -243,8 +384,86 @@ impl Session {
         }
     }
 
+    /// NIP-42 AUTH: verifies the event, then adds its pubkey to the
+    /// connection's authenticated set. Every failure answers
+    /// `OK <id> false <reason>`.
+    fn on_auth(&mut self, now: u64, unverified: UnverifiedEvent<'_>, out: &mut Vec<Command>) {
+        fn fail(out: &mut Vec<Command>, id: &EventId, reason: &str) {
+            out.push(Command::Send {
+                verb: RelayVerb::Ok,
+                text: ok_frame(id, false, reason),
+            });
+        }
+        let id = unverified.id();
+        let auth = &self.limits.auth;
+        if !auth.enabled() {
+            return fail(
+                out,
+                &id,
+                &Reason::Unsupported.message("authentication is disabled"),
+            );
+        }
+        if let Err(error) = unverified.check_limits(&self.limits.event) {
+            return fail(out, &id, &error.reason());
+        }
+        if unverified.kind() != AUTH_KIND {
+            return fail(
+                out,
+                &id,
+                &Reason::Invalid.message("AUTH event must be kind 22242"),
+            );
+        }
+        if let Some(reason) = self.check_time(
+            unverified.created_at(),
+            unverified.kind(),
+            unverified.expiration(),
+            now,
+        ) {
+            return fail(out, &id, &Reason::Invalid.message(reason));
+        }
+        if !unverified
+            .tag_values("challenge")
+            .any(|value| value == &*self.challenge)
+        {
+            return fail(out, &id, &Reason::Invalid.message("challenge mismatch"));
+        }
+        if !unverified
+            .tag_values("relay")
+            .any(|value| auth.matches_relay(value))
+        {
+            return fail(out, &id, &Reason::Invalid.message("relay tag mismatch"));
+        }
+        let event = match unverified.verify(&self.limits.event) {
+            Ok(event) => event,
+            Err(error) => return fail(out, &id, &error.reason()),
+        };
+        let pubkey = event.pubkey();
+        if self.authed.contains(&pubkey) {
+            out.push(Command::Send {
+                verb: RelayVerb::Ok,
+                text: ok_frame(&id, true, ""),
+            });
+            return;
+        }
+        if self.authed.len() >= MAX_AUTHED_PUBKEYS {
+            return fail(
+                out,
+                &id,
+                &Reason::Restricted.message("too many authenticated pubkeys"),
+            );
+        }
+        let mut authed = self.authed.to_vec();
+        authed.push(pubkey);
+        self.authed = authed.into();
+        out.push(Command::Send {
+            verb: RelayVerb::Ok,
+            text: ok_frame(&id, true, ""),
+        });
+    }
+
     fn on_req(&mut self, sub_id: SubId, filters: Vec<Filter>, out: &mut Vec<Command>) {
         if filters.len() > self.limits.req.max_req_filter_size {
+            self.drop_sub(&sub_id, out);
             out.push(Command::Send {
                 verb: RelayVerb::Closed,
                 text: closed_frame(
@@ -258,6 +477,7 @@ impl Session {
             .iter()
             .any(|filter| filter.tag_filter_count() > self.limits.req.max_tags_per_filter)
         {
+            self.drop_sub(&sub_id, out);
             out.push(Command::Send {
                 verb: RelayVerb::Closed,
                 text: closed_frame(
@@ -270,6 +490,7 @@ impl Session {
         if !self.subs.contains_key(&sub_id)
             && self.subs.len() >= self.limits.req.max_subs_per_connection
         {
+            self.drop_sub(&sub_id, out);
             out.push(Command::Send {
                 verb: RelayVerb::Closed,
                 text: closed_frame(
@@ -277,6 +498,31 @@ impl Session {
                     &Reason::Error.message("too many open subscriptions"),
                 ),
             });
+            return;
+        }
+        // A fully restricted filter group cannot return anything to an
+        // unauthenticated client (strfry `isFilterGroupFullyRestricted`).
+        if self.limits.auth.fully_restricts(&filters) && self.authed.is_empty() {
+            if self.limits.auth.enabled() {
+                self.issue_challenge(out);
+                self.drop_sub(&sub_id, out);
+                out.push(Command::Send {
+                    verb: RelayVerb::Closed,
+                    text: closed_frame(
+                        &sub_id,
+                        &Reason::AuthRequired.message("requested filter requires authentication"),
+                    ),
+                });
+            } else {
+                self.drop_sub(&sub_id, out);
+                out.push(Command::Send {
+                    verb: RelayVerb::Closed,
+                    text: closed_frame(
+                        &sub_id,
+                        &Reason::Restricted.message("requested kinds are not served"),
+                    ),
+                });
+            }
             return;
         }
         let generation = self.next_generation;
@@ -292,6 +538,10 @@ impl Session {
                 generation,
             },
             filters: filters.into(),
+            gate: ReadGate {
+                rules: Arc::clone(&self.limits.auth),
+                authed: Arc::clone(&self.authed),
+            },
         });
     }
 }

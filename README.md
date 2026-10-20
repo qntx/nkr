@@ -65,6 +65,27 @@ with `error: internal error` and a fresh plugin process serves the next
 event. A plugin configured as a bare path is reloaded automatically
 when the file's mtime changes.
 
+`[relay.auth]` implements NIP-42 authentication and the strfry-style
+read restrictions that ride on it. `service_url` (default empty) is
+the relay's canonical `ws://`/`wss://` address clients echo in the AUTH
+event's `relay` tag; when it is set, NIP-11 advertises NIP 42 and the
+relay challenges clients lazily — only when they REQ a fully
+restricted filter or publish a protected event. A connection may
+authenticate up to 8 distinct pubkeys. `restricted_read_kinds`
+(default `[4, 1059]` — DMs and gift wraps) are served only to
+authenticated readers; with `restrict_read_to_involved = true`
+(default) only to pubkeys involved as author or `p`-tagged recipient.
+A REQ whose filters all list only restricted kinds is refused
+(`CLOSED auth-required:` when AUTH is enabled, `CLOSED restricted:`
+otherwise); mixed filters still subscribe but hide restricted events,
+and hidden events never consume `limit`. Without a `service_url`,
+DMs are stored but never served. NIP-70 protected events (a `["-"]`
+tag) are rejected unless AUTH is configured and the author is
+authenticated; kind-6/16 reposts embedding a protected event are
+always blocked. AUTH events (kind 22242) are never stored or
+broadcast. The write-policy request gains `authed` — the hex pubkey
+the connection authenticated with — after a successful AUTH.
+
 SIGHUP reloads the configuration file without restarting: the relay
 re-reads it, logs an error and keeps the running configuration on a
 parse failure, and applies everything except the restart-only keys —

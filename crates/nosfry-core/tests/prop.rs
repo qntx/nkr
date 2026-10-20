@@ -380,7 +380,7 @@ proptest! {
                 Op::Insert(conn, sub, generation, filters) => {
                     let key = sub_key(&sub, generation);
                     let filters: Arc<[Filter]> = filters.into();
-                    monitors.insert(conn, key.clone(), Arc::clone(&filters));
+                    monitors.insert(conn, key.clone(), Arc::clone(&filters), nosfry_core::auth::ReadGate::default());
                     model.insert((conn, sub), (key, filters));
                 }
                 Op::Remove(conn, sub) => {
