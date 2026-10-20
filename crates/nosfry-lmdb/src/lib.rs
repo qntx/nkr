@@ -904,7 +904,7 @@ impl Store {
     /// the author's events with `created_at <= T` via `ix_pubkey`
     /// (kind 62 skipped — a request to vanish is never deleted), then
     /// kind-1059 gift wraps `p`-tagged to it via `ix_tag`, removing
-    /// collected seqs through the full [`Store::delete_seq`] routine.
+    /// collected seqs through the full `Store::delete_seq` routine.
     /// The `vanish_pending` value is a resume cursor — a phase byte
     /// plus the last examined index key — so skipped rows (kind 62
     /// itself, non-wrap mentions of the author) are examined once
