@@ -86,6 +86,10 @@ pub fn config() -> Config {
         events_burst: 0,
         reqs_per_second: 0,
         reqs_burst: 0,
+        ip_events_per_second: 0,
+        ip_events_burst: 0,
+        ip_reqs_per_second: 0,
+        ip_reqs_burst: 0,
     };
     config.relay.max_connections_per_ip = 0;
     config

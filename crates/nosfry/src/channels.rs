@@ -180,24 +180,31 @@ impl Out {
 }
 
 /// Per-connection outbound queue: unbounded frames plus a bounded byte
-/// budget tracked atomically.
+/// budget tracked atomically. `total` is the process-wide sum of every
+/// connection's `pending`, shared by all `Outbound`s.
 #[derive(Debug)]
 pub(crate) struct Outbound {
     tx: mpsc::UnboundedSender<Out>,
     pending: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
     dead: Arc<AtomicBool>,
     max_pending: usize,
 }
 
 impl Outbound {
-    /// New queue; `max_pending` is the byte budget.
+    /// New queue; `max_pending` is the byte budget and `total` the
+    /// process-wide pending-byte counter shared by every connection.
     #[must_use]
-    pub(crate) fn new(max_pending: usize) -> (Self, mpsc::UnboundedReceiver<Out>) {
+    pub(crate) fn new(
+        max_pending: usize,
+        total: Arc<AtomicUsize>,
+    ) -> (Self, mpsc::UnboundedReceiver<Out>) {
         let (tx, rx) = mpsc::unbounded_channel();
         (
             Self {
                 tx,
                 pending: Arc::new(AtomicUsize::new(0)),
+                total,
                 dead: Arc::new(AtomicBool::new(false)),
                 max_pending,
             },
@@ -210,25 +217,36 @@ impl Outbound {
     pub(crate) fn push(&self, out: Out) {
         let len = out.accounted_bytes();
         let prev = self.pending.fetch_add(len, Ordering::Relaxed);
+        self.total.fetch_add(len, Ordering::Relaxed);
         if prev + len > self.max_pending {
             self.pending.fetch_sub(len, Ordering::Relaxed);
+            self.total.fetch_sub(len, Ordering::Relaxed);
             self.dead.store(true, Ordering::Relaxed);
             return;
         }
         if self.tx.send(out).is_err() {
             self.pending.fetch_sub(len, Ordering::Relaxed);
+            self.total.fetch_sub(len, Ordering::Relaxed);
         }
     }
 
     /// Account for a frame actually written to the socket.
     pub(crate) fn written(&self, bytes: usize) {
         self.pending.fetch_sub(bytes, Ordering::Relaxed);
+        self.total.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Pending outbound bytes.
     #[must_use]
     pub(crate) fn pending(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Process-wide pending outbound bytes (every connection's
+    /// `pending` summed).
+    #[must_use]
+    pub(crate) fn total(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
     }
 
     /// The byte budget was exceeded; the connection should close.
@@ -243,6 +261,7 @@ impl Clone for Outbound {
         Self {
             tx: self.tx.clone(),
             pending: Arc::clone(&self.pending),
+            total: Arc::clone(&self.total),
             dead: Arc::clone(&self.dead),
             max_pending: self.max_pending,
         }

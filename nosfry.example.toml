@@ -44,6 +44,10 @@ max_websocket_payload_size = 131072
 auto_ping_seconds = 55
 # Pending outbound bytes above which a connection is closed (1008).
 max_pending_outbound_bytes = 33554432
+# Process-wide pending outbound byte budget (restart-only; 0 =
+# unlimited). Over budget, scans pause only on connections already
+# more than one chunk behind; caught-up readers keep scanning.
+max_pending_outbound_bytes_total = 1073741824
 # Maximum simultaneous WebSocket connections (0 = unlimited).
 max_connections = 0
 # Maximum simultaneous WebSocket connections per client IP (0 =
@@ -76,6 +80,12 @@ events_per_second = 20
 events_burst      = 100
 reqs_per_second   = 20
 reqs_burst        = 100
+# Shared per-client-address buckets (IPv4 per address, IPv6 per /64):
+# every connection of one address draws from the same bucket.
+ip_events_per_second = 100
+ip_events_burst      = 500
+ip_reqs_per_second   = 100
+ip_reqs_burst        = 500
 
 [relay.write_policy]
 # strfry-compatible write-policy plugin: each verified event is sent

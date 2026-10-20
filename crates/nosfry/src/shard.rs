@@ -274,7 +274,8 @@ mod tests {
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let (reader_tx, _reader_rx) = std::sync::mpsc::channel();
         let mut shard = Shard::new(&store, Arc::from([reader_tx]));
-        let (out, mut out_rx) = Outbound::new(1 << 20);
+        let (out, mut out_rx) =
+            Outbound::new(1 << 20, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
 
         shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,
@@ -329,7 +330,8 @@ mod tests {
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let (reader_tx, reader_rx) = std::sync::mpsc::channel();
         let mut shard = Shard::new(&store, Arc::from([reader_tx]));
-        let (out, _out_rx) = Outbound::new(1 << 20);
+        let (out, _out_rx) =
+            Outbound::new(1 << 20, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
 
         let batch: crate::channels::Batch = vec![(42u64, event(1, "hi"))];
         shard.handle(ShardMsg::Batch(Arc::new(batch)));
@@ -357,7 +359,8 @@ mod tests {
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let (reader_tx, reader_rx) = std::sync::mpsc::channel();
         let mut shard = Shard::new(&store, Arc::from([reader_tx]));
-        let (out, _out_rx) = Outbound::new(1 << 20);
+        let (out, _out_rx) =
+            Outbound::new(1 << 20, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
 
         shard.handle(ShardMsg::Register(Box::new(ScanStart {
             conn: 1,

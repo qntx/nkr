@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::SinkExt;
@@ -13,6 +13,7 @@ use futures_util::stream::StreamExt;
 use nosfry_core::auth::ReadGate;
 use nosfry_core::event::PublicKey;
 use nosfry_core::filter::Filter;
+use nosfry_core::limits::AddressBuckets;
 use nosfry_core::message::{RelayVerb, SubId, closed_frame, event_frame, notice_frame, ok_frame};
 use nosfry_core::session::{Command, Session, SubKey};
 use tokio::sync::{mpsc, watch};
@@ -36,6 +37,8 @@ pub(crate) struct Handle {
     pub(crate) live: watch::Receiver<Arc<crate::Live>>,
     /// Process-wide counters.
     pub(crate) metrics: Arc<Metrics>,
+    /// Process-wide pending outbound bytes shared by every `Outbound`.
+    pub(crate) outbound_total: Arc<AtomicUsize>,
     /// Broadcast shutdown signal.
     pub(crate) shutdown: watch::Receiver<bool>,
     /// Tracks every live connection task for the shutdown deadline.
@@ -92,7 +95,13 @@ struct Connection<'a> {
 impl<'a> Connection<'a> {
     /// `None` when the per-connection NIP-42 challenge cannot be
     /// generated — the connection ends without a close frame.
-    fn new(handle: &'a Handle, peer: IpAddr) -> Option<(Self, mpsc::UnboundedReceiver<Out>)> {
+    /// `address` carries the rate-limit buckets shared with every
+    /// other connection of this client address.
+    fn new(
+        handle: &'a Handle,
+        peer: IpAddr,
+        address: Arc<AddressBuckets>,
+    ) -> Option<(Self, mpsc::UnboundedReceiver<Out>)> {
         let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         // Limits and the outbound budget are fixed at connect time;
         // reloads apply to the next connection.
@@ -102,14 +111,21 @@ impl<'a> Connection<'a> {
             tracing::error!(%err, conn, "cannot generate an AUTH challenge");
             return None;
         }
-        let (out, out_rx) = Outbound::new(live.config.relay.max_pending_outbound_bytes);
+        let (out, out_rx) = Outbound::new(
+            live.config.relay.max_pending_outbound_bytes,
+            Arc::clone(&handle.outbound_total),
+        );
         Some((
             Self {
                 conn,
                 peer,
                 handle,
                 shard: route(&handle.shards, conn).clone(),
-                session: Session::new(Arc::clone(&live.limits), faster_hex::hex_string(&challenge)),
+                session: Session::new(
+                    Arc::clone(&live.limits),
+                    faster_hex::hex_string(&challenge),
+                    address,
+                ),
                 out,
                 ping_interval: Duration::from_secs(live.config.relay.auto_ping_seconds),
                 batch: VecDeque::new(),
@@ -478,8 +494,15 @@ impl<'a> Connection<'a> {
 }
 
 /// Run one WebSocket connection until close, error, or shutdown.
-pub(crate) async fn run(ws: &mut HttpWebSocket, handle: &Handle, peer: IpAddr) {
-    let Some((mut conn, mut out_rx)) = Connection::new(handle, peer) else {
+/// `address` shares the client address's rate-limit buckets into the
+/// session.
+pub(crate) async fn run(
+    ws: &mut HttpWebSocket,
+    handle: &Handle,
+    peer: IpAddr,
+    address: Arc<AddressBuckets>,
+) {
+    let Some((mut conn, mut out_rx)) = Connection::new(handle, peer, address) else {
         return;
     };
     let mut ping = tokio::time::interval(conn.ping_interval);

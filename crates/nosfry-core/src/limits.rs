@@ -1,6 +1,6 @@
 //! Relay resource limits (strfry-compatible defaults).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Deserialize;
 
@@ -33,8 +33,9 @@ impl Default for ReqLimits {
     }
 }
 
-/// Per-connection token-bucket rate limits for EVENT and REQ messages.
-/// A `*_per_second` of 0 disables that bucket.
+/// Per-connection token-bucket rate limits for EVENT and REQ messages,
+/// plus shared per-address buckets the adapter hands to every session
+/// of one client address. A `*_per_second` of 0 disables that bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimits {
@@ -47,6 +48,16 @@ pub struct RateLimits {
     pub reqs_per_second: u32,
     /// REQ burst capacity.
     pub reqs_burst: u32,
+    /// EVENT messages accepted per second across every connection of
+    /// one client address.
+    pub ip_events_per_second: u32,
+    /// Shared EVENT burst capacity per client address.
+    pub ip_events_burst: u32,
+    /// REQ messages accepted per second across every connection of
+    /// one client address.
+    pub ip_reqs_per_second: u32,
+    /// Shared REQ burst capacity per client address.
+    pub ip_reqs_burst: u32,
 }
 
 impl Default for RateLimits {
@@ -56,7 +67,80 @@ impl Default for RateLimits {
             events_burst: 100,
             reqs_per_second: 20,
             reqs_burst: 100,
+            ip_events_per_second: 100,
+            ip_events_burst: 500,
+            ip_reqs_per_second: 100,
+            ip_reqs_burst: 500,
         }
+    }
+}
+
+/// Token buckets shared by every connection of one client address
+/// (built from the `ip_*` rate limits). A `None` bucket is disabled;
+/// `Default` gives a fully disabled pair.
+#[derive(Debug, Default)]
+pub struct AddressBuckets {
+    events: Option<Mutex<TokenBucket>>,
+    reqs: Option<Mutex<TokenBucket>>,
+}
+
+impl AddressBuckets {
+    /// Buckets for the shared `ip_*` limits of `rate`.
+    #[must_use]
+    pub fn new(rate: &RateLimits) -> Self {
+        Self {
+            events: (rate.ip_events_per_second > 0).then(|| {
+                Mutex::new(TokenBucket::new(
+                    rate.ip_events_per_second,
+                    rate.ip_events_burst,
+                ))
+            }),
+            reqs: (rate.ip_reqs_per_second > 0).then(|| {
+                Mutex::new(TokenBucket::new(
+                    rate.ip_reqs_per_second,
+                    rate.ip_reqs_burst,
+                ))
+            }),
+        }
+    }
+
+    /// Spend one shared EVENT token at `now_ms`; `true` when the
+    /// bucket is disabled.
+    pub fn take_event(&self, now_ms: u64) -> bool {
+        self.events.as_ref().is_none_or(|bucket| {
+            bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(now_ms)
+        })
+    }
+
+    /// Spend one shared REQ token at `now_ms`; `true` when the
+    /// bucket is disabled.
+    pub fn take_req(&self, now_ms: u64) -> bool {
+        self.reqs.as_ref().is_none_or(|bucket| {
+            bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(now_ms)
+        })
+    }
+
+    /// Every enabled bucket is back at full capacity (disabled buckets
+    /// count as full): an address with no live connections has cooled
+    /// off, and dropping its state cannot grant a fresh burst.
+    pub fn is_idle(&self, now_ms: u64) -> bool {
+        self.events.as_ref().is_none_or(|bucket| {
+            bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_full(now_ms)
+        }) && self.reqs.as_ref().is_none_or(|bucket| {
+            bucket
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_full(now_ms)
+        })
     }
 }
 
@@ -87,6 +171,16 @@ impl TokenBucket {
         }
     }
 
+    /// Whether the balance plus the refill accrued since `last_ms`
+    /// reaches capacity; a clock that goes backwards refills nothing.
+    /// Does not mutate.
+    pub(crate) const fn is_full(&self, now_ms: u64) -> bool {
+        let refill = now_ms
+            .saturating_sub(self.last_ms)
+            .saturating_mul(self.refill_ms);
+        self.tokens.saturating_add(refill) >= self.capacity
+    }
+
     /// Spend one token at `now_ms`; `false` when the bucket is empty.
     pub(crate) fn take(&mut self, now_ms: u64) -> bool {
         if now_ms > self.last_ms {
@@ -111,7 +205,7 @@ pub struct Limits {
     pub event: EventLimits,
     /// REQ limits.
     pub req: ReqLimits,
-    /// Per-connection EVENT/REQ rate limits.
+    /// Per-connection and per-address EVENT/REQ rate limits.
     pub rate: RateLimits,
     /// NIP-42 authentication and read restriction.
     pub auth: Arc<AuthRules>,
@@ -159,6 +253,40 @@ mod tests {
             assert!(bucket.take(later));
         }
         assert!(!bucket.take(later));
+    }
+
+    #[test]
+    fn bucket_is_full_only_at_capacity() {
+        let mut bucket = TokenBucket::new(10, 3);
+        assert!(bucket.is_full(0), "a fresh bucket is full");
+        assert!(bucket.take(0));
+        assert!(!bucket.is_full(0));
+        assert!(!bucket.is_full(99), "0.99 of a token is not full");
+        assert!(bucket.is_full(100), "one token refilled in 100 ms");
+        // `is_full` does not mutate: a second check agrees.
+        assert!(bucket.is_full(100));
+    }
+
+    /// `is_idle` is true only when every enabled bucket refilled;
+    /// disabled buckets count as full.
+    #[test]
+    fn address_buckets_is_idle() {
+        assert!(AddressBuckets::default().is_idle(0));
+        let rate = RateLimits {
+            events_per_second: 0,
+            events_burst: 0,
+            reqs_per_second: 0,
+            reqs_burst: 0,
+            ip_events_per_second: 1,
+            ip_events_burst: 2,
+            ip_reqs_per_second: 0,
+            ip_reqs_burst: 0,
+        };
+        let buckets = AddressBuckets::new(&rate);
+        assert!(buckets.is_idle(0), "fresh buckets are full");
+        assert!(buckets.take_event(0));
+        assert!(!buckets.is_idle(0));
+        assert!(buckets.is_idle(2_000), "2 tokens at 1/s: idle after 2 s");
     }
 
     #[test]

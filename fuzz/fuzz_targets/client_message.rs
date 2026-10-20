@@ -8,7 +8,7 @@ use std::sync::Arc;
 use libfuzzer_sys::fuzz_target;
 use nosfry_core::auth::AuthRules;
 use nosfry_core::event::EventLimits;
-use nosfry_core::limits::{Limits, RateLimits, ReqLimits};
+use nosfry_core::limits::{AddressBuckets, Limits, RateLimits, ReqLimits};
 use nosfry_core::message::ClientMessage;
 use nosfry_core::session::{Command, Session};
 use serde_json::Value;
@@ -27,13 +27,21 @@ fn limits() -> Arc<Limits> {
             events_burst: 10,
             reqs_per_second: 5,
             reqs_burst: 10,
+            ip_events_per_second: 0,
+            ip_events_burst: 0,
+            ip_reqs_per_second: 0,
+            ip_reqs_burst: 0,
         },
         auth: Arc::new(AuthRules::new("wss://fuzz.example", &[4, 1059], true).unwrap()),
     })
 }
 
 fuzz_target!(|data: &[u8]| {
-    let mut session = Session::new(limits(), "fuzzchallenge".to_owned());
+    let mut session = Session::new(
+        limits(),
+        "fuzzchallenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    );
     let mut out = Vec::new();
     let mut last_generation = 0;
     for (i, chunk) in data.split(|b| *b == b'\n').enumerate() {

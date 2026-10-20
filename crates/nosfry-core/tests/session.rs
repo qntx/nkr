@@ -27,14 +27,18 @@ use std::sync::Arc;
 
 use nosfry_core::event::{PublicKey, event_id, serialize_for_id};
 use nosfry_core::kind::Kind;
-use nosfry_core::limits::Limits;
+use nosfry_core::limits::{AddressBuckets, Limits};
 use nosfry_core::message::ClientVerb;
 use nosfry_core::session::{Command, Received, Session};
 use secp256k1::Keypair;
 use secp256k1::schnorr;
 
 fn session() -> Session {
-    Session::new(Arc::new(Limits::default()), "challenge".to_owned())
+    Session::new(
+        Arc::new(Limits::default()),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    )
 }
 
 fn feed(session: &mut Session, now: u64, text: &str) -> Vec<Command> {
@@ -159,7 +163,11 @@ fn req_over_cap_closes() {
         },
         ..Limits::default()
     };
-    let mut s = Session::new(Arc::new(limits), "challenge".to_owned());
+    let mut s = Session::new(
+        Arc::new(limits),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    );
     feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
     let out = feed(&mut s, 2, "[\"REQ\",\"b\",{}]");
     let frames = sends(&out);
@@ -325,7 +333,11 @@ fn event_malformed_reports_id_or_notice() {
         },
         ..Limits::default()
     };
-    let mut s = Session::new(Arc::new(limits), "challenge".to_owned());
+    let mut s = Session::new(
+        Arc::new(limits),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    );
     let tagged =
         signed_event(1_700_000_000, 1, "gm").replace("\"tags\":[]", "\"tags\":[[\"t\",\"x\"]]");
     // The event id/signature are stale after tampering, but the limit
@@ -422,6 +434,7 @@ fn session_with_rate(rate: nosfry_core::limits::RateLimits) -> Session {
             ..Limits::default()
         }),
         "challenge".to_owned(),
+        Arc::new(AddressBuckets::new(&rate)),
     )
 }
 
@@ -505,6 +518,10 @@ fn zero_rate_per_second_disables() {
         events_burst: 0,
         reqs_per_second: 0,
         reqs_burst: 0,
+        ip_events_per_second: 0,
+        ip_events_burst: 0,
+        ip_reqs_per_second: 0,
+        ip_reqs_burst: 0,
     };
     let mut s = session_with_rate(rate);
     let text = signed_event(1_700_000_000, 1, "gm");
@@ -596,6 +613,10 @@ fn rate_limited_flag_marks_refusals() {
         events_burst: 1,
         reqs_per_second: 1_000,
         reqs_burst: 1,
+        ip_events_per_second: 0,
+        ip_events_burst: 0,
+        ip_reqs_per_second: 0,
+        ip_reqs_burst: 0,
     };
     let mut s = session_with_rate(rate);
     let t = 1_000u64;
@@ -627,6 +648,7 @@ fn session_auth(url: &str, kinds: &[u16], involved_only: bool) -> Session {
             ..Limits::default()
         }),
         "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
     )
 }
 
@@ -847,6 +869,10 @@ fn auth_charges_event_bucket() {
         events_burst: 1,
         reqs_per_second: 0,
         reqs_burst: 0,
+        ip_events_per_second: 0,
+        ip_events_burst: 0,
+        ip_reqs_per_second: 0,
+        ip_reqs_burst: 0,
     };
     let mut s = Session::new(
         Arc::new(Limits {
@@ -858,6 +884,7 @@ fn auth_charges_event_bucket() {
             ..Limits::default()
         }),
         "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
     );
     let t = 1_700_000_000_000u64;
     let out = feed_ms(&mut s, t, &auth_frame([9; 32], 1_700_000_000));

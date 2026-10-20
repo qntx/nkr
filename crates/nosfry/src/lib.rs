@@ -26,6 +26,7 @@ mod writer;
 
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -150,6 +151,7 @@ fn apply_reload(
     limiter.update_caps(
         merged.relay.max_connections,
         merged.relay.max_connections_per_ip,
+        limits.rate,
     );
     let policy = if merged.relay.write_policy == live.config.relay.write_policy {
         live.policy.clone()
@@ -191,9 +193,16 @@ impl Server {
         let store = Arc::new(Store::open(&config.db.path, &config.store_options())?);
         let monitors = config.relay.threads.monitors.max(1);
         let readers = config.relay.threads.readers.max(1);
-        let budget = Duration::from_micros(config.relay.query_timeslice_budget_microseconds);
-        let high_water = config.relay.max_pending_outbound_bytes / 4;
-        let max_filter_limit = config.relay.limits.max_filter_limit;
+        let tuning = reader::Tuning {
+            budget: Duration::from_micros(config.relay.query_timeslice_budget_microseconds),
+            high_water: config.relay.max_pending_outbound_bytes / 4,
+            total_budget: config.relay.max_pending_outbound_bytes_total,
+            max_filter_limit: config.relay.limits.max_filter_limit,
+        };
+        let metrics = Arc::new(metrics::Metrics::new());
+        // Process-wide pending outbound bytes, shared by every
+        // connection's `Outbound`.
+        let outbound_total = Arc::new(AtomicUsize::new(0));
 
         let mut threads = Vec::with_capacity(monitors + readers + 1);
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -229,10 +238,13 @@ impl Server {
         }
 
         // Readers.
+        let tuning = Arc::new(tuning);
         for rx in reader_rxs {
             let reader_store = Arc::clone(&store);
             let reader_shards = shard_txs.clone();
             let reader_shutdown = stop_rx.clone();
+            let reader_metrics = Arc::clone(&metrics);
+            let reader_tuning = Arc::clone(&tuning);
             threads.push(
                 std::thread::Builder::new()
                     .name("nosfry-reader".into())
@@ -241,9 +253,8 @@ impl Server {
                             &reader_store,
                             &rx,
                             &reader_shards,
-                            budget,
-                            high_water,
-                            max_filter_limit,
+                            &reader_tuning,
+                            &reader_metrics,
                             &reader_shutdown,
                         );
                     })
@@ -254,10 +265,11 @@ impl Server {
         // Writer.
         let (writer_tx, writer_rx) = mpsc::channel::<WriterMsg>(WRITER_QUEUE);
         let writer_shards = shard_txs.clone();
+        let writer_metrics = Arc::clone(&metrics);
         threads.push(
             std::thread::Builder::new()
                 .name("nosfry-writer".into())
-                .spawn(move || writer::run(&store, writer_rx, &writer_shards))
+                .spawn(move || writer::run(&store, writer_rx, &writer_shards, &writer_metrics))
                 .map_err(ServerError::Spawn)?,
         );
 
@@ -273,7 +285,6 @@ impl Server {
                     .map_err(ServerError::Spawn)?,
             );
         }
-        let metrics = Arc::new(metrics::Metrics::new());
         let (live_tx, live_rx) = watch::channel(Arc::new(Live {
             config: Arc::clone(&config),
             limits: Arc::new(config.limits()?),
@@ -285,6 +296,7 @@ impl Server {
             shards: Arc::from(shard_txs.as_slice()),
             live: live_rx.clone(),
             metrics: Arc::clone(&metrics),
+            outbound_total,
             shutdown: stop_rx,
             tracker: tokio_util::task::TaskTracker::new(),
         };
@@ -296,6 +308,7 @@ impl Server {
                 limiter: Arc::new(limiter::ConnectionLimiter::new(
                     config.relay.max_connections,
                     config.relay.max_connections_per_ip,
+                    config.relay.rate_limits,
                 )),
             },
             live_tx,

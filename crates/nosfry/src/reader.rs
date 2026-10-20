@@ -11,6 +11,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::watch;
 
 use crate::channels::{ConnId, Out, Outbound, ReaderMsg, ShardMsg, route};
+use crate::metrics::{Metrics, StoreOp};
 
 /// How long an idle reader waits for new work.
 const IDLE_WAIT: Duration = Duration::from_millis(5);
@@ -40,19 +41,38 @@ struct ScanEntry {
     first_pushed: bool,
 }
 
-/// Reader thread main loop. `high_water` pauses scans for connections
-/// whose outbound queue is backing up; new and resumed scans alternate
-/// slices. `shutdown` ends the idle wait even while shard
-/// senders still point at this reader (shards forward into it).
+/// Tunables a reader thread holds for its lifetime (restart-only).
+pub(crate) struct Tuning {
+    /// Per-slice stored-scan time budget.
+    pub(crate) budget: Duration,
+    /// Per-connection pending bytes above which its scans pause.
+    pub(crate) high_water: usize,
+    /// Process-wide pending budget: over it, scans pause whose
+    /// connection already holds more than `CHUNK_BYTES` pending —
+    /// under memory pressure only connections already behind stop
+    /// receiving scan output; clients that keep up are not stalled,
+    /// so an attacker holding the budget cannot stall everyone's
+    /// queries (0 = unlimited).
+    pub(crate) total_budget: usize,
+    /// Per-filter cap on stored scan results.
+    pub(crate) max_filter_limit: u64,
+}
+
+/// Reader thread main loop. `tuning.high_water` pauses scans for
+/// connections whose outbound queue is backing up; `total_budget`
+/// adds the process-wide rule documented on [`Tuning`]. New and
+/// resumed scans alternate slices. `shutdown` ends the idle wait
+/// even while shard senders still point at this reader (shards forward
+/// into it).
 pub(crate) fn run(
     store: &Store,
     rx: &Receiver<ReaderMsg>,
     shards: &[tokio_mpsc::Sender<ShardMsg>],
-    budget: Duration,
-    high_water: usize,
-    max_filter_limit: u64,
+    tuning: &Tuning,
+    metrics: &Metrics,
     shutdown: &watch::Receiver<bool>,
 ) {
+    let max_filter_limit = tuning.max_filter_limit;
     let mut new_scans: VecDeque<ScanEntry> = VecDeque::new();
     let mut resumed: VecDeque<ScanEntry> = VecDeque::new();
     let mut skipped = 0usize;
@@ -84,10 +104,16 @@ pub(crate) fn run(
             }
             continue;
         };
-        // Pause scans for connections above the outbound high-water mark.
-        if entry.out.pending() <= high_water {
+        // Pause scans for connections above the outbound high-water
+        // mark, or — while the process-wide total is over budget — for
+        // connections already more than one chunk behind.
+        let pending = entry.out.pending();
+        let behind = tuning.total_budget != 0
+            && entry.out.total() > tuning.total_budget
+            && pending > CHUNK_BYTES;
+        if pending <= tuning.high_water && !behind {
             skipped = 0;
-            step(entry, store, budget, shards, &mut resumed);
+            step(entry, store, tuning.budget, shards, metrics, &mut resumed);
             continue;
         }
         resumed.push_back(entry);
@@ -131,6 +157,7 @@ fn step(
     store: &Store,
     budget: Duration,
     shards: &[tokio_mpsc::Sender<ShardMsg>],
+    metrics: &Metrics,
     resumed: &mut VecDeque<ScanEntry>,
 ) {
     let out = entry.out.clone();
@@ -179,6 +206,7 @@ fn step(
             }));
         }
         Err(err) => {
+            metrics.store_error(StoreOp::Scan);
             tracing::error!(%err, conn = entry.conn, "scan failed");
             entry.out.push(Out::Closed {
                 sub: entry.sub.clone(),
@@ -233,6 +261,7 @@ fn apply(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     use nosfry_core::auth::ReadGate;
     use nosfry_core::filter::Filter;
@@ -284,7 +313,7 @@ mod tests {
         store.write(&events).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let (shard_tx, _shard_rx) = mpsc::channel(8);
-        let (out, mut out_rx) = Outbound::new(1 << 30);
+        let (out, mut out_rx) = Outbound::new(1 << 30, Arc::new(AtomicUsize::new(0)));
         let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
         tx.send(ReaderMsg::Start(Box::new(ScanStart {
             conn: 1,
@@ -303,9 +332,13 @@ mod tests {
                 &store,
                 &rx,
                 &[shard_tx],
-                Duration::from_secs(10),
-                usize::MAX,
-                500,
+                &Tuning {
+                    budget: Duration::from_secs(10),
+                    high_water: usize::MAX,
+                    total_budget: 0,
+                    max_filter_limit: 500,
+                },
+                &Metrics::new(),
                 &watch::channel(false).1,
             );
         });
@@ -336,7 +369,7 @@ mod tests {
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let (shard_tx, _shard_rx) = mpsc::channel(8);
-        let (out, _out_rx) = Outbound::new(1 << 20);
+        let (out, _out_rx) = Outbound::new(1 << 20, Arc::new(AtomicUsize::new(0)));
         // The queued scan's connection is over the high-water mark from
         // the start, so its step can never run.
         out.push(Out::Frame {
@@ -365,9 +398,13 @@ mod tests {
                 &store,
                 &rx,
                 &[shard_tx],
-                Duration::ZERO,
-                0,
-                500,
+                &Tuning {
+                    budget: Duration::ZERO,
+                    high_water: 0,
+                    total_budget: 0,
+                    max_filter_limit: 500,
+                },
+                &Metrics::new(),
                 &watch::channel(false).1,
             );
             LOOP_TICKS.with(std::cell::Cell::get)
@@ -378,6 +415,92 @@ mod tests {
         // IDLE_WAIT is 5ms: roughly 60 passes in 300ms. An unpaused
         // spin would tick millions of times in the same window.
         assert!(ticks < 1000, "reader spun {ticks} times in 300ms");
+    }
+
+    /// With the process-wide pending total over a tiny budget, a scan
+    /// whose connection is already more than one chunk behind stays
+    /// paused while a caught-up connection's scan completes.
+    #[test]
+    fn total_budget_pauses_only_behind_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+        let events: Vec<Arc<nosfry_core::event::Event>> = (0..3).map(event).collect();
+        store.write(&events).unwrap();
+        // Pre-inflated shared total: over any tiny budget.
+        let total = Arc::new(AtomicUsize::new(2));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (shard_tx, mut shard_rx) = mpsc::channel(8);
+        // Conn 1 is already more than one chunk behind; conn 2 has
+        // nothing pending. Both share the same total.
+        let (behind_out, mut behind_rx) = Outbound::new(usize::MAX, Arc::clone(&total));
+        behind_out.push(Out::Frame {
+            sub: None,
+            verb: RelayVerb::Notice,
+            text: "x".repeat(CHUNK_BYTES + 1),
+        });
+        let (caught_out, mut caught_rx) = Outbound::new(1 << 30, Arc::clone(&total));
+        let filters: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
+        for (conn, out) in [(1, behind_out), (2, caught_out)] {
+            tx.send(ReaderMsg::Start(Box::new(ScanStart {
+                conn,
+                sub: SubKey {
+                    id: SubId::parse(&format!("s{conn}")).unwrap(),
+                    generation: 1,
+                },
+                filters: Arc::clone(&filters),
+                gate: ReadGate::default(),
+                snapshot: u64::MAX,
+                out,
+            })))
+            .unwrap();
+        }
+        let reader = std::thread::spawn(move || {
+            run(
+                &store,
+                &rx,
+                &[shard_tx],
+                &Tuning {
+                    budget: Duration::from_secs(10),
+                    high_water: usize::MAX,
+                    total_budget: 1,
+                    max_filter_limit: 500,
+                },
+                &Metrics::new(),
+                &watch::channel(false).1,
+            );
+        });
+        // Conn 2's scan completes (frames + EOSE + Activate); conn 1's
+        // scan stays paused and pushes nothing beyond the notice frame
+        // already queued above.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut eose = false;
+        while !eose && std::time::Instant::now() < deadline {
+            match caught_rx.try_recv() {
+                Ok(Out::Frame { ref text, .. }) if text.contains("EOSE") => eose = true,
+                Ok(_) | Err(mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert!(eose, "caught-up scan did not complete under total budget");
+        assert_eq!(
+            shard_rx.blocking_recv().map(|_| ()),
+            Some(()),
+            "caught-up scan never activated"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let mut behind_frames = 0usize;
+        while let Ok(out) = behind_rx.try_recv() {
+            behind_frames += usize::from(matches!(out, Out::Frames { .. }));
+            assert!(
+                matches!(out, Out::Frame { ref text, .. } if !text.contains("EOSE")),
+                "behind scan pushed while paused: {out:?}"
+            );
+        }
+        assert_eq!(behind_frames, 0, "behind scan emitted frames while paused");
+        drop(tx);
+        reader.join().unwrap();
     }
 
     /// A resumed scan must keep receiving slices while a steady stream
@@ -393,7 +516,7 @@ mod tests {
         // Every finishing scan `blocking_send`s an `Activate`; keep the
         // inbox bigger than the flood.
         let (shard_tx, mut shard_rx) = mpsc::channel(8_192);
-        let (long_out, mut long_rx) = Outbound::new(1 << 30);
+        let (long_out, mut long_rx) = Outbound::new(1 << 30, Arc::new(AtomicUsize::new(0)));
         let all: Arc<[Filter]> = Arc::from(vec![Filter::parse("{\"kinds\":[1]}").unwrap()]);
         let one: Arc<[Filter]> =
             Arc::from(vec![Filter::parse("{\"kinds\":[1],\"limit\":1}").unwrap()]);
@@ -414,7 +537,7 @@ mod tests {
         // and a scheduler that always prefers new scans cannot reach
         // the resumed queue until the whole flood is done.
         for i in 0..500u64 {
-            let (out, _rx) = Outbound::new(0);
+            let (out, _rx) = Outbound::new(0, Arc::new(AtomicUsize::new(0)));
             tx.send(ReaderMsg::Start(Box::new(ScanStart {
                 conn: 2 + i,
                 sub: SubKey {
@@ -433,9 +556,13 @@ mod tests {
                 &store,
                 &rx,
                 &[shard_tx],
-                Duration::from_micros(50),
-                usize::MAX,
-                5_000,
+                &Tuning {
+                    budget: Duration::from_micros(50),
+                    high_water: usize::MAX,
+                    total_budget: 0,
+                    max_filter_limit: 5_000,
+                },
+                &Metrics::new(),
                 &watch::channel(false).1,
             );
         });
