@@ -149,6 +149,26 @@ impl<E: Executor> SqlStore<E> {
         })
     }
 
+    /// The earliest stored NIP-40 `expiration`, or `None` when
+    /// nothing expires — the next alarm time after
+    /// [`SqlStore::expire`]. `ix_expiration` serves the `MIN`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure,
+    /// [`StoreError::Corrupt`] on a broken row shape.
+    pub fn next_expiration(&self) -> Result<Option<u64>, StoreError> {
+        let row = self.row(
+            "SELECT MIN(expiration) FROM events WHERE expiration IS NOT NULL",
+            &[],
+        )?;
+        match row.as_deref() {
+            // MIN over an empty set is NULL.
+            Some([Value::Null] | []) | None => Ok(None),
+            Some(row) => Ok(Some(uint(row, 0)?)),
+        }
+    }
+
     /// The underlying executor, for plan inspection and raw
     /// statements the store does not cover.
     pub const fn exec(&self) -> &E {

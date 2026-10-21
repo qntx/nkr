@@ -234,6 +234,25 @@ fn nip09_blocks_and_deletes() {
     assert_eq!(blocked[0], WriteOutcome::Deleted);
 }
 
+/// `next_expiration` reports the earliest expiring event, `None`
+/// when nothing expires.
+#[test]
+fn next_expiration_tracks_earliest() {
+    let store = store();
+    let k = key(1);
+    assert_eq!(store.next_expiration().unwrap(), None);
+    store
+        .write(&[
+            event(&k, 1, 100, &json!([]), "plain"),
+            event(&k, 1, 100, &json!([["expiration", "500"]]), "later"),
+            event(&k, 1, 100, &json!([["expiration", "150"]]), "soon"),
+        ])
+        .unwrap();
+    assert_eq!(store.next_expiration().unwrap(), Some(150));
+    assert_eq!(store.expire(200, 10).unwrap(), 1);
+    assert_eq!(store.next_expiration().unwrap(), Some(500));
+}
+
 #[test]
 fn expire_hides_then_sweeps() {
     let store = store();
