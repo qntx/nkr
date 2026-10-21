@@ -12,6 +12,22 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- A Cloudflare Workers edition (`nosfry-worker`): the relay runs as
+  a hibernatable Durable Object over `ctx.storage.sql`, with the
+  same NIP-01/09/11/40/42/45/62/70/77/86 coverage as the native
+  edition. WebSocket hibernation persists attachments and a `subs`
+  table restores subscriptions on wake. Publishes can be gated by a
+  strfry write-policy through an optional `POLICY` service binding
+  (the request line is `POST`ed and the `reject`/`shadowReject`
+  verdicts behave identically). `nosfry-sql` is a portable store
+  over a minimal executor trait with a rusqlite adapter, and the
+  conformance suite runs the same cases against both editions.
+  Workers-specific keys: `[worker] location_hint`,
+  `[worker] max_scan_rows` (per-REQ index-row budget, default
+  100,000), and `[worker] max_subscription_bytes` (live-subscription
+  byte budget, default 32 MiB, `0` unlimited); the Workers defaults
+  for `[relay] max_connections` (5,000) and `[relay]
+  max_sync_memory_bytes` (32 MiB) are tighter than native's.
 - NIP-86 relay management API over NIP-98 auth: `POST /` with
   `application/nostr+json+rpc` answers `{"result"|"error"}` JSON for
   pubkey/event/kind bans and allow-lists, IP blocks, and NIP-11
@@ -179,6 +195,14 @@ down`; CLOSE is never charged.
   delays every publisher's `OK` while read queries keep completing.
 
 ### Changed
+
+- Shared protocol code moved into `nosfry-core` for the Workers
+  edition: `moderation` (the NIP-86 snapshot and ops),
+  `management` (the RPC authorization and dispatch), `policy`
+  (the strfry write-policy request/response protocol), `sync`
+  (the negentropy reconcile helpers), `info` (the NIP-11 document),
+  and `auth`'s `AuthConfig`; `nosfry_core::sign` is now behind the
+  `test-util` feature.
 
 - `WriteOutcome` moved from `nosfry-lmdb` to `nosfry_core::store`,
   with the `OK` reply mapping as `WriteOutcome::ok_reply`, so every
