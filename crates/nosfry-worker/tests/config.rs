@@ -68,3 +68,11 @@ fn service_url_is_validated() {
     // An empty service URL means no AUTH.
     assert!(!Config::parse("").unwrap().limits().unwrap().auth.enabled());
 }
+
+#[test]
+fn management_admins_are_validated() {
+    let err = Config::parse("[relay.management]\nadmins = [\"not-hex\"]\n").unwrap_err();
+    assert!(err.to_string().contains("admins"), "got: {err}");
+    let admin = nosfry_core::sign::pubkey_hex(0);
+    assert!(Config::parse(&format!("[relay.management]\nadmins = [\"{admin}\"]\n")).is_ok());
+}

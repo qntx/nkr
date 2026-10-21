@@ -20,6 +20,7 @@ toml.workspace        = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 worker       = { workspace = true }
+futures-util = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys       = { workspace = true }
 faster-hex   = { workspace = true }
@@ -28,7 +29,10 @@ getrandom    = { workspace = true, features = ["wasm_js"] }
 [dev-dependencies]
 nosfry-core          = { workspace = true, features = ["test-util"] }
 nosfry-sql           = { workspace = true, features = ["rusqlite"] }
+base64.workspace     = true
+faster-hex.workspace = true
 serde_json.workspace = true
+sha2.workspace       = true
 
 [lib]
 crate-type = ["cdylib", "rlib"]

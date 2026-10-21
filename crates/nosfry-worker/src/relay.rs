@@ -5,12 +5,14 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use nosfry_core::auth::ReadGate;
+use nosfry_core::auth::{AUTH_KIND, ReadGate};
 use nosfry_core::event::{Event, PublicKey};
 use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
 use nosfry_core::limits::{AddressBuckets, Limits};
+use nosfry_core::management::{self, Action, Request};
 use nosfry_core::message::{SubId, closed_frame, count_frame, eose_frame, event_frame, ok_frame};
+use nosfry_core::moderation::Moderation;
 use nosfry_core::monitor::Monitors;
 use nosfry_core::session::{Command, Session, SubKey};
 use nosfry_core::store::WriteOutcome;
@@ -80,6 +82,16 @@ pub struct Effects {
     pub vanish: bool,
 }
 
+/// The management RPC answer the glue turns into an HTTP response.
+#[derive(Debug)]
+pub struct Managed {
+    /// The HTTP status.
+    pub status: u16,
+    /// The response body — a JSON object for 200/401 answers, plain
+    /// text for 400/413 like the native axum handler.
+    pub body: String,
+}
+
 /// [`Relay`] construction failures.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -116,6 +128,12 @@ pub struct Relay<E: Executor, S: Socket> {
     store: SqlStore<E>,
     config: Config,
     limits: Arc<Limits>,
+    /// Parsed `[relay.management] admins` — hex strings are validated
+    /// in [`Config::parse`]; `open` parses them once.
+    admins: Vec<PublicKey>,
+    /// The NIP-86 snapshot hot paths read; `manage` refreshes it
+    /// after every applied op.
+    moderation: Moderation,
     conns: HashMap<u64, Conn<S>>,
     /// `AddressBuckets` shared by every connection of one client
     /// address; the entry dies with the last.
@@ -144,10 +162,18 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             .exec()
             .execute(SUBS_SCHEMA, &[])
             .map_err(|err| StoreError::Sql(Box::new(err)))?;
+        let moderation = store.moderation()?;
+        let admins = config
+            .relay
+            .management
+            .admin_keys()
+            .map_err(ConfigError::Admins)?;
         let mut relay = Self {
             store,
             config,
             limits,
+            admins,
+            moderation,
             conns: HashMap::new(),
             buckets: HashMap::new(),
             monitors: Monitors::new(),
@@ -182,6 +208,14 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
         relay.restore_subs()?;
         Ok(relay)
+    }
+
+    /// Whether `ip` is on the NIP-86 block list; the glue answers 403
+    /// before upgrades, NIP-11, and the management RPC — the native
+    /// order.
+    #[must_use]
+    pub fn ip_blocked(&self, ip: Option<IpAddr>) -> bool {
+        ip.is_some_and(|ip| self.moderation.ip_blocked(&ip))
     }
 
     /// Whether `ip` may open another connection under the global and
@@ -337,9 +371,83 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         self.store.next_expiration()
     }
 
+    /// The NIP-86 management endpoint: `POST` with the
+    /// `application/nostr+json+rpc` content type, NIP-98 authorized
+    /// against `[relay.management] admins` — the native status
+    /// table: 405 without either, 413 over [`management::BODY_LIMIT`]
+    /// (the glue refuses earlier without buffering), 401 on
+    /// authorization failure, 400 on invalid UTF-8/JSON, and method
+    /// errors as `{"error": …}` at 200.
+    #[must_use]
+    pub fn manage(
+        &mut self,
+        content_type: Option<&str>,
+        authorization: Option<&str>,
+        body: &[u8],
+        now: u64,
+    ) -> Managed {
+        let managed = |status, value: serde_json::Value| Managed {
+            status,
+            body: value.to_string(),
+        };
+        let rpc = content_type
+            .and_then(|v| v.split(';').next())
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(management::CONTENT_TYPE));
+        if !rpc || self.admins.is_empty() {
+            return Managed {
+                status: 405,
+                body: String::new(),
+            };
+        }
+        if body.len() > management::BODY_LIMIT {
+            return Managed {
+                status: 413,
+                body: "Failed to buffer the request body: length limit exceeded".to_owned(),
+            };
+        }
+        if let Err(error) = management::authorize(
+            authorization,
+            body,
+            now,
+            &self.config.events,
+            self.limits.auth.relay(),
+            &self.admins,
+        ) {
+            return managed(
+                401,
+                serde_json::json!({"error": format!("unauthorized: {error}")}),
+            );
+        }
+        let Ok(text) = std::str::from_utf8(body) else {
+            return Managed {
+                status: 400,
+                body: "invalid utf-8".to_owned(),
+            };
+        };
+        let Ok(request) = serde_json::from_str::<Request<'_>>(text) else {
+            return Managed {
+                status: 400,
+                body: "invalid request json".to_owned(),
+            };
+        };
+        match management::action(&request, &self.moderation) {
+            Ok(Action::Respond(result)) => managed(200, serde_json::json!({"result": result})),
+            Ok(Action::Apply(op)) => match self.store.moderate(op) {
+                Ok(moderation) => {
+                    self.moderation = moderation;
+                    managed(200, serde_json::json!({"result": true}))
+                }
+                Err(err) => managed(200, serde_json::json!({"error": format!("error: {err}")})),
+            },
+            Err(error) => managed(200, serde_json::json!({"error": error})),
+        }
+    }
+
     /// The NIP-11 document: the implemented NIPs only — NIP-45 when
     /// COUNT is enabled, NIP-42 when `service_url` is set, NIP-62
-    /// always.
+    /// always, NIP-86 when management admins are configured. The
+    /// moderation snapshot overrides `name`/`description`/`icon` like
+    /// native.
     #[must_use]
     pub fn nip11(&self) -> String {
         let mut nips = vec![1, 9, 11, 40, 62, 70];
@@ -349,13 +457,34 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         if !self.config.relay.service_url.is_empty() {
             nips.push(42);
         }
+        if !self.config.relay.management.admins.is_empty() {
+            nips.push(86);
+        }
         nips.sort_unstable();
-        nosfry_core::info::document(
-            &self.config.relay.info,
-            &nips,
-            &self.limits,
-            self.config.relay.max_websocket_payload_size,
-        )
+        let relay = &self.config.relay;
+        let info = nosfry_core::info::Info {
+            name: self
+                .moderation
+                .name
+                .as_deref()
+                .unwrap_or(&relay.info.name)
+                .to_owned(),
+            description: self
+                .moderation
+                .description
+                .as_deref()
+                .unwrap_or(&relay.info.description)
+                .to_owned(),
+            pubkey: relay.info.pubkey.clone(),
+            contact: relay.info.contact.clone(),
+            icon: self
+                .moderation
+                .icon
+                .as_deref()
+                .unwrap_or(&relay.info.icon)
+                .to_owned(),
+        };
+        nosfry_core::info::document(&info, &nips, &self.limits, relay.max_websocket_payload_size)
     }
 
     /// Consume the relay and return the store (tests reopen it with
@@ -414,6 +543,18 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     /// and deliver a `Stored` or accepted ephemeral event to every
     /// current subscription, the publisher's own included.
     fn publish(&mut self, conn: u64, event: &Arc<Event>, effects: &mut Effects) {
+        // NIP-86: the moderation snapshot gates every publish,
+        // ephemeral kinds included — the same position the native
+        // connection checks. AUTH events and a relay-scoped request
+        // to vanish are exempt (a banned author may still
+        // authenticate or vanish).
+        if event.kind() != AUTH_KIND
+            && !event.requests_vanish(self.limits.auth.relay())
+            && let Some(reason) = self.moderation.blocked_reason(event)
+        {
+            self.send(conn, &ok_frame(&event.id(), false, reason));
+            return;
+        }
         if event.kind().is_ephemeral() {
             self.send(conn, &ok_frame(&event.id(), true, ""));
             self.deliver(event);

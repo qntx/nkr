@@ -24,9 +24,8 @@ use nosfry_sql::{Executor, Param, SqlStore, StoreError, Value};
 use wasm_bindgen::closure::ScopedClosure;
 use wasm_bindgen::{JsCast, JsValue};
 use worker::{
-    Context, DurableObject, Env, Error, Headers, Method, Request, Response, Result, ScheduledTime,
-    State, WebSocket, WebSocketIncomingMessage, WebSocketPair, console_error, durable_object,
-    event,
+    Context, DurableObject, Env, Error, Method, Request, Response, Result, ScheduledTime, State,
+    WebSocket, WebSocketIncomingMessage, WebSocketPair, console_error, durable_object, event,
 };
 
 use crate::config::Config;
@@ -280,10 +279,7 @@ impl RelayObject {
 
     /// Handle a WebSocket upgrade request: cap check, `accept` on the
     /// runtime and the relay, attachment, then the 101.
-    fn upgrade(&self, headers: &Headers) -> Result<Response> {
-        let ip = headers
-            .get("CF-Connecting-IP")?
-            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+    fn upgrade(&self, ip: Option<IpAddr>) -> Result<Response> {
         let pair = WebSocketPair::new()?;
         let attachment = {
             let mut borrowed = self.relay.borrow_mut();
@@ -306,6 +302,70 @@ impl RelayObject {
         };
         pair.server.serialize_attachment(&attachment)?;
         Response::from_websocket(pair.client)
+    }
+
+    /// The NIP-86 management `POST`: read at most
+    /// [`management::BODY_LIMIT`] bytes off the stream (an honest
+    /// `Content-Length` is refused before any read), then let the
+    /// relay authorize and dispatch — its `Managed` carries status
+    /// and body verbatim.
+    async fn manage(&self, mut req: Request) -> Result<Response> {
+        let headers = req.headers();
+        let content_type = headers.get("Content-Type")?;
+        let authorization = headers.get("Authorization")?;
+        if headers
+            .get("Content-Length")?
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|len| len > nosfry_core::management::BODY_LIMIT as u64)
+        {
+            return Response::error(
+                "Failed to buffer the request body: length limit exceeded",
+                413,
+            );
+        }
+        let Some(body) = Self::buffered_body(&mut req).await? else {
+            return Response::error(
+                "Failed to buffer the request body: length limit exceeded",
+                413,
+            );
+        };
+        let managed = {
+            let mut borrowed = self.relay.borrow_mut();
+            let Ok(relay) = borrowed.as_mut() else {
+                return Self::down_response("unreachable: checked in fetch");
+            };
+            relay.manage(
+                content_type.as_deref(),
+                authorization.as_deref(),
+                &body,
+                worker::Date::now().as_millis() / 1000,
+            )
+        };
+        let json = managed.body.starts_with('{');
+        let response = Response::ok(managed.body)?.with_status(managed.status);
+        if json {
+            response.headers().set("Content-Type", "application/json")?;
+        }
+        Ok(response)
+    }
+
+    /// Buffer the request body: `None` when it exceeds
+    /// [`management::BODY_LIMIT`] — the stream stops without reading
+    /// further. A POST without a body streams nothing.
+    async fn buffered_body(req: &mut Request) -> Result<Option<Vec<u8>>> {
+        use futures_util::StreamExt;
+        // A POST without a body has no stream — an empty body.
+        let Ok(mut stream) = req.stream() else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            body.extend_from_slice(&chunk?);
+            if body.len() > nosfry_core::management::BODY_LIMIT {
+                return Ok(None);
+            }
+        }
+        Ok(Some(body))
     }
 
     /// Schedule the alarm at `ms` (unix milliseconds) when it is
@@ -408,11 +468,27 @@ impl DurableObject for RelayObject {
             return with_cors(Response::empty()?.with_status(204));
         }
         let headers = req.headers();
+        // NIP-86: a blocked client address is refused before upgrades,
+        // NIP-11, and the management RPC — the native order.
+        let ip = headers
+            .get("CF-Connecting-IP")?
+            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+        if self
+            .relay
+            .borrow()
+            .as_ref()
+            .is_ok_and(|relay| relay.ip_blocked(ip))
+        {
+            return Ok(Response::empty()?.with_status(403));
+        }
         if headers
             .get("Upgrade")?
             .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
         {
-            return self.upgrade(headers);
+            return self.upgrade(ip);
+        }
+        if req.method() == Method::Post {
+            return self.manage(req).await;
         }
         if req.method() == Method::Get
             && headers
