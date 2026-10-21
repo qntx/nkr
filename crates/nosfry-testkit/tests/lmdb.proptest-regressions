@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 284b8a9707ddc40097caa886e3de6bd95aaf7b121b88e58c351c4f9a95f8af98 # shrinks to specs = [EventSpec { key: 0, kind: 1, created_at: 0, tags: [], content: "a", expiration: None }, EventSpec { key: 0, kind: 1, created_at: 0, tags: [], content: "a", expiration: None }, EventSpec { key: 0, kind: 1, created_at: 0, tags: [], content: "a", expiration: None }, EventSpec { key: 0, kind: 1, created_at: 0, tags: [], content: "a", expiration: None }, EventSpec { key: 0, kind: 1, created_at: 0, tags: [], content: "a", expiration: None }, EventSpec { key: 3, kind: 62, created_at: 0, tags: [P(0), RelayAll], content: "a", expiration: None }, EventSpec { key: 3, kind: 5, created_at: 1, tags: [E(5)], content: "a", expiration: None }], batches = [1], filter_specs = [Any], max_limit = 3, now = 0, now2 = 0

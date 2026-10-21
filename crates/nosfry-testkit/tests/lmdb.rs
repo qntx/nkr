@@ -27,9 +27,10 @@ use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
 use nosfry_core::sign::{event, keys};
 use nosfry_core::store::WriteOutcome;
+use nosfry_core::url::RelayUrl;
 use nosfry_lmdb::{CountResult, CountScan, Progress, Scan, Store, StoreOptions};
 use nosfry_testkit::driver::{Count, StoreDriver, build_case, check};
-use nosfry_testkit::spec::{event_spec_strategy, filter_spec_strategy};
+use nosfry_testkit::spec::{SERVICE_URL, event_spec_strategy, filter_spec_strategy};
 use proptest::prelude::*;
 use serde_json::json;
 
@@ -89,7 +90,8 @@ struct LmdbDriver<'a> {
 
 impl StoreDriver for LmdbDriver<'_> {
     fn write(&mut self, events: &[Arc<Event>]) -> Vec<WriteOutcome> {
-        self.store.write(events, None).unwrap().outcomes
+        let url = RelayUrl::parse(SERVICE_URL).unwrap();
+        self.store.write(events, Some(&url)).unwrap().outcomes
     }
 
     fn snapshot(&mut self) -> u64 {
@@ -119,6 +121,10 @@ impl StoreDriver for LmdbDriver<'_> {
 
     fn expire(&mut self, now: u64) {
         self.store.expire(now, usize::MAX).unwrap();
+    }
+
+    fn drain_vanish(&mut self) {
+        while self.store.vanish_step(3).unwrap().more {}
     }
 }
 

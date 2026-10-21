@@ -13,7 +13,7 @@ use nosfry_core::url::RelayUrl;
 use proptest::prelude::*;
 
 use crate::model::{Model, model_expire, model_scan, model_store, model_union};
-use crate::spec::{EventSpec, FilterSpec, build_event, filter_json};
+use crate::spec::{EventSpec, FilterSpec, SERVICE_URL, build_event, filter_json};
 
 /// One event store under test. Implementations translate each call
 /// into their store's API; panics and unwraps are the driver's way of
@@ -44,6 +44,10 @@ pub trait StoreDriver {
 
     /// Sweep events expired at `now`.
     fn expire(&mut self, now: u64);
+
+    /// Drain every queued NIP-62 vanish sweep with a small step
+    /// limit so resumption is exercised.
+    fn drain_vanish(&mut self);
 }
 
 /// The count [`StoreDriver::count`] reports, mirrored per store.
@@ -133,11 +137,7 @@ pub struct Aftermath {
 /// to involved keys and the authed set is the first pool signer, the
 /// same rules the LMDB COUNT check uses.
 fn restricted_gate() -> ReadGate {
-    let rules = AuthRules::new(
-        Some(RelayUrl::parse("wss://relay.example.com").unwrap()),
-        &[3],
-        true,
-    );
+    let rules = AuthRules::new(Some(RelayUrl::parse(SERVICE_URL).unwrap()), &[3], true);
     let authed: Arc<[PublicKey]> = Arc::from(vec![PublicKey(
         keys()[0].x_only_public_key().0.to_byte_array(),
     )]);
@@ -171,6 +171,7 @@ pub fn check(store: &mut impl StoreDriver, case: &Case) -> Result<Aftermath, Tes
                     | WriteOutcome::Superseded
                     | WriteOutcome::Ephemeral
                     | WriteOutcome::Deleted
+                    | WriteOutcome::Vanished
             );
             prop_assert!(known, "unknown outcome {outcome:?}");
         }
@@ -178,7 +179,13 @@ pub fn check(store: &mut impl StoreDriver, case: &Case) -> Result<Aftermath, Tes
     let outcomes = store.write(&all);
     prop_assert_eq!(outcomes.len(), all.len());
 
-    let mut stored = model_store(&case.events);
+    // Drain queued vanish sweeps with a tiny step limit so the
+    // persisted resume cursor is exercised; the model applied the
+    // deletions eagerly while storing.
+    store.drain_vanish();
+    let service_url =
+        RelayUrl::parse(SERVICE_URL).map_err(|e| TestCaseError::reject(e.to_string()))?;
+    let mut stored = model_store(&case.events, Some(&service_url));
 
     let filters: Arc<[Filter]> = Arc::from(
         case.filter_specs
