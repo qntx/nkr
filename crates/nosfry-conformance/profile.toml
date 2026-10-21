@@ -12,6 +12,10 @@ max_filter_limit = 1000
 restricted_read_kinds     = [4, 1059]
 restrict_read_to_involved = true
 
+# NIP-86: the suite's fixed admin signer (nosfry_core::sign::key(9)).
+[relay.management]
+admins = ["acd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe"]
+
 [relay.info]
 name        = "nosfry conformance"
 description = "edition under test"
