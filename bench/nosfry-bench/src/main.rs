@@ -142,7 +142,13 @@ fn author(index: usize) -> Author {
 }
 
 /// Returns `(id_hex, event_json)` for a signed event.
-fn sign_event(author: &Author, created_at: u64, kind: u16, tags: &Value, content: &str) -> (String, String) {
+fn sign_event(
+    author: &Author,
+    created_at: u64,
+    kind: u16,
+    tags: &Value,
+    content: &str,
+) -> (String, String) {
     let preimage = json!([0, author.pk_hex, created_at, kind, tags, content]).to_string();
     let id: [u8; 32] = Sha256::digest(preimage.as_bytes()).into();
     let sig = schnorr::sign_no_aux_rand(&id, &author.keypair);
@@ -160,11 +166,16 @@ fn sign_event(author: &Author, created_at: u64, kind: u16, tags: &Value, content
 }
 
 fn unix_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after epoch").as_secs()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs()
 }
 
 async fn connect(url: &url::Url, deflate: bool) -> Result<TcpWebSocket, String> {
-    let mut options = Options::default().with_max_payload_read(16 << 20).with_no_delay();
+    let mut options = Options::default()
+        .with_max_payload_read(16 << 20)
+        .with_no_delay();
     if deflate {
         options = options.with_compression_level(CompressionLevel::fast());
     }
@@ -221,7 +232,11 @@ fn proc_stats(pid: u32) -> Option<ProcStats> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        proc_stats_ps(pid).map(|(rss_kib, cpu_secs)| ProcStats { rss_kib, rss_anon_kib: None, cpu_secs })
+        proc_stats_ps(pid).map(|(rss_kib, cpu_secs)| ProcStats {
+            rss_kib,
+            rss_anon_kib: None,
+            cpu_secs,
+        })
     }
 }
 
@@ -252,7 +267,11 @@ fn proc_stats_linux(pid: u32) -> Option<ProcStats> {
             .and_then(|v| v.split_whitespace().next())
             .and_then(|v| v.parse::<u64>().ok())
     };
-    Some(ProcStats { rss_kib: kib("VmRSS:")?, rss_anon_kib: kib("RssAnon:"), cpu_secs: (utime + stime) / ticks_per_sec })
+    Some(ProcStats {
+        rss_kib: kib("VmRSS:")?,
+        rss_anon_kib: kib("RssAnon:"),
+        cpu_secs: (utime + stime) / ticks_per_sec,
+    })
 }
 
 /// Resident set size (KiB) and cumulative CPU seconds of `pid`, via `ps`.
@@ -376,11 +395,20 @@ async fn fanout(
     let now = unix_now();
     let authors: Vec<Author> = (0..authors_n).map(author).collect();
     let tags = json!([["t", "nosfry-bench"]]);
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
     let mut index = HashMap::with_capacity(events);
     let mut messages = Vec::with_capacity(events);
     for i in 0..events {
-        let (id, event) = sign_event(&authors[i % authors_n], now, 1, &tags, &format!("fanout {nonce} {i}"));
+        let (id, event) = sign_event(
+            &authors[i % authors_n],
+            now,
+            1,
+            &tags,
+            &format!("fanout {nonce} {i}"),
+        );
         index.insert(id, u32::try_from(i).expect("events fit in u32"));
         messages.push(format!("[\"EVENT\",{event}]"));
     }
@@ -395,7 +423,10 @@ async fn fanout(
             Mode::Broadcast => (events, json!({"kinds": [1], "since": now})),
             Mode::Selective => {
                 let a = j % authors_n;
-                (per_author(a), json!({"kinds": [1], "authors": [authors[a].pk_hex], "since": now}))
+                (
+                    per_author(a),
+                    json!({"kinds": [1], "authors": [authors[a].pk_hex], "since": now}),
+                )
             }
         })
         .collect();
@@ -425,12 +456,18 @@ async fn fanout(
                 Ok(ws) => ws,
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
-                    return SubOutcome { error: Some(e), ..SubOutcome::default() };
+                    return SubOutcome {
+                        error: Some(e),
+                        ..SubOutcome::default()
+                    };
                 }
             };
             if let Err(e) = subscribe(&mut ws, &format!("s{j}"), &filter).await {
                 failed.fetch_add(1, Ordering::Relaxed);
-                return SubOutcome { error: Some(e), ..SubOutcome::default() };
+                return SubOutcome {
+                    error: Some(e),
+                    ..SubOutcome::default()
+                };
             }
             drop(permit);
             ready.fetch_add(1, Ordering::Relaxed);
@@ -439,7 +476,10 @@ async fn fanout(
     }
     let ready_deadline = Instant::now() + READY_TIMEOUT;
     while ready.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) < subs {
-        assert!(Instant::now() < ready_deadline, "subscribers not ready in time");
+        assert!(
+            Instant::now() < ready_deadline,
+            "subscribers not ready in time"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let subs_ready = ready.load(Ordering::Relaxed);
@@ -451,7 +491,9 @@ async fn fanout(
     let oks = tokio::spawn(async move {
         let (mut accepted, mut rejected) = (0usize, 0usize);
         while accepted + rejected < events {
-            let Some(frame) = stream.next().await else { break };
+            let Some(frame) = stream.next().await else {
+                break;
+            };
             if frame.opcode() != OpCode::Text {
                 continue;
             }
@@ -543,8 +585,13 @@ async fn conns(url: url::Url, n: usize, deflate: bool, pid: u32, hold_secs: u64,
     let start = Instant::now();
     let mut tasks = Vec::with_capacity(n);
     for j in 0..n {
-        let (url, ready, failed, gate, mut stop) =
-            (url.clone(), Arc::clone(&ready), Arc::clone(&failed), Arc::clone(&gate), stop_rx.clone());
+        let (url, ready, failed, gate, mut stop) = (
+            url.clone(),
+            Arc::clone(&ready),
+            Arc::clone(&failed),
+            Arc::clone(&gate),
+            stop_rx.clone(),
+        );
         tasks.push(tokio::spawn(async move {
             let permit = gate.acquire_owned().await.expect("semaphore open");
             let mut ws = match connect(&url, deflate).await {
@@ -554,7 +601,14 @@ async fn conns(url: url::Url, n: usize, deflate: bool, pid: u32, hold_secs: u64,
                     return;
                 }
             };
-            if subscribe(&mut ws, &format!("c{j}"), &json!({"kinds": [1], "limit": 1})).await.is_err() {
+            if subscribe(
+                &mut ws,
+                &format!("c{j}"),
+                &json!({"kinds": [1], "limit": 1}),
+            )
+            .await
+            .is_err()
+            {
                 failed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -607,11 +661,39 @@ async fn conns(url: url::Url, n: usize, deflate: bool, pid: u32, hold_secs: u64,
 #[tokio::main]
 async fn main() {
     match Cli::parse().cmd {
-        Cmd::Fanout { url, subs, events, rate, mode, authors, deflate, pid, label } => {
+        Cmd::Fanout {
+            url,
+            subs,
+            events,
+            rate,
+            mode,
+            authors,
+            deflate,
+            pid,
+            label,
+        } => {
             let url = url.parse().expect("valid ws url");
-            fanout(url, subs, events, rate, mode, authors.max(1), deflate, pid, label).await;
+            fanout(
+                url,
+                subs,
+                events,
+                rate,
+                mode,
+                authors.max(1),
+                deflate,
+                pid,
+                label,
+            )
+            .await;
         }
-        Cmd::Conns { url, conns: n, deflate, pid, hold_secs, label } => {
+        Cmd::Conns {
+            url,
+            conns: n,
+            deflate,
+            pid,
+            hold_secs,
+            label,
+        } => {
             let url = url.parse().expect("valid ws url");
             conns(url, n, deflate, pid, hold_secs, label).await;
         }
