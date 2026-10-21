@@ -15,6 +15,7 @@ use std::ops::ControlFlow;
 use nosfry_core::auth::ReadGate;
 use nosfry_core::event::{EventId, cmp_newest_first};
 use nosfry_core::filter::Filter;
+use nosfry_core::hll::Hll;
 use nosfry_core::packed::PackedRef;
 
 use crate::StoreError;
@@ -50,6 +51,23 @@ pub struct Hit {
     pub seq: u64,
     /// The canonical event JSON.
     pub json: Box<str>,
+}
+
+/// What [`SqlStore::count`] reports, mirroring the LMDB
+/// `CountResult`.
+///
+/// [`SqlStore::count`]: crate::SqlStore::count
+#[derive(Debug)]
+pub struct Count {
+    /// Events counted (the exact union size, or a partial count when
+    /// `approximate`).
+    pub count: u64,
+    /// `true` when the `max_rows` budget stopped the scan early; the
+    /// partial `count` is never more than the true count.
+    pub approximate: bool,
+    /// The HLL registers of counted authors, when the query was
+    /// eligible for a sketch.
+    pub hll: Option<[u8; 256]>,
 }
 
 /// The column predicate one cursor key pins.
@@ -302,54 +320,82 @@ enum Mode {
     Ranges(Vec<Cursor>),
 }
 
-/// One cursor per key; the first page is `limit / keys` clamped to
-/// `1..=FIRST_PAGE` so a wide fan-out reads about `limit` rows.
-fn cursors(sql: &'static str, keys: Vec<Key>, limit: u64) -> Vec<Cursor> {
-    let first = usize::try_from(limit.div_ceil(keys.len() as u64))
-        .unwrap_or(usize::MAX)
-        .clamp(1, FIRST_PAGE);
+/// The cursor keys [`plan`] and [`count`] derive from a filter: the
+/// same pick without the paging policy.
+enum Shape {
+    /// `id` point lookups.
+    Ids(Vec<[u8; 32]>),
+    /// `(statement, keys, tag condition position)`: one cursor per
+    /// key on one index. The position marks the `Filter::tags()`
+    /// entry whose values seeded `keys` — COUNT's cover dedup needs
+    /// it; only the `SQL_TAG` branch sets it.
+    Ranges(&'static str, Vec<Key>, Option<usize>),
+}
+
+/// One cursor per key, `first` rows on the first page.
+fn cursors(sql: &'static str, keys: Vec<Key>, first: usize) -> Vec<Cursor> {
     keys.into_iter()
         .map(|key| Cursor::new(sql, key, first))
         .collect()
 }
 
-fn plan(filter: &Filter, limit: u64) -> Mode {
+/// The statement and keys a filter's index cursors cover.
+fn shape(filter: &Filter) -> Shape {
     if let Some(ids) = filter.ids() {
-        return Mode::Ids(ids.to_vec());
+        return Shape::Ids(ids.to_vec());
     }
-    let tag = filter.tags().iter().min_by_key(|(_, values)| values.len());
+    let tag = filter
+        .tags()
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, (_, values))| values.len());
     match (filter.authors(), filter.kinds(), tag) {
         (Some(authors), Some(kinds), _)
             if (authors.len() as u64).saturating_mul(kinds.len() as u64) <= 256 =>
         {
-            Mode::Ranges(cursors(
+            Shape::Ranges(
                 SQL_PUBKEY_KIND,
                 authors
                     .iter()
                     .flat_map(|pk| kinds.iter().map(|kind| Key::PubkeyKind(*pk, *kind)))
                     .collect(),
-                limit,
-            ))
+                None,
+            )
         }
-        (Some(authors), _, _) => Mode::Ranges(cursors(
+        (Some(authors), _, _) => Shape::Ranges(
             SQL_PUBKEY,
             authors.iter().map(|pk| Key::Pubkey(*pk)).collect(),
-            limit,
-        )),
-        (None, _, Some((name, values))) => Mode::Ranges(cursors(
+            None,
+        ),
+        (None, _, Some((pos, (name, values)))) => Shape::Ranges(
             SQL_TAG,
             values
                 .iter()
                 .map(|value| Key::Tag(*name, value.as_bytes().to_vec()))
                 .collect(),
-            limit,
-        )),
-        (None, Some(kinds), _) => Mode::Ranges(cursors(
+            Some(pos),
+        ),
+        (None, Some(kinds), _) => Shape::Ranges(
             SQL_KIND,
             kinds.iter().map(|kind| Key::Kind(*kind)).collect(),
-            limit,
-        )),
-        (None, None, _) => Mode::Ranges(vec![Cursor::new(SQL_TIME, Key::Time, FIRST_PAGE)]),
+            None,
+        ),
+        (None, None, _) => Shape::Ranges(SQL_TIME, vec![Key::Time], None),
+    }
+}
+
+fn plan(filter: &Filter, limit: u64) -> Mode {
+    match shape(filter) {
+        Shape::Ids(ids) => Mode::Ids(ids),
+        Shape::Ranges(sql, keys, _) => {
+            // The first page is `limit / keys` clamped to
+            // `1..=FIRST_PAGE` so a wide fan-out reads about `limit`
+            // rows; pages then double up to MAX_PAGE.
+            let first = usize::try_from(limit.div_ceil(keys.len() as u64))
+                .unwrap_or(usize::MAX)
+                .clamp(1, FIRST_PAGE);
+            Mode::Ranges(cursors(sql, keys, first))
+        }
     }
 }
 
@@ -630,6 +676,231 @@ pub(crate) fn scan<E: Executor>(
         }
     }
     Ok(scan)
+}
+
+/// COUNT's per-candidate checks — the LMDB `CountScan::examine`:
+/// NIP-40 expiration (`now = 0` disables it), the read gate, the
+/// tag-cover dedup (an event an *earlier* value of the seeding tag
+/// condition also reaches is counted under that cursor), the
+/// compiled matcher, then union dedup: an event an earlier filter
+/// matches is counted once, there.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the LMDB count's shared step state"
+)]
+fn count_candidate(
+    filters: &[Filter],
+    filter_i: usize,
+    gate: &ReadGate,
+    now: u64,
+    cover: Option<(usize, usize)>,
+    packed: PackedRef<'_>,
+    counted: &mut u64,
+    hll: &mut Option<Hll>,
+) {
+    let expiration = packed.expiration();
+    if expiration != 0 && expiration <= now {
+        return;
+    }
+    if !gate.allows(packed) {
+        return;
+    }
+    let Some(filter) = filters.get(filter_i) else {
+        return;
+    };
+    if let Some((tag_pos, cursor)) = cover
+        && let Some((name, values)) = filter.tags().get(tag_pos)
+        && values
+            .get(..cursor)
+            .unwrap_or_default()
+            .iter()
+            .any(|value| {
+                packed
+                    .tags()
+                    .any(|(n, t)| n == *name && t == value.as_bytes())
+            })
+    {
+        return;
+    }
+    if !filter.matches(packed) {
+        return;
+    }
+    if filters
+        .get(..filter_i)
+        .unwrap_or_default()
+        .iter()
+        .any(|f| f.matches(packed))
+    {
+        return;
+    }
+    *counted += 1;
+    if let Some(hll) = hll.as_mut() {
+        hll.add(&packed.pubkey());
+    }
+}
+
+/// `id` lookups through one `json_each` parameter; every fetched row
+/// counts toward the budget (`id IN` already deduplicates).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the scan's shared step state"
+)]
+fn count_ids<E: Executor>(
+    exec: &E,
+    filters: &[Filter],
+    filter_i: usize,
+    gate: &ReadGate,
+    now: u64,
+    ids: &[[u8; 32]],
+    counted: &mut u64,
+    hll: &mut Option<Hll>,
+    seen: &mut usize,
+    max_rows: usize,
+    approximate: &mut bool,
+) -> Result<(), StoreError> {
+    let list = format!(
+        "[{}]",
+        ids.iter()
+            .map(|id| format!("\"{}\"", faster_hex::hex_string(id)))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut failure = None;
+    let result = exec.query(SQL_IDS, &[Param::Text(&list)], &mut |row| {
+        if *seen >= max_rows {
+            *approximate = true;
+            return ControlFlow::Break(());
+        }
+        *seen += 1;
+        match record(&row, 1) {
+            Ok(packed) => count_candidate(filters, filter_i, gate, now, None, packed, counted, hll),
+            Err(err) => {
+                failure = Some(err);
+                return ControlFlow::Break(());
+            }
+        }
+        ControlFlow::Continue(())
+    });
+    if let Err(err) = result {
+        return Err(StoreError::sql(err));
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Walk each `Ranges` cursor to exhaustion in order; `cursor`'s
+/// index feeds the tag-cover dedup. `approximate` stops the walk
+/// once the row budget refuses a fetch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the scan's shared step state"
+)]
+fn count_ranges<E: Executor>(
+    exec: &E,
+    filters: &[Filter],
+    filter_i: usize,
+    gate: &ReadGate,
+    now: u64,
+    sql: &'static str,
+    keys: Vec<Key>,
+    tag: Option<usize>,
+    counted: &mut u64,
+    hll: &mut Option<Hll>,
+    seen: &mut usize,
+    max_rows: usize,
+    approximate: &mut bool,
+) -> Result<(), StoreError> {
+    let Some(filter) = filters.get(filter_i) else {
+        return Ok(());
+    };
+    let since = filter.since().unwrap_or(0);
+    let until = filter.until().unwrap_or(u64::MAX);
+    for (c, cursor) in cursors(sql, keys, MAX_PAGE).iter_mut().enumerate() {
+        while let Some(row) = cursor.next(exec, since, until, seen, max_rows, approximate)? {
+            let packed =
+                PackedRef::new(&row.packed).ok_or(StoreError::Corrupt("bad packed record"))?;
+            count_candidate(
+                filters,
+                filter_i,
+                gate,
+                now,
+                tag.map(|pos| (pos, c)),
+                packed,
+                counted,
+                hll,
+            );
+        }
+        if *approximate {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Count the union `filters` match: the same index cursors as
+/// [`scan`], walked to exhaustion in order with no merge and no
+/// `limit` (COUNT ignores it), deduplicated exactly like the LMDB
+/// `CountScan` — an event counts under the first filter matching it
+/// and, on the tag index, under the first covering cursor. Every row
+/// fetched counts toward `max_rows`; reaching it stops early with
+/// `approximate` and a partial count, never an over-count. Pages
+/// start at `MAX_PAGE` since every row is needed.
+pub(crate) fn count<E: Executor>(
+    exec: &E,
+    filters: &[Filter],
+    gate: &ReadGate,
+    now: u64,
+    max_rows: usize,
+    mut hll: Option<Hll>,
+) -> Result<Count, StoreError> {
+    let mut counted = 0u64;
+    let mut approximate = false;
+    let mut seen = 0usize;
+    for (filter_i, filter) in filters.iter().enumerate() {
+        if filter.is_impossible() {
+            continue;
+        }
+        match shape(filter) {
+            Shape::Ids(ids) => count_ids(
+                exec,
+                filters,
+                filter_i,
+                gate,
+                now,
+                &ids,
+                &mut counted,
+                &mut hll,
+                &mut seen,
+                max_rows,
+                &mut approximate,
+            )?,
+            Shape::Ranges(sql, keys, tag) => count_ranges(
+                exec,
+                filters,
+                filter_i,
+                gate,
+                now,
+                sql,
+                keys,
+                tag,
+                &mut counted,
+                &mut hll,
+                &mut seen,
+                max_rows,
+                &mut approximate,
+            )?,
+        }
+        if approximate {
+            break;
+        }
+    }
+    Ok(Count {
+        count: counted,
+        approximate,
+        hll: hll.map(|h| *h.registers()),
+    })
 }
 
 #[cfg(all(test, feature = "rusqlite"))]

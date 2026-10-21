@@ -336,6 +336,50 @@ fn first_page_scales_with_the_cursor_count() {
     assert!(read <= 24, "read {read} index rows for limit 4");
 }
 
+/// `count` twin of the LMDB `count_budget_marks_approximate`: the
+/// row budget ends the count early with `approximate` and a partial
+/// count, never an over-count. A key that drains inside its first
+/// page stays exact — the flag marks a scan the budget stopped, not
+/// one that merely read over it.
+#[test]
+fn count_budget_marks_approximate() {
+    let store = store();
+    let ks = keys();
+    let events: Vec<Arc<Event>> = (0..80u64)
+        .map(|i| {
+            event(
+                &ks[usize::try_from(i).unwrap() % 4],
+                1,
+                100 + i,
+                &json!([]),
+                "e",
+            )
+        })
+        .collect();
+    store.write(&events).unwrap();
+    let authors = (0..4)
+        .map(nosfry_core::sign::pubkey_hex)
+        .map(|pk| format!("\"{pk}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let filters = [filter(&format!("{{\"authors\":[{authors}]}}"))];
+
+    let full = store
+        .count(&filters, &ReadGate::default(), 0, usize::MAX, None)
+        .unwrap();
+    assert!(!full.approximate);
+    assert_eq!(full.count, events.len() as u64);
+
+    // A 10-row budget lets the first author cursor drain (20 rows in
+    // one page) then refuses the next fetch: the answer is
+    // approximate and never over-counts.
+    let partial = store
+        .count(&filters, &ReadGate::default(), 0, 10, None)
+        .unwrap();
+    assert!(partial.approximate);
+    assert!(partial.count <= full.count);
+}
+
 #[test]
 fn int_params_outside_the_js_range_are_rejected() {
     let store = store();
