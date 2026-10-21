@@ -29,6 +29,7 @@ pub mod message;
 pub mod moderation;
 pub mod monitor;
 pub mod packed;
+pub mod policy;
 pub mod session;
 #[cfg(feature = "test-util")]
 pub mod sign;

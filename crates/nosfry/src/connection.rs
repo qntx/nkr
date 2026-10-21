@@ -16,6 +16,7 @@ use nosfry_core::filter::Filter;
 use nosfry_core::limits::AddressBuckets;
 use nosfry_core::message::{RelayVerb, SubId, closed_frame, event_frame, notice_frame, ok_frame};
 use nosfry_core::moderation::Moderation;
+use nosfry_core::policy::Decision;
 use nosfry_core::session::{Command, Session, SubKey};
 use tokio::sync::{mpsc, watch};
 use yawc::close::CloseCode;
@@ -26,7 +27,6 @@ use crate::channels::{
     route,
 };
 use crate::metrics::Metrics;
-use crate::policy::Decision;
 
 /// Per-connection state handed down from the server.
 #[derive(Debug, Clone)]
