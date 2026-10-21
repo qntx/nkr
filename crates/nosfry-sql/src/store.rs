@@ -10,12 +10,13 @@ use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
 use nosfry_core::packed::PackedRef;
 use nosfry_core::store::WriteOutcome;
+use nosfry_core::url::RelayUrl;
 
 use crate::exec::{Executor, Param, Value};
 use crate::{Count, Scan, StoreError};
 
 /// The on-disk schema version `meta.format` must hold.
-pub const FORMAT_VERSION: i64 = 1;
+pub const FORMAT_VERSION: i64 = 2;
 
 /// The largest integer JavaScript exchanges losslessly (`2^53 - 1`).
 /// Every integer bound into SQL is clamped to it; a `created_at`
@@ -68,7 +69,43 @@ const SCHEMA: &[&str] = &[
         carrier INTEGER NOT NULL,
         PRIMARY KEY (address, deleted_at, carrier)
     ) WITHOUT ROWID",
+    // NIP-62: `pubkey` → vanish point `T`, the maximum `created_at`
+    // of its honored requests to vanish.
+    "CREATE TABLE IF NOT EXISTS vanish (
+        pubkey BLOB PRIMARY KEY,
+        until INTEGER NOT NULL
+    ) WITHOUT ROWID",
+    // NIP-62: pubkeys whose vanish ranges are not drained — a
+    // persistent work queue so a restart resumes mid-vanish. `phase`
+    // is 0 for the author's own events (`ix_pubkey`) and 1 for
+    // kind-1059 wraps `p`-tagged to it (`tags`); `(created_at, seq)`
+    // is the exclusive keyset resume point, NULL for "from the top".
+    "CREATE TABLE IF NOT EXISTS vanish_pending (
+        pubkey BLOB PRIMARY KEY,
+        phase INTEGER NOT NULL,
+        created_at INTEGER,
+        seq INTEGER
+    ) WITHOUT ROWID",
 ];
+
+/// The result of one [`SqlStore::write`] transaction.
+#[derive(Debug, Default)]
+pub struct Written {
+    /// One outcome per input event, in arrival order.
+    pub outcomes: Vec<WriteOutcome>,
+    /// A stored (or duplicate) NIP-62 request queued deletion work:
+    /// the caller should keep draining [`SqlStore::vanish_step`].
+    pub vanish_pending: bool,
+}
+
+/// Outcome of one [`SqlStore::vanish_step`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VanishStep {
+    /// Events deleted in this step.
+    pub deleted: usize,
+    /// `vanish_pending` still holds work — call again.
+    pub more: bool,
+}
 
 /// The event store: writes, scans and expiry over an [`Executor`].
 #[derive(Debug)]
@@ -110,7 +147,10 @@ impl<E: Executor> SqlStore<E> {
     }
 
     /// Apply `events` in arrival order inside a single transaction,
-    /// one [`WriteOutcome`] per input.
+    /// one [`WriteOutcome`] per input. `service_url` is the relay's
+    /// own URL for NIP-62: a stored (or duplicate) request to vanish
+    /// naming it or `ALL_RELAYS` raises the author's vanish point and
+    /// queues the sweep [`SqlStore::vanish_step`] drains.
     ///
     /// # Errors
     ///
@@ -118,9 +158,22 @@ impl<E: Executor> SqlStore<E> {
     /// [`StoreError::OutOfRange`] on a `created_at` above the
     /// JavaScript-safe integer range, [`StoreError::Corrupt`] on a
     /// broken index invariant.
-    pub fn write(&self, events: &[Arc<Event>]) -> Result<Vec<WriteOutcome>, StoreError> {
-        self.exec
-            .transaction(|| events.iter().map(|event| self.apply(event)).collect())
+    pub fn write(
+        &self,
+        events: &[Arc<Event>],
+        service_url: Option<&RelayUrl>,
+    ) -> Result<Written, StoreError> {
+        self.exec.transaction(|| {
+            let mut written = Written {
+                outcomes: Vec::with_capacity(events.len()),
+                vanish_pending: false,
+            };
+            for event in events {
+                written.vanish_pending |=
+                    self.apply_event(event, service_url, &mut written.outcomes)?;
+            }
+            Ok(written)
+        })
     }
 
     /// Delete every event whose NIP-40 `expiration` is `<= now`, at
@@ -230,6 +283,12 @@ impl<E: Executor> SqlStore<E> {
     /// targets. Identical to the LMDB store minus NIP-62 vanish,
     /// which this slice does not implement.
     fn apply(&self, event: &Event) -> Result<WriteOutcome, StoreError> {
+        // NIP-62: a stored request to vanish blocks the author's
+        // equal-or-older events (never a kind 62 itself) and gift
+        // wraps `p`-tagged to a vanished pubkey.
+        if event.kind().0 != 62 && self.vanish_blocked(event)? {
+            return Ok(WriteOutcome::Vanished);
+        }
         if event.kind().is_ephemeral() {
             return Ok(WriteOutcome::Ephemeral);
         }
@@ -330,6 +389,310 @@ impl<E: Executor> SqlStore<E> {
             self.apply_deletions(event)?;
         }
         Ok(WriteOutcome::Stored { seq })
+    }
+
+    /// Apply one event and, when it is a stored (or duplicate)
+    /// NIP-62 request this relay honors, raise the author's vanish
+    /// point and queue the sweep. Returns whether undrained work is
+    /// queued.
+    fn apply_event(
+        &self,
+        event: &Arc<Event>,
+        service_url: Option<&RelayUrl>,
+        outcomes: &mut Vec<WriteOutcome>,
+    ) -> Result<bool, StoreError> {
+        let outcome = self.apply(event)?;
+        outcomes.push(outcome);
+        if event.requests_vanish(service_url)
+            && matches!(
+                outcome,
+                WriteOutcome::Stored { .. } | WriteOutcome::Duplicate
+            )
+        {
+            return self.record_vanish(event);
+        }
+        Ok(false)
+    }
+
+    /// The stored vanish point `T` of `pubkey` — the maximum
+    /// `created_at` of its honored NIP-62 requests.
+    fn vanished_at(&self, pubkey: &[u8; 32]) -> Result<Option<u64>, StoreError> {
+        match self.row(
+            "SELECT until FROM vanish WHERE pubkey = ?1",
+            &[Param::Blob(pubkey)],
+        )? {
+            Some(row) => Ok(Some(uint(&row, 0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a NIP-62 vanish point covers `event`: the author's `T`
+    /// blocks its events with `created_at <= T`, and a kind-1059 gift
+    /// wrap is blocked by the `p`-tagged recipient's `T`.
+    fn vanish_blocked(&self, event: &Event) -> Result<bool, StoreError> {
+        if self
+            .vanished_at(&event.pubkey().0)?
+            .is_some_and(|t| event.created_at() <= t)
+        {
+            return Ok(true);
+        }
+        if event.kind().0 != 1059 {
+            return Ok(false);
+        }
+        for (name, value) in event.packed().tags() {
+            let Ok(value) = <&[u8; 32]>::try_from(value) else {
+                continue;
+            };
+            if name == b'p'
+                && self
+                    .vanished_at(value)?
+                    .is_some_and(|t| event.created_at() <= t)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Register `event`'s NIP-62 request: raise the author's vanish
+    /// point to its `created_at` and queue the pubkey for
+    /// [`SqlStore::vanish_step`]. A raised point restarts the walk
+    /// from the beginning so rows between the old and new `T` are
+    /// covered; an equal-or-older request keeps the in-flight resume
+    /// position. Returns whether undrained work is queued.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure.
+    fn record_vanish(&self, event: &Event) -> Result<bool, StoreError> {
+        let pubkey = event.pubkey().0;
+        match self.vanished_at(&pubkey)? {
+            Some(old) if old >= event.created_at() => {}
+            _ => {
+                self.exec_sql(
+                    "INSERT OR REPLACE INTO vanish (pubkey, until) VALUES (?1, ?2)",
+                    &[Param::Blob(&pubkey), int(event.created_at())],
+                )?;
+                // Phase 0, no resume key: walk from the start.
+                self.exec_sql(
+                    "INSERT OR REPLACE INTO vanish_pending
+                     (pubkey, phase, created_at, seq) VALUES (?1, 0, NULL, NULL)",
+                    &[Param::Blob(&pubkey)],
+                )?;
+                return Ok(true);
+            }
+        }
+        self.exists(
+            "SELECT 1 FROM vanish_pending WHERE pubkey = ?1",
+            &[Param::Blob(&pubkey)],
+        )
+    }
+
+    /// Whether any pubkey has undrained vanish work (startup check so
+    /// a vanish queued before a crash resumes).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure.
+    pub fn vanish_pending(&self) -> Result<bool, StoreError> {
+        self.exists("SELECT 1 FROM vanish_pending LIMIT 1", &[])
+    }
+
+    /// Drain pending vanish work examining at most `limit` index
+    /// rows, in one transaction and shared across queued pubkeys.
+    /// Per pubkey the walk visits the author's events with
+    /// `created_at <= T` via `ix_pubkey` (kind 62 skipped — a request
+    /// to vanish is never deleted), then kind-1059 gift wraps
+    /// `p`-tagged to it via `tags`, removing collected seqs through
+    /// the full `delete_seq` routine. The `vanish_pending`
+    /// row is a resume cursor — the phase plus the last examined
+    /// `(created_at, seq)` — so skipped rows (kind 62 itself,
+    /// non-wrap mentions of the author) are examined once across
+    /// steps, and an exhausted wraps range removes the pubkey.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure,
+    /// [`StoreError::Corrupt`] on a broken index invariant.
+    pub fn vanish_step(&self, limit: usize) -> Result<VanishStep, StoreError> {
+        self.exec.transaction(|| {
+            let mut queue = Vec::new();
+            self.query_rows(
+                "SELECT pubkey, phase, created_at, seq FROM vanish_pending ORDER BY pubkey",
+                &[],
+                |row| {
+                    queue.push(PendingVanish {
+                        pubkey: blob(row, 0)?,
+                        phase: uint(row, 1)?,
+                        created_at: opt_uint(row, 2)?,
+                        seq: opt_uint(row, 3)?,
+                    });
+                    Ok(())
+                },
+            )?;
+            self.drain_queue(&queue, limit)
+        })
+    }
+
+    /// Drain queued pubkeys in order under one shared `budget`.
+    fn drain_queue(&self, queue: &[PendingVanish], limit: usize) -> Result<VanishStep, StoreError> {
+        let mut budget = limit;
+        let mut deleted = 0usize;
+        let mut more = false;
+        for pending in queue {
+            if budget == 0 {
+                more = true;
+                break;
+            }
+            let (removed, done) = self.drain_vanished(
+                &pending.pubkey,
+                pending.phase,
+                pending.created_at,
+                pending.seq,
+                &mut budget,
+            )?;
+            deleted += removed;
+            more |= !done;
+        }
+        Ok(VanishStep { deleted, more })
+    }
+
+    /// Drain one pending pubkey's vanish ranges under the shared
+    /// `budget` (decremented per examined row), then `delete_seq` the
+    /// collected seqs and advance or remove the `vanish_pending`
+    /// cursor. Returns the deleted count and whether the pubkey is
+    /// done.
+    fn drain_vanished(
+        &self,
+        pubkey: &[u8; 32],
+        phase: u64,
+        created_at: Option<u64>,
+        seq: Option<u64>,
+        budget: &mut usize,
+    ) -> Result<(usize, bool), StoreError> {
+        let Some(t) = self.vanished_at(pubkey)? else {
+            self.exec_sql(
+                "DELETE FROM vanish_pending WHERE pubkey = ?1",
+                &[Param::Blob(pubkey)],
+            )?;
+            return Ok((0, true));
+        };
+        let mut phase = match phase {
+            0 | 1 => phase,
+            _ => return Err(StoreError::Corrupt("bad vanish_pending phase")),
+        };
+        let mut last = created_at.zip(seq);
+        let mut seqs = Vec::new();
+        let mut done = false;
+        loop {
+            let walk = self.collect_vanished(pubkey, phase, t, last, *budget)?;
+            *budget -= walk.examined;
+            seqs.extend(walk.seqs);
+            last = walk.last;
+            if !walk.drained {
+                break;
+            }
+            if phase == 1 {
+                done = true;
+                break;
+            }
+            phase = 1;
+            last = None;
+        }
+        let mut deleted = 0usize;
+        for victim in seqs {
+            deleted += usize::from(self.delete_seq(victim)?);
+        }
+        if done {
+            self.exec_sql(
+                "DELETE FROM vanish_pending WHERE pubkey = ?1",
+                &[Param::Blob(pubkey)],
+            )?;
+        } else {
+            self.exec_sql(
+                "INSERT OR REPLACE INTO vanish_pending (pubkey, phase, created_at, seq)
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[
+                    Param::Blob(pubkey),
+                    int(phase),
+                    last.map_or(Param::Null, |(created, _)| int(created)),
+                    last.map_or(Param::Null, |(_, s)| int(s)),
+                ],
+            )?;
+        }
+        Ok((deleted, done))
+    }
+
+    /// Walk one vanish range — `(last, T]` on `(created_at, seq)` or
+    /// from the top when `last` is `None` — examining at most
+    /// `budget` rows and collecting seqs whose record kind `phase`
+    /// accepts (phase 0 keeps everything but kind 62, phase 1 keeps
+    /// kind 1059 only).
+    fn collect_vanished(
+        &self,
+        pubkey: &[u8; 32],
+        phase: u64,
+        t: u64,
+        last: Option<(u64, u64)>,
+        budget: usize,
+    ) -> Result<VanishWalk, StoreError> {
+        // A NULL resume point binds `(-1, -1)`, admitting every row.
+        let (bound_created, bound_seq) = match last {
+            Some((created, seq)) => (
+                i64::try_from(created).map_err(|_| StoreError::OutOfRange("vanish cursor"))?,
+                i64::try_from(seq).map_err(|_| StoreError::OutOfRange("vanish cursor"))?,
+            ),
+            None => (-1, -1),
+        };
+        let limit = i64::try_from(budget).map_err(|_| StoreError::OutOfRange("vanish budget"))?;
+        let params: Vec<Param<'_>> = if phase == 0 {
+            vec![
+                Param::Blob(pubkey),
+                int(t),
+                Param::Int(bound_created),
+                Param::Int(bound_seq),
+                Param::Int(limit),
+            ]
+        } else {
+            vec![
+                Param::Int(i64::from(b'p')),
+                Param::Blob(pubkey),
+                int(t),
+                Param::Int(bound_created),
+                Param::Int(bound_seq),
+                Param::Int(limit),
+            ]
+        };
+        let mut walk = VanishWalk {
+            seqs: Vec::new(),
+            examined: 0,
+            last,
+            drained: false,
+        };
+        let mut failure = None;
+        let result = self.exec.query(
+            if phase == 0 {
+                SQL_VANISH_PUBKEY
+            } else {
+                SQL_VANISH_WRAPS
+            },
+            &params,
+            &mut |row| match collect_row(&mut walk, phase, &row) {
+                Ok(()) => ControlFlow::Continue(()),
+                Err(err) => {
+                    failure = Some(err);
+                    ControlFlow::Break(())
+                }
+            },
+        );
+        if let Err(err) = result {
+            return Err(StoreError::sql(err));
+        }
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        walk.drained = walk.examined < budget;
+        Ok(walk)
     }
 
     /// Apply every target of a stored kind-5 `event` (NIP-09). Targets
@@ -503,6 +866,93 @@ impl<E: Executor> SqlStore<E> {
             (Ok(()), Some(err)) => Err(err),
             (Ok(()), None) => Ok(()),
         }
+    }
+}
+
+/// One queued vanish pubkey and its resume position.
+struct PendingVanish {
+    /// The author whose vanish range is being drained.
+    pubkey: [u8; 32],
+    /// 0 = the author's events via `ix_pubkey`, 1 = kind-1059 wraps
+    /// `p`-tagged to it via `tags`.
+    phase: u64,
+    /// Exclusive keyset resume point — `created_at` …
+    created_at: Option<u64>,
+    /// … and `seq`; `None` when the phase starts from the top.
+    seq: Option<u64>,
+}
+
+/// Collected seqs and the resume position of one bounded vanish
+/// range walk.
+struct VanishWalk {
+    /// Seqs to delete through the full delete routine.
+    seqs: Vec<u64>,
+    /// Index rows examined this walk (charged to the step budget).
+    examined: usize,
+    /// The last examined `(created_at, seq)` — the exclusive resume
+    /// bound of the next step.
+    last: Option<(u64, u64)>,
+    /// The range yielded fewer than the budget allowed.
+    drained: bool,
+}
+
+// Vanish range statements: the author's own events via `ix_pubkey`
+// and kind-1059 wraps `p`-tagged to it via the `tags` primary key —
+// both `created_at <= T` with an exclusive `(created_at, seq)`
+// keyset lower bound. The `query_plan` tests pin the plans.
+pub(crate) const SQL_VANISH_PUBKEY: &str =
+    "SELECT seq, created_at, packed FROM events INDEXED BY ix_pubkey
+WHERE pubkey = ?1 AND created_at <= ?2
+  AND (created_at > ?3 OR (created_at = ?3 AND seq > ?4))
+ORDER BY created_at, seq
+LIMIT ?5";
+
+pub(crate) const SQL_VANISH_WRAPS: &str = "SELECT t.seq, t.created_at, e.packed
+FROM tags AS t
+JOIN events AS e ON e.seq = t.seq
+WHERE t.name = ?1 AND t.value = ?2 AND t.created_at <= ?3
+  AND (t.created_at > ?4 OR (t.created_at = ?4 AND t.seq > ?5))
+ORDER BY t.created_at, t.seq
+LIMIT ?6";
+
+/// Fold one vanish index row into `walk`: count it, remember the
+/// `(created_at, seq)` resume point, and collect the seq when the
+/// record's kind survives this phase (phase 0 keeps everything but
+/// kind 62, phase 1 keeps kind 1059 only).
+fn collect_row(walk: &mut VanishWalk, phase: u64, row: &[Value]) -> Result<(), StoreError> {
+    let seq = uint(row, 0)?;
+    let created = uint(row, 1)?;
+    let packed = record(row, 2)?;
+    walk.examined += 1;
+    walk.last = Some((created, seq));
+    let keep = if phase == 0 {
+        packed.kind().0 != 62
+    } else {
+        packed.kind().0 == 1059
+    };
+    if keep {
+        walk.seqs.push(seq);
+    }
+    Ok(())
+}
+
+/// Column `i` of `row` as a 32-byte blob.
+fn blob(row: &[Value], i: usize) -> Result<[u8; 32], StoreError> {
+    match row.get(i) {
+        Some(Value::Blob(bytes)) => <&[u8; 32]>::try_from(bytes.as_slice())
+            .map(<[u8; 32]>::to_owned)
+            .map_err(|_| StoreError::Corrupt("row column is not a 32-byte blob")),
+        _ => Err(StoreError::Corrupt("row column is not a blob")),
+    }
+}
+
+/// Column `i` of `row` as an optional unsigned integer (`NULL` =
+/// `None`).
+fn opt_uint(row: &[Value], i: usize) -> Result<Option<u64>, StoreError> {
+    match row.get(i) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::Int(v)) if *v >= 0 => Ok(Some(u64::try_from(*v).unwrap_or_default())),
+        _ => Err(StoreError::Corrupt("row column is not an integer")),
     }
 }
 

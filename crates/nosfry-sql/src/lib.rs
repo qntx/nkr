@@ -36,4 +36,4 @@ pub mod rusqlite;
 pub use error::StoreError;
 pub use exec::{Executor, Param, Value};
 pub use scan::{Count, Hit, Scan};
-pub use store::{FORMAT_VERSION, SqlStore};
+pub use store::{FORMAT_VERSION, SqlStore, VanishStep, Written};
