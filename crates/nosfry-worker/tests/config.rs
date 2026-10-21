@@ -53,6 +53,14 @@ fn limits_disable_negentropy_but_not_count() {
 }
 
 #[test]
+fn max_scan_rows_must_be_positive() {
+    // A zero budget would make every REQ and COUNT return nothing.
+    let err = Config::parse("[worker]\nmax_scan_rows = 0\n").unwrap_err();
+    assert!(err.to_string().contains("max_scan_rows"), "got: {err}");
+    assert!(Config::parse("[worker]\nmax_scan_rows = 1\n").is_ok());
+}
+
+#[test]
 fn service_url_is_validated() {
     assert!(Config::parse("[relay]\nservice_url = \"http://nope\"\n").is_err());
     let config = Config::parse("[relay]\nservice_url = \"wss://relay.example.com\"\n").unwrap();

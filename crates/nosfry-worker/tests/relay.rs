@@ -642,3 +642,92 @@ fn corrupt_subs_rows_are_purged_not_fatal() {
         assert_eq!(count, 1, "only the valid row remains");
     }
 }
+
+/// NIP-62: a request to vanish queues the sweep; the alarm deletes
+/// the author's older events and `p`-tagged gift wraps, keeps the
+/// request itself, and blocks later older publishes.
+#[test]
+fn request_to_vanish_sweeps_and_keeps_the_request() {
+    let mut r = relay("[relay]\nservice_url = \"wss://relay.example.com\"\n");
+    let socket = connect(&mut r, 1);
+    let old = event(&key(1), 1, NOW - 100, &json!([]), "old");
+    let wrap = event(
+        &key(2),
+        1059,
+        NOW - 90,
+        &json!([["p", pubkey_of(1)]]),
+        "gift",
+    );
+    msg(&mut r, 1, &event_frame(&old));
+    msg(&mut r, 1, &event_frame(&wrap));
+    let vanish = event(
+        &key(1),
+        62,
+        NOW,
+        &json!([["relay", "wss://relay.example.com"]]),
+        "",
+    );
+    let effects = r.message(1, NOW * 1000, &event_frame(&vanish));
+    assert!(effects.vanish, "queued vanish produced no effect");
+    assert_eq!(r.next_alarm(50).unwrap(), Some(50));
+    // The alarm drains the queue — the loop exercises resumption.
+    while r.alarm(NOW).unwrap() == Some(NOW) {}
+    assert_eq!(r.next_alarm(50).unwrap(), None);
+    // The author's older events are gone; the request remains.
+    msg(
+        &mut r,
+        1,
+        &req_frame("a", &json!({"authors": [pubkey_of(1)]})),
+    );
+    let hits = event_frames(&socket.sent(), "a");
+    assert_eq!(hits.len(), 1, "{:?}", socket.sent());
+    assert!(hits[0].contains(&format!("{}", vanish.id())), "{hits:?}");
+    // The gift wrap `p`-tagged to the author is gone.
+    msg(&mut r, 1, &req_frame("w", &json!({"#p": [pubkey_of(1)]})));
+    assert!(event_frames(&socket.sent(), "w").is_empty());
+    // An equal-or-older publish by the author stays blocked.
+    let late = event(&key(1), 1, NOW - 50, &json!([]), "late");
+    msg(&mut r, 1, &event_frame(&late));
+    assert!(
+        socket
+            .sent()
+            .iter()
+            .any(|f| f.contains("blocked: request to vanish")),
+        "{:?}",
+        socket.sent()
+    );
+}
+
+/// A kind-62 request naming a foreign relay changes nothing.
+#[test]
+fn foreign_relay_vanish_request_is_ignored() {
+    let mut r = relay("[relay]\nservice_url = \"wss://relay.example.com\"\n");
+    let socket = connect(&mut r, 1);
+    let old = event(&key(1), 1, NOW - 100, &json!([]), "old");
+    msg(&mut r, 1, &event_frame(&old));
+    let foreign = event(
+        &key(1),
+        62,
+        NOW,
+        &json!([["relay", "wss://foreign.example.com"]]),
+        "",
+    );
+    let effects = r.message(1, NOW * 1000, &event_frame(&foreign));
+    assert!(!effects.vanish, "foreign request queued work");
+    assert_eq!(r.next_alarm(50).unwrap(), None);
+    msg(
+        &mut r,
+        1,
+        &req_frame("s", &json!({"authors": [pubkey_of(1)]})),
+    );
+    assert_eq!(event_frames(&socket.sent(), "s").len(), 2);
+}
+
+/// The NIP-11 document advertises NIP-62.
+#[test]
+fn nip11_lists_62() {
+    let r = relay("");
+    let doc: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
+    let nips = doc["supported_nips"].as_array().unwrap();
+    assert!(nips.contains(&json!(62)), "{nips:?}");
+}
