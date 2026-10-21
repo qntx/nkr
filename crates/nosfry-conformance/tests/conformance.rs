@@ -744,7 +744,7 @@ async fn manage_call(body: &Value, authorization: Option<&str>) -> (u16, String)
     let authority = relay.strip_prefix("ws://").unwrap().trim_end_matches('/');
     let mut tcp = tokio::net::TcpStream::connect(authority).await.unwrap();
     let mut request = format!(
-        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: {}\r\nContent-Length: {}\r\n",
         nosfry_core::management::CONTENT_TYPE,
         bytes.len()
     );
@@ -754,17 +754,32 @@ async fn manage_call(body: &Value, authorization: Option<&str>) -> (u16, String)
     request.push_str("\r\n");
     tcp.write_all(request.as_bytes()).await.unwrap();
     tcp.write_all(&bytes).await.unwrap();
-    let mut buf = Vec::new();
-    tcp.read_to_end(&mut buf).await.unwrap();
-    let text = String::from_utf8(buf).unwrap();
-    let status: u16 = text
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        tcp.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let status: u16 = head
         .split_ascii_whitespace()
         .nth(1)
         .unwrap()
         .parse()
         .unwrap();
-    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
-    (status, body)
+    let length: usize = head
+        .split("\r\n")
+        .find_map(|line| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length: ")
+                .map(str::to_owned)
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut body = vec![0u8; length];
+    tcp.read_exact(&mut body).await.unwrap();
+    (status, String::from_utf8(body).unwrap())
 }
 
 /// An authorized NIP-86 call; asserts 200 and returns the parsed body.
