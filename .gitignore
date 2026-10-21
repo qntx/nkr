@@ -34,3 +34,4 @@ docs/
 # Workers build output
 crates/nosfry-worker/build/
 .wrangler/
+crates/nosfry-worker/.wrangler.conformance.toml
