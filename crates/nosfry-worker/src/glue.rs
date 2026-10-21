@@ -1,0 +1,480 @@
+//! The Cloudflare Workers shell: the entry `fetch` routes every
+//! request to the single `relay` Durable Object, which wraps the
+//! host-testable [`Relay`] behind the hibernation WebSocket API and
+//! `transactionSync`.
+//!
+//! [`worker::Storage::transaction`] runs the KV transaction path, so
+//! [`DoSql::transaction`] calls `transactionSync` on the raw
+//! `DurableObjectStorage` through `js-sys` instead.
+
+#![allow(
+    tail_expr_drop_order,
+    clippy::future_not_send,
+    clippy::unused_async_trait_impl,
+    reason = "workerd is single-threaded so futures and RefCell state never cross threads; the workers-rs and wasm-bindgen macros generate temporaries whose drop order changes under Rust 2024; the DurableObject trait mandates async signatures even for handlers without awaits"
+)]
+
+use std::cell::{Cell, RefCell};
+use std::net::IpAddr;
+use std::ops::ControlFlow;
+
+use js_sys::{Date, Function, Reflect};
+use nosfry_core::message::notice_frame;
+use nosfry_sql::{Executor, Param, SqlStore, StoreError, Value};
+use wasm_bindgen::closure::ScopedClosure;
+use wasm_bindgen::{JsCast, JsValue};
+use worker::{
+    Context, DurableObject, Env, Error, Headers, Method, Request, Response, Result, ScheduledTime,
+    State, WebSocket, WebSocketIncomingMessage, WebSocketPair, console_error, durable_object,
+    event,
+};
+
+use crate::config::Config;
+use crate::relay::{Attachment, Relay, Socket};
+
+/// The `NOSFRY_CONFIG` variable's TOML; a missing variable is an
+/// empty document, which `Config::parse` fills with defaults.
+fn config(env: &Env) -> Result<Config> {
+    let toml = env
+        .var("NOSFRY_CONFIG")
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    Config::parse(&toml).map_err(|err| Error::from(err.to_string()))
+}
+
+/// Forward every request to the `relay` object, honouring
+/// `[worker] location_hint` when it is set.
+#[event(fetch)]
+async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    let config = config(&env)?;
+    let namespace = env.durable_object("RELAY")?;
+    let hint = &config.worker.location_hint;
+    let stub = if hint.is_empty() {
+        namespace.get_by_name("relay")?
+    } else {
+        namespace.get_by_name_with_location_hint("relay", hint)?
+    };
+    stub.fetch_with_request(req).await
+}
+
+/// The same CORS headers the native `with_cors` emits.
+const CORS_HEADERS: [(&str, &str); 3] = [
+    ("Access-Control-Allow-Origin", "*"),
+    ("Access-Control-Allow-Headers", "*"),
+    ("Access-Control-Allow-Methods", "GET, OPTIONS"),
+];
+
+fn with_cors(response: Response) -> Result<Response> {
+    for (name, value) in CORS_HEADERS {
+        response.headers().set(name, value)?;
+    }
+    Ok(response)
+}
+
+/// Connection ids are bound into `subs` rows, so they must stay
+/// inside the JavaScript safe-integer range.
+const JS_MAX: u64 = (1 << 53) - 1;
+
+/// `ctx.storage.sql` as a [`nosfry_sql::Executor`].
+struct DoSql {
+    /// `ctx.storage`: `sql()` hands out `SqlStorage` handles, and
+    /// `as_raw()` reaches the unbound `transactionSync`.
+    storage: worker::Storage,
+}
+
+/// A statement-level failure from workerd's SQL surface.
+#[derive(Debug)]
+struct DoSqlError(String);
+
+impl std::fmt::Display for DoSqlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DoSqlError {}
+
+impl DoSqlError {
+    fn sql(self) -> StoreError {
+        StoreError::Sql(Box::new(self))
+    }
+}
+
+fn js_error(err: &Error) -> DoSqlError {
+    DoSqlError(err.to_string())
+}
+
+fn js_value_error(value: JsValue) -> DoSqlError {
+    js_error(&Error::from(value))
+}
+
+fn storage_param(param: &Param<'_>) -> Result<worker::SqlStorageValue, DoSqlError> {
+    Ok(match param {
+        Param::Null => worker::SqlStorageValue::Null,
+        &Param::Int(v) => worker::SqlStorageValue::try_from_i64(v).map_err(|e| js_error(&e))?,
+        Param::Text(s) => worker::SqlStorageValue::from(*s),
+        Param::Blob(b) => worker::SqlStorageValue::from(b.to_vec()),
+    })
+}
+
+fn storage_value(value: worker::SqlStorageValue) -> Value {
+    match value {
+        worker::SqlStorageValue::Null => Value::Null,
+        worker::SqlStorageValue::Boolean(b) => Value::Int(i64::from(b)),
+        worker::SqlStorageValue::Integer(i) => Value::Int(i),
+        worker::SqlStorageValue::Float(f) => Value::Real(f),
+        worker::SqlStorageValue::String(s) => Value::Text(s),
+        worker::SqlStorageValue::Blob(b) => Value::Blob(b),
+    }
+}
+
+impl Executor for DoSql {
+    type Error = DoSqlError;
+
+    fn query(
+        &self,
+        sql: &str,
+        params: &[Param<'_>],
+        row: &mut dyn FnMut(Vec<Value>) -> ControlFlow<()>,
+    ) -> Result<(), Self::Error> {
+        let bindings = params
+            .iter()
+            .map(storage_param)
+            .collect::<Result<Vec<_>, _>>()?;
+        let cursor = self
+            .storage
+            .sql()
+            .exec(sql, Some(bindings))
+            .map_err(|e| js_error(&e))?;
+        for result in cursor.raw() {
+            let values = result
+                .map_err(|e| js_error(&e))?
+                .into_iter()
+                .map(storage_value)
+                .collect();
+            if row(values).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<(), Self::Error> {
+        let bindings = params
+            .iter()
+            .map(storage_param)
+            .collect::<Result<Vec<_>, _>>()?;
+        // `exec` runs eagerly in workerd; dropping the cursor leaves
+        // its rows unread, which an execute never inspects anyway.
+        drop(
+            self.storage
+                .sql()
+                .exec(sql, Some(bindings))
+                .map_err(|e| js_error(&e))?,
+        );
+        Ok(())
+    }
+
+    fn transaction<T>(&self, f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, StoreError> {
+        // workers-rs binds the KV `transaction`, not the SQL
+        // `transactionSync`: call it on the raw `DurableObjectStorage`.
+        let raw: JsValue = AsRef::<JsValue>::as_ref(self.storage.as_raw()).clone();
+        let txn = Reflect::get(&raw, &JsValue::from_str("transactionSync"))
+            .and_then(JsCast::dyn_into::<Function>)
+            .map_err(|e| js_value_error(e).sql())?;
+        let mut outcome = None;
+        let mut body = Some(f);
+        let called = {
+            let outcome = &mut outcome;
+            let mut run =
+                move || -> Result<JsValue, JsValue> { invoke_body(&mut body, &mut *outcome) };
+            let closure =
+                ScopedClosure::<dyn FnMut() -> Result<JsValue, JsValue>>::borrow_mut(&mut run);
+            txn.call1(&raw, closure.as_js_value())
+        };
+        match (called, outcome) {
+            (_, Some(result)) => result,
+            // Our callback always records an outcome, even when it
+            // throws; a bare `call1` failure is a workerd error.
+            (Ok(_), None) => Err(DoSqlError(
+                "transactionSync returned without invoking its callback".into(),
+            )
+            .sql()),
+            (Err(js), None) => Err(js_value_error(js).sql()),
+        }
+    }
+}
+
+/// The `transactionSync` callback body: run `f`, record the outcome,
+/// and throw on error so workerd rolls the transaction back.
+fn invoke_body<T, F>(
+    body: &mut Option<F>,
+    outcome: &mut Option<Result<T, StoreError>>,
+) -> Result<JsValue, JsValue>
+where
+    F: FnOnce() -> Result<T, StoreError>,
+{
+    let Some(body) = body.take() else {
+        return Err(JsValue::from_str("transaction body ran twice"));
+    };
+    match body() {
+        Ok(value) => {
+            *outcome = Some(Ok(value));
+            Ok(JsValue::UNDEFINED)
+        }
+        Err(err) => {
+            // Throwing rolls the transaction back; the real
+            // `StoreError` comes out through `outcome`.
+            let message = err.to_string();
+            *outcome = Some(Err(err));
+            Err(js_sys::Error::new(&message).into())
+        }
+    }
+}
+
+/// A hibernatable `WebSocket` as a [`Socket`].
+struct DoSocket(WebSocket);
+
+impl Socket for DoSocket {
+    fn send(&self, text: &str) {
+        // A failure means the socket is already gone; the relay's own
+        // bookkeeping is unaffected either way.
+        drop(self.0.send_with_str(text));
+    }
+
+    fn close(&self, code: u16, reason: &str) {
+        drop(self.0.close(Some(code), Some(reason)));
+    }
+}
+
+/// The hibernatable relay: one Durable Object named `relay` holding
+/// all live connections.
+#[durable_object]
+pub struct RelayObject {
+    state: State,
+    /// `Err` when `new` failed to build the relay: the object keeps
+    /// the message and answers every later request with a 500.
+    relay: RefCell<Result<Relay<DoSql, DoSocket>, String>>,
+    /// The scheduled alarm in unix milliseconds; `None` also means
+    /// "not yet loaded from storage" — `schedule_alarm` reads it once
+    /// when the cache is empty.
+    alarm: Cell<Option<u64>>,
+}
+
+impl std::fmt::Debug for RelayObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayObject").finish_non_exhaustive()
+    }
+}
+
+impl RelayObject {
+    /// The plain-text body the native relay answers non-WebSocket
+    /// requests with.
+    const PLAIN: &'static str = "nosfry: a nostr relay. connect with a websocket client.\n";
+
+    /// The 500 every request gets once `new` failed.
+    fn down_response(err: &str) -> Result<Response> {
+        console_error!("relay object failed to initialize: {err}");
+        Response::error("internal error", 500)
+    }
+
+    /// Handle a WebSocket upgrade request: cap check, `accept` on the
+    /// runtime and the relay, attachment, then the 101.
+    fn upgrade(&self, headers: &Headers) -> Result<Response> {
+        let ip = headers
+            .get("CF-Connecting-IP")?
+            .and_then(|v| v.trim().parse::<IpAddr>().ok());
+        let pair = WebSocketPair::new()?;
+        let attachment = {
+            let mut borrowed = self.relay.borrow_mut();
+            let Ok(relay) = borrowed.as_mut() else {
+                return Self::down_response("unreachable: checked in fetch");
+            };
+            if !relay.admits(ip) {
+                return Response::error("too many connections", 503);
+            }
+            let mut bytes = [0u8; 8];
+            getrandom::fill(&mut bytes).map_err(|e| Error::from(e.to_string()))?;
+            let conn = u64::from_ne_bytes(bytes) & JS_MAX;
+            let mut challenge_bytes = [0u8; 32];
+            getrandom::fill(&mut challenge_bytes).map_err(|e| Error::from(e.to_string()))?;
+            let challenge = faster_hex::hex_string(&challenge_bytes);
+            self.state.accept_web_socket(&pair.server);
+            relay
+                .accept(DoSocket(pair.server.clone()), conn, ip, challenge)
+                .map_err(|e| Error::from(e.to_string()))?
+        };
+        pair.server.serialize_attachment(&attachment)?;
+        Response::from_websocket(pair.client)
+    }
+
+    /// Schedule the alarm at `ms` (unix milliseconds) when it is
+    /// earlier than the scheduled one. An empty cache triggers the
+    /// one `get_alarm` read; a stored alarm keeps it.
+    async fn schedule_alarm(&self, ms: u64) -> Result<()> {
+        let current = match self.alarm.get() {
+            Some(current) => Some(current),
+            None => self
+                .state
+                .storage()
+                .get_alarm()
+                .await?
+                .and_then(|t| u64::try_from(t).ok()),
+        };
+        if current.is_some_and(|current| current <= ms) {
+            return Ok(());
+        }
+        self.state
+            .storage()
+            .set_alarm(ScheduledTime::new(Date::new(&(ms as f64).into())))
+            .await?;
+        self.alarm.set(Some(ms));
+        Ok(())
+    }
+
+    /// `relay.close` for the socket's attached connection; a missing
+    /// or malformed attachment strands its `subs` rows, which the
+    /// next `open` purges.
+    fn close_connection(&self, ws: &WebSocket) {
+        if let Ok(Some(attachment)) = ws.deserialize_attachment::<Attachment>()
+            && let Ok(relay) = self.relay.borrow_mut().as_mut()
+        {
+            relay.close(attachment.conn);
+        }
+    }
+}
+
+impl DurableObject for RelayObject {
+    fn new(state: State, env: Env) -> Self {
+        let relay = (|| -> Result<Relay<DoSql, DoSocket>, String> {
+            let config = config(&env).map_err(|e| e.to_string())?;
+            let storage = state.storage();
+            let store = SqlStore::open(DoSql { storage }).map_err(|e| e.to_string())?;
+            let mut sockets = Vec::new();
+            for ws in state.get_websockets() {
+                let attachment: Attachment = ws
+                    .deserialize_attachment()
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "websocket missing its attachment".to_owned())?;
+                sockets.push((DoSocket(ws), attachment));
+            }
+            Relay::open(store, config, sockets).map_err(|e| e.to_string())
+        })();
+        Self {
+            state,
+            relay: RefCell::new(relay),
+            alarm: Cell::new(None),
+        }
+    }
+
+    async fn fetch(&self, req: Request) -> Result<Response> {
+        if let Err(err) = self.relay.borrow().as_ref() {
+            return Self::down_response(err);
+        }
+        if req.method() == Method::Options {
+            return with_cors(Response::empty()?.with_status(204));
+        }
+        let headers = req.headers();
+        if headers
+            .get("Upgrade")?
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        {
+            return self.upgrade(headers);
+        }
+        if req.method() == Method::Get
+            && headers
+                .get("Accept")?
+                .is_some_and(|v| v.contains("application/nostr+json"))
+        {
+            let mut borrowed = self.relay.borrow_mut();
+            return match borrowed.as_mut() {
+                Ok(relay) => {
+                    let response = Response::ok(relay.nip11())?;
+                    response
+                        .headers()
+                        .set("Content-Type", "application/nostr+json")?;
+                    with_cors(response)
+                }
+                Err(err) => Self::down_response(err),
+            };
+        }
+        let response = Response::ok(Self::PLAIN.to_owned())?;
+        response
+            .headers()
+            .set("Content-Type", "text/plain; charset=utf-8")?;
+        Ok(response)
+    }
+
+    async fn websocket_message(
+        &self,
+        ws: WebSocket,
+        message: WebSocketIncomingMessage,
+    ) -> Result<()> {
+        let WebSocketIncomingMessage::String(text) = message else {
+            ws.send_with_str(notice_frame("invalid: binary frames are not supported"))?;
+            return Ok(());
+        };
+        let Some(attachment) = ws.deserialize_attachment::<Attachment>()? else {
+            // The socket was accepted but never attached; there is no
+            // connection state to drive.
+            return ws.close(Some(1011), Some("internal error"));
+        };
+        let effects = {
+            let mut borrowed = self.relay.borrow_mut();
+            match borrowed.as_mut() {
+                Ok(relay) => relay.message(attachment.conn, worker::Date::now().as_millis(), &text),
+                Err(err) => {
+                    console_error!("relay object failed to initialize: {err}");
+                    return ws.close(Some(1011), Some("internal error"));
+                }
+            }
+        };
+        if let Some(updated) = effects.attachment {
+            ws.serialize_attachment(&updated)?;
+        }
+        if let Some(expiration) = effects.expiration {
+            self.schedule_alarm(expiration.saturating_mul(1000)).await?;
+        }
+        Ok(())
+    }
+
+    async fn websocket_close(
+        &self,
+        ws: WebSocket,
+        _code: usize,
+        _reason: String,
+        _was_clean: bool,
+    ) -> Result<()> {
+        self.close_connection(&ws);
+        Ok(())
+    }
+
+    async fn websocket_error(&self, ws: WebSocket, error: Error) -> Result<()> {
+        console_error!("websocket error: {error}");
+        self.close_connection(&ws);
+        Ok(())
+    }
+
+    async fn alarm(&self) -> Result<Response> {
+        let now = worker::Date::now().as_millis() / 1000;
+        let next = {
+            let borrowed = self.relay.borrow();
+            match borrowed.as_ref() {
+                Ok(relay) => relay.alarm(now).map_err(|e| Error::from(e.to_string()))?,
+                Err(err) => return Self::down_response(err),
+            }
+        };
+        if let Some(secs) = next {
+            let ms = secs.saturating_mul(1000);
+            self.state
+                .storage()
+                .set_alarm(ScheduledTime::new(Date::new(&(ms as f64).into())))
+                .await?;
+            self.alarm.set(Some(ms));
+        } else {
+            self.state.storage().delete_alarm().await?;
+            self.alarm.set(None);
+        }
+        Response::empty()
+    }
+}
