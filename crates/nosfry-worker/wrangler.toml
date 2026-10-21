@@ -1,0 +1,19 @@
+name               = "nosfry"
+main               = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+# The build needs a clang with wasm32 support and an unstripped wasm
+# (wasm-bindgen reads the `target_features` section that `strip = true`
+# in the release profile would drop):
+#   CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang" \
+#   CARGO_PROFILE_RELEASE_STRIP=false \
+#   worker-build --release
+[build]
+command = "worker-build --release"
+
+[durable_objects]
+bindings = [{ name = "RELAY", class_name = "RelayObject" }]
+
+[[migrations]]
+tag                = "v1"
+new_sqlite_classes = ["RelayObject"]
