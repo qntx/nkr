@@ -75,6 +75,9 @@ pub struct Effects {
     /// The earliest expiration among events stored by this call; the
     /// glue moves the alarm forward when it precedes the scheduled one.
     pub expiration: Option<u64>,
+    /// A stored (or duplicate) NIP-62 request to vanish queued
+    /// deletion work; the glue schedules the alarm for now.
+    pub vanish: bool,
 }
 
 /// [`Relay`] construction failures.
@@ -301,26 +304,45 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
     }
 
-    /// Run the NIP-40 sweep: delete up to 10,000 expired events, then
-    /// answer the next alarm time — `Some(now)` while the batch was
-    /// full (run again immediately), else the next expiration or
-    /// `None`.
+    /// Run the NIP-40 and NIP-62 sweeps: delete up to 10,000 expired
+    /// events, then drain one vanish step of up to 10,000 examined
+    /// index rows. Answers the next alarm time — `Some(now)` while
+    /// either backlog remains (run again immediately), else the next
+    /// expiration or `None`.
     ///
     /// # Errors
     ///
     /// [`StoreError::Sql`] on executor failure.
     pub fn alarm(&self, now: u64) -> Result<Option<u64>, StoreError> {
-        if self.store.expire(now, 10_000)? == 10_000 {
+        let expiring = self.store.expire(now, 10_000)? == 10_000;
+        let step = self.store.vanish_step(10_000)?;
+        if expiring || step.more {
+            return Ok(Some(now));
+        }
+        self.store.next_expiration()
+    }
+
+    /// The alarm the object should wake at: `Some(now)` while vanish
+    /// work is pending, else the next expiration — the value the
+    /// glue reconciles against the stored alarm on wake so work
+    /// committed just before a crash still runs.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure.
+    pub fn next_alarm(&self, now: u64) -> Result<Option<u64>, StoreError> {
+        if self.store.vanish_pending()? {
             return Ok(Some(now));
         }
         self.store.next_expiration()
     }
 
     /// The NIP-11 document: the implemented NIPs only — NIP-45 when
-    /// COUNT is enabled, NIP-42 when `service_url` is set.
+    /// COUNT is enabled, NIP-42 when `service_url` is set, NIP-62
+    /// always.
     #[must_use]
     pub fn nip11(&self) -> String {
-        let mut nips = vec![1, 9, 11, 40, 70];
+        let mut nips = vec![1, 9, 11, 40, 62, 70];
         if self.limits.req.max_filter_limit_count > 0 {
             nips.push(45);
         }
@@ -397,11 +419,15 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             self.deliver(event);
             return;
         }
-        match self.store.write(std::slice::from_ref(event)) {
-            Ok(outcomes) => {
-                let Some(&outcome) = outcomes.first() else {
+        match self
+            .store
+            .write(std::slice::from_ref(event), self.limits.auth.relay())
+        {
+            Ok(written) => {
+                let Some(&outcome) = written.outcomes.first() else {
                     return;
                 };
+                effects.vanish |= written.vanish_pending;
                 let (accepted, message) = outcome.ok_reply();
                 self.send(conn, &ok_frame(&event.id(), accepted, message));
                 if matches!(outcome, WriteOutcome::Stored { .. }) {

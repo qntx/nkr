@@ -99,6 +99,10 @@ pub enum ConfigError {
     /// `[relay] service_url` is not a `ws://`/`wss://` URL.
     #[error(transparent)]
     ServiceUrl(#[from] RelayUrlError),
+    /// `[worker] max_scan_rows` is 0 — every REQ/COUNT would return
+    /// nothing, so the configuration is refused.
+    #[error("[worker] max_scan_rows must be at least 1")]
+    MaxScanRows,
 }
 
 impl Config {
@@ -108,10 +112,14 @@ impl Config {
     ///
     /// [`ConfigError::Toml`] on syntax errors or unknown keys,
     /// [`ConfigError::ServiceUrl`] on an invalid
-    /// `[relay] service_url`.
+    /// `[relay] service_url`, [`ConfigError::MaxScanRows`] when
+    /// `[worker] max_scan_rows` is 0.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text)?;
         config.limits()?;
+        if config.worker.max_scan_rows == 0 {
+            return Err(ConfigError::MaxScanRows);
+        }
         Ok(config)
     }
 

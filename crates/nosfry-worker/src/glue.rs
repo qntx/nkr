@@ -332,6 +332,27 @@ impl RelayObject {
         Ok(())
     }
 
+    /// Reconcile the stored alarm with the wanted time `ms` once on
+    /// wake: a crash between a store commit and `set_alarm` would
+    /// otherwise strand queued vanish or expiry work forever. The
+    /// runtime blocks event delivery on the `block_concurrency_while`
+    /// gate — `new` must not await the returned future.
+    fn reconcile_alarm(state: &State, ms: u64) {
+        let storage = state.storage();
+        let _init = state.block_concurrency_while(async move {
+            let stored = storage
+                .get_alarm()
+                .await?
+                .and_then(|t| u64::try_from(t).ok());
+            if stored.is_none_or(|stored| ms < stored) {
+                storage
+                    .set_alarm(ScheduledTime::new(Date::new(&(ms as f64).into())))
+                    .await?;
+            }
+            Ok(())
+        });
+    }
+
     /// `relay.close` for the socket's attached connection; a missing
     /// or malformed attachment strands its `subs` rows, which the
     /// next `open` purges.
@@ -360,6 +381,18 @@ impl DurableObject for RelayObject {
             }
             Relay::open(store, config, sockets).map_err(|e| e.to_string())
         })();
+        // Reconcile the alarm once on wake: `next_alarm` is
+        // synchronous, so the wanted time is computed before any
+        // future — the `RefCell` borrow never crosses an await.
+        let wanted = relay.as_ref().ok().and_then(|relay| {
+            relay
+                .next_alarm(worker::Date::now().as_millis() / 1000)
+                .ok()
+                .flatten()
+        });
+        if let Some(secs) = wanted {
+            Self::reconcile_alarm(&state, secs.saturating_mul(1000));
+        }
         Self {
             state,
             relay: RefCell::new(relay),
@@ -434,6 +467,9 @@ impl DurableObject for RelayObject {
         }
         if let Some(expiration) = effects.expiration {
             self.schedule_alarm(expiration.saturating_mul(1000)).await?;
+        }
+        if effects.vanish {
+            self.schedule_alarm(worker::Date::now().as_millis()).await?;
         }
         Ok(())
     }
