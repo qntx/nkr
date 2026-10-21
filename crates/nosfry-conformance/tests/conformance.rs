@@ -61,6 +61,10 @@ fn req_wire(id: &str, filter: &str) -> String {
     format!("[\"REQ\",\"{id}\",{filter}]")
 }
 
+fn count_wire(id: &str, filter: &str) -> String {
+    format!("[\"COUNT\",\"{id}\",{filter}]")
+}
+
 async fn connect() -> yawc::TcpWebSocket {
     yawc::WebSocket::connect(url().parse().unwrap())
         .await
@@ -110,6 +114,16 @@ async fn req(ws: &mut yawc::TcpWebSocket, id: &str, filter: &str) -> Vec<Value> 
     collect_until(ws, |v| v[0] == "EOSE" || v[0] == "CLOSED").await
 }
 
+/// Send a COUNT and return its `{"count":…}` body.
+async fn count(ws: &mut yawc::TcpWebSocket, id: &str, filter: &str) -> Value {
+    send(ws, &count_wire(id, filter)).await;
+    let frames = collect_until(ws, |v| v[0] == "COUNT" || v[0] == "CLOSED").await;
+    let frame = frames.last().unwrap();
+    assert_eq!(frame[0], "COUNT", "COUNT refused: {frame}");
+    assert_eq!(frame[1], id, "{frame}");
+    frame[2].clone()
+}
+
 fn events(frames: &[Value]) -> Vec<&Value> {
     frames
         .iter()
@@ -152,7 +166,7 @@ async fn nip11_document() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    for nip in [1, 9, 11, 40, 42, 70] {
+    for nip in [1, 9, 11, 40, 42, 45, 70] {
         assert!(nips.contains(&nip), "missing NIP-{nip}: {nips:?}");
     }
 }
@@ -511,4 +525,119 @@ async fn nip70_protected_events() {
 
     let (ok, reason) = publish(&mut ws, &ev).await;
     assert!(ok, "protected publish after AUTH: {reason}");
+}
+
+/// NIP-45: an exact count for the fresh author, union dedup over
+/// overlapping filters, and `limit` ignored — all scoped to the
+/// author's pubkey so parallel tests never see each other.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn count_exact_union_and_limit_ignored() {
+    let k = key();
+    let mut pub_ws = connect().await;
+    for (kind, content) in [(1u16, "a"), (1, "b"), (3, "c")] {
+        let ev = sign::event(&k, kind, now(), &json!([]), content);
+        let (ok, reason) = publish(&mut pub_ws, &ev).await;
+        assert!(ok, "publish: {reason}");
+    }
+
+    let mut ws = connect().await;
+    let scoped = format!("{{\"kinds\":[1],\"authors\":[\"{}\"]}}", pubkey(&k));
+    let body = count(&mut ws, "c", &scoped).await;
+    assert_eq!(body["count"], 2, "{body}");
+    assert!(body.get("approximate").is_none(), "{body}");
+
+    // Overlapping filters count each event once: the author's 2
+    // kind-1s plus their kind-3 — not 2 + 3. Both filters are
+    // author-scoped so parallel tests never inflate the union.
+    let wire = format!(
+        "[\"COUNT\",\"d\",{{\"kinds\":[1],\"authors\":[\"{0}\"]}},{{\"authors\":[\"{0}\"]}}]",
+        pubkey(&k)
+    );
+    send(&mut ws, &wire).await;
+    let frames = collect_until(&mut ws, |v| v[0] == "COUNT").await;
+    assert_eq!(frames.last().unwrap()[2]["count"], 3);
+
+    // A filter `limit` is ignored for COUNT.
+    let scoped = format!(
+        "{{\"kinds\":[1],\"authors\":[\"{}\"],\"limit\":1}}",
+        pubkey(&k)
+    );
+    assert_eq!(count(&mut ws, "e", &scoped).await["count"], 2);
+}
+
+/// NIP-45: a single-filter, single-tag-condition, single-value COUNT
+/// is sketch-eligible and returns the 512-hex `hll` registers.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn count_hll_for_a_single_tag_value() {
+    let reader = key();
+    let mut pub_ws = connect().await;
+    for _ in 0..3 {
+        let ev = sign::event(&key(), 3, now(), &json!([["p", pubkey(&reader)]]), "");
+        let (ok, reason) = publish(&mut pub_ws, &ev).await;
+        assert!(ok, "publish: {reason}");
+    }
+    let mut ws = connect().await;
+    let body = count(
+        &mut ws,
+        "h",
+        &format!("{{\"#p\":[\"{}\"]}}", pubkey(&reader)),
+    )
+    .await;
+    assert_eq!(body["count"], 3, "{body}");
+    let hll = body["hll"]
+        .as_str()
+        .unwrap_or_else(|| panic!("hll missing: {body}"));
+    assert_eq!(hll.len(), 512, "hll must be 512 hex chars: {hll}");
+    assert!(hll.bytes().all(|b| b.is_ascii_hexdigit()), "{hll}");
+}
+
+/// NIP-45 + NIP-42: a fully restricted COUNT is refused
+/// unauthenticated; after AUTH the involved pubkey's events count.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn count_restricted_kind_needs_auth() {
+    let author = key();
+    let reader = key();
+    let dm = sign::event(
+        &author,
+        4,
+        now() - 5,
+        &json!([["p", pubkey(&reader)]]),
+        "restricted dm",
+    );
+    {
+        let mut publisher = connect().await;
+        let (ok, reason) = publish(&mut publisher, &dm).await;
+        assert!(ok, "restricted publish: {reason}");
+    }
+
+    let mut ws = connect().await;
+    let filter = format!("{{\"kinds\":[4],\"authors\":[\"{}\"]}}", pubkey(&author));
+    send(&mut ws, &count_wire("c", &filter)).await;
+    let frames = collect_until(&mut ws, |v| v[0] == "COUNT" || v[0] == "CLOSED").await;
+    let challenge = frames
+        .iter()
+        .find(|v| v[0] == "AUTH")
+        .map(|v| v[1].as_str().unwrap().to_owned())
+        .expect("no AUTH challenge sent");
+    assert!(
+        frames
+            .iter()
+            .any(|v| v[0] == "CLOSED" && v[2].as_str().unwrap().starts_with("auth-required:")),
+        "restricted COUNT not refused: {frames:?}"
+    );
+
+    let auth = sign::event(
+        &reader,
+        22242,
+        now(),
+        &json!([["relay", url()], ["challenge", challenge]]),
+        "",
+    );
+    send(&mut ws, &format!("[\"AUTH\",{}]", auth.json())).await;
+    let ok = collect_until(&mut ws, |v| v[0] == "OK").await;
+    assert_eq!(ok.last().unwrap()[2], true, "AUTH rejected");
+    assert_eq!(count(&mut ws, "d", &filter).await["count"], 1);
 }
