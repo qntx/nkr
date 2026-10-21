@@ -1,0 +1,30 @@
+[package]
+name                   = "nosfry-worker"
+description            = "Host-testable relay object for the nosfry Nostr relay's Workers edition"
+publish                = false
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+readme.workspace       = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+nosfry-core.workspace = true
+nosfry-sql.workspace  = true
+serde.workspace       = true
+serde_json.workspace  = true
+thiserror.workspace   = true
+toml.workspace        = true
+
+[dev-dependencies]
+nosfry-core          = { workspace = true, features = ["test-util"] }
+nosfry-sql           = { workspace = true, features = ["rusqlite"] }
+serde_json.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true

@@ -36,7 +36,7 @@ jobs:
       contents: read
     with:
       targets: wasm32-unknown-unknown
-      packages: nosfry-core nosfry-sql
+      packages: nosfry-core nosfry-sql nosfry-worker
       features: --all-features
 
   fuzz:

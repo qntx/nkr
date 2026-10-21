@@ -1310,6 +1310,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nosfry-worker"
+version = "0.2.0"
+dependencies = [
+ "nosfry-core",
+ "nosfry-sql",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
