@@ -58,7 +58,10 @@ pub struct Worker {
     /// Durable Object `locationHint`; empty = none.
     pub location_hint: String,
     /// Per-REQ index-row budget, the Workers substitute for native
-    /// time slicing (one thread cannot yield inside a message).
+    /// time slicing (one thread cannot yield inside a message). It
+    /// also bounds a `COUNT` scan together with `[relay.limits]
+    /// max_filter_limit_count`: the effective COUNT budget is their
+    /// minimum, `0` disabling COUNT entirely.
     pub max_scan_rows: usize,
 }
 
@@ -115,10 +118,9 @@ impl Config {
     /// `nosfry_core::limits::Limits` assembled from `[events]`,
     /// `[relay.limits]`, `[relay.rate_limits]`, and `[relay.auth]`.
     ///
-    /// COUNT (slice 3.3) and negentropy (slice 3.5) are not
-    /// implemented on Workers yet: `max_filter_limit_count` and
-    /// `max_sync_events` are forced to 0 so the session refuses those
-    /// messages itself.
+    /// COUNT (NIP-45) is served; the session still refuses negentropy
+    /// itself because `max_sync_events` is forced to 0 until slice
+    /// 3.5.
     ///
     /// # Errors
     ///
@@ -126,7 +128,6 @@ impl Config {
     /// `[relay] service_url`.
     pub fn limits(&self) -> Result<Limits, ConfigError> {
         let mut req = self.relay.limits;
-        req.max_filter_limit_count = 0;
         req.max_sync_events = 0;
         Ok(Limits {
             event: self.events,
