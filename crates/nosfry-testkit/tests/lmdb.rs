@@ -21,21 +21,22 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nosfry_core::event::{Event, PublicKey};
+use nosfry_core::auth::ReadGate;
+use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
+use nosfry_core::hll::Hll;
 use nosfry_core::sign::{event, keys};
 use nosfry_core::store::WriteOutcome;
-use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreOptions};
-use nosfry_testkit::driver::{Aftermath, StoreDriver, build_case, check};
-use nosfry_testkit::model::model_union;
-use nosfry_testkit::spec::{event_spec_strategy, filter_json, filter_spec_strategy};
+use nosfry_lmdb::{CountResult, CountScan, Progress, Scan, Store, StoreOptions};
+use nosfry_testkit::driver::{Count, StoreDriver, build_case, check};
+use nosfry_testkit::spec::{event_spec_strategy, filter_spec_strategy};
 use proptest::prelude::*;
 use serde_json::json;
 
 fn store_scan_gated(
     store: &Store,
     filters: Arc<[Filter]>,
-    gate: nosfry_core::auth::ReadGate,
+    gate: ReadGate,
     snapshot: u64,
     max_limit: u64,
     now: u64,
@@ -62,12 +63,13 @@ fn store_scan_gated(
 fn store_count(
     store: &Store,
     filters: Arc<[Filter]>,
-    gate: nosfry_core::auth::ReadGate,
+    gate: ReadGate,
     snapshot: u64,
     budget_entries: u64,
     now: u64,
-) -> nosfry_lmdb::CountResult {
-    let mut scan = CountScan::new(filters, gate, snapshot, budget_entries, now, None);
+    hll: Option<Hll>,
+) -> CountResult {
+    let mut scan = CountScan::new(filters, gate, snapshot, budget_entries, now, hll);
     let mut guard = 0usize;
     loop {
         guard += 1;
@@ -97,12 +99,22 @@ impl StoreDriver for LmdbDriver<'_> {
     fn scan(
         &mut self,
         filters: Arc<[Filter]>,
-        gate: &nosfry_core::auth::ReadGate,
+        gate: &ReadGate,
         snapshot: u64,
         max_limit: u64,
         now: u64,
     ) -> Vec<String> {
         store_scan_gated(self.store, filters, gate.clone(), snapshot, max_limit, now)
+    }
+
+    fn count(&mut self, filters: Arc<[Filter]>, gate: &ReadGate, snapshot: u64, now: u64) -> Count {
+        let hll = Hll::for_filters(&filters);
+        let result = store_count(self.store, filters, gate.clone(), snapshot, 0, now, hll);
+        Count {
+            count: result.count,
+            approximate: result.approximate,
+            hll: result.hll,
+        }
     }
 
     fn expire(&mut self, now: u64) {
@@ -126,56 +138,8 @@ proptest! {
         let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
 
         let case = build_case(&specs, batches, filter_specs, max_limit, now, now2);
-        let Aftermath { model, snapshot } = {
-            let mut driver = LmdbDriver { store: &store };
-            check(&mut driver, &case)?
-        };
-
-        // COUNT ignores `limit`: it must equal the deduplicated union
-        // a limit-less Scan returns.
-        let unlimited: Arc<[Filter]> = Arc::from(
-            case.filter_specs
-                .iter()
-                .map(|s| {
-                    let mut json = filter_json(s, &case.ids);
-                    json.remove("limit");
-                    Filter::parse(&serde_json::to_string(&json).unwrap()).unwrap()
-                })
-                .collect::<Vec<_>>(),
-        );
-        let union = model_union(
-            &model.stored,
-            &unlimited,
-            snapshot,
-            &nosfry_core::auth::ReadGate::default(),
-            case.now2,
-        );
-        let counted = store_count(
-            &store,
-            Arc::clone(&unlimited),
-            nosfry_core::auth::ReadGate::default(),
-            snapshot,
-            0,
-            case.now2,
-        );
-        prop_assert!(!counted.approximate);
-        prop_assert_eq!(counted.count, union as u64);
-
-        // A restricted-kind gate shrinks the count exactly as it
-        // shrinks the scan union.
-        let rules = nosfry_core::auth::AuthRules::new(
-            Some(nosfry_core::url::RelayUrl::parse("wss://relay.example.com").unwrap()),
-            &[3],
-            true,
-        );
-        let authed: Arc<[PublicKey]> = Arc::from(vec![PublicKey(
-            keys()[0].x_only_public_key().0.to_byte_array(),
-        )]);
-        let gate = nosfry_core::auth::ReadGate::new(Arc::new(rules), authed);
-        let union_gated = model_union(&model.stored, &unlimited, snapshot, &gate, case.now2);
-        let counted_gated = store_count(&store, unlimited, gate, snapshot, 0, case.now2);
-        prop_assert!(!counted_gated.approximate);
-        prop_assert_eq!(counted_gated.count, union_gated as u64);
+        let mut driver = LmdbDriver { store: &store };
+        check(&mut driver, &case)?;
     }
 }
 
@@ -203,10 +167,11 @@ fn count_budget_marks_approximate() {
     let full = store_count(
         &store,
         Arc::clone(&filters),
-        nosfry_core::auth::ReadGate::default(),
+        ReadGate::default(),
         snapshot,
         0,
         u64::MAX,
+        None,
     );
     assert!(!full.approximate);
     assert_eq!(full.count, events.len() as u64);
@@ -216,10 +181,11 @@ fn count_budget_marks_approximate() {
     let partial = store_count(
         &store,
         filters,
-        nosfry_core::auth::ReadGate::default(),
+        ReadGate::default(),
         snapshot,
         10,
         u64::MAX,
+        None,
     );
     assert!(partial.approximate);
     assert!(partial.count <= full.count);
