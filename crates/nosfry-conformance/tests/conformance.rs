@@ -167,7 +167,7 @@ async fn nip11_document() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    for nip in [1, 9, 11, 40, 42, 45, 62, 70, 86] {
+    for nip in [1, 9, 11, 40, 42, 45, 62, 70, 77, 86] {
         assert!(nips.contains(&nip), "missing NIP-{nip}: {nips:?}");
     }
 }
@@ -955,4 +955,93 @@ async fn nip86_icon_override_and_restore() {
     assert_eq!(answer["result"], true, "{answer}");
     let doc = nip11().await;
     assert_ne!(doc["icon"], "https://icon.example/m.png", "{doc}");
+}
+
+/// `["NEG-OPEN",sub,filter,"<hex>"]`.
+fn neg_open_wire(id: &str, filter: &str, msg: &[u8]) -> String {
+    format!(
+        "[\"NEG-OPEN\",\"{id}\",{filter},\"{}\"]",
+        faster_hex::hex_string(msg)
+    )
+}
+
+/// `["NEG-MSG",sub,"<hex>"]`.
+fn neg_msg_wire(id: &str, msg: &[u8]) -> String {
+    format!("[\"NEG-MSG\",\"{id}\",\"{}\"]", faster_hex::hex_string(msg))
+}
+
+/// Hex-decode a wire payload.
+fn unhex(text: &str) -> Vec<u8> {
+    let mut buf = vec![0u8; text.len() / 2];
+    faster_hex::hex_decode(text.as_bytes(), &mut buf).unwrap();
+    buf
+}
+
+/// NIP-77: the client's `negentropy` set reconciles against the
+/// relay's records — have/need report the true differences both
+/// ways — then `NEG-CLOSE` ends the session and a further `NEG-MSG`
+/// is answered `closed: unknown subscription`.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn negentropy_converges_and_closes() {
+    use negentropy::{Id, Negentropy, NegentropyStorageVector};
+
+    let author = key();
+    let mut ws = connect().await;
+    let a = sign::event(&author, 1, now() - 30, &json!([]), "a");
+    let b = sign::event(&author, 1, now() - 20, &json!([]), "b");
+    let c = sign::event(&author, 1, now() - 10, &json!([]), "c");
+    for ev in [&a, &b, &c] {
+        let (ok, reason) = publish(&mut ws, ev).await;
+        assert!(ok, "publish: {reason}");
+    }
+    // The client's storage shares a and b, claims a phantom the
+    // relay lacks, and misses c.
+    let phantom = sign::event(&key(), 1, now() - 5, &json!([]), "phantom");
+    let records = [
+        (a.created_at(), a.id().0),
+        (b.created_at(), b.id().0),
+        (phantom.created_at(), phantom.id().0),
+    ];
+    let mut storage = NegentropyStorageVector::with_capacity(records.len());
+    for (created_at, id) in records {
+        storage.insert(created_at, Id::from_byte_array(id)).unwrap();
+    }
+    storage.seal().unwrap();
+    let mut neg = Negentropy::owned(storage, 500_000).unwrap();
+    let init = neg.initiate().unwrap();
+
+    let filter = format!("{{\"authors\":[\"{}\"]}}", pubkey(&author));
+    send(&mut ws, &neg_open_wire("neg", &filter, &init)).await;
+    let mut have_ids = Vec::new();
+    let mut need_ids = Vec::new();
+    for _ in 0..16 {
+        let frame = recv_json(&mut ws).await;
+        assert_eq!(frame[0], "NEG-MSG", "{frame}");
+        assert_eq!(frame[1], "neg", "{frame}");
+        let reply = unhex(frame[2].as_str().unwrap());
+        let next = neg
+            .reconcile_with_ids(&reply, &mut have_ids, &mut need_ids)
+            .unwrap();
+        match next {
+            Some(msg) => send(&mut ws, &neg_msg_wire("neg", &msg)).await,
+            None => break,
+        }
+    }
+    let hexes = |ids: &[Id]| -> Vec<String> {
+        ids.iter()
+            .map(|id| faster_hex::hex_string(id.as_bytes()))
+            .collect()
+    };
+    assert_eq!(hexes(&have_ids), [phantom.id().to_string()]);
+    assert_eq!(hexes(&need_ids), [c.id().to_string()]);
+
+    send(&mut ws, "[\"NEG-CLOSE\",\"neg\"]").await;
+    send(&mut ws, &neg_msg_wire("neg", &[0x60])).await;
+    let frame = recv_json(&mut ws).await;
+    assert_eq!(
+        frame,
+        json!(["NEG-ERR", "neg", "closed: unknown subscription"]),
+        "{frame}"
+    );
 }
