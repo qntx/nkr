@@ -2,7 +2,7 @@
 //! index, and hibernation state over a [`SqlStore`].
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use nosfry_core::auth::{AUTH_KIND, ReadGate};
@@ -17,6 +17,7 @@ use nosfry_core::message::{
 };
 use nosfry_core::moderation::Moderation;
 use nosfry_core::monitor::Monitors;
+use nosfry_core::policy::{self, Decision};
 use nosfry_core::session::{Command, Session, SubKey};
 use nosfry_core::store::WriteOutcome;
 use nosfry_core::sync::{self, NegentropyStorageVector};
@@ -88,6 +89,22 @@ pub struct Effects {
     /// A stored (or duplicate) NIP-62 request to vanish queued
     /// deletion work; the glue schedules the alarm for now.
     pub vanish: bool,
+    /// A publish paused at the write-policy point; the glue answers
+    /// it and calls [`Relay::decided`]. A message carries at most one
+    /// EVENT, so at most one check is pending per call.
+    pub policy: Option<PolicyCheck>,
+}
+
+/// A publish waiting on the write-policy verdict: the connection,
+/// the event, and the strfry request line to send the policy.
+#[derive(Debug)]
+pub struct PolicyCheck {
+    /// The publishing connection.
+    pub conn: u64,
+    /// The verified event under review.
+    pub event: Arc<Event>,
+    /// The `{"type":"new",…}` line to POST to the policy.
+    pub line: String,
 }
 
 /// The management RPC answer the glue turns into an HTTP response.
@@ -164,6 +181,8 @@ pub struct Relay<E: Executor, S: Socket> {
     /// address; the entry dies with the last.
     buckets: HashMap<IpAddr, Arc<AddressBuckets>>,
     monitors: Monitors<u64>,
+    /// Whether a write policy runs (the `POLICY` binding exists).
+    policy: bool,
     /// Open negentropy sessions by `(conn, subscription id)`.
     negs: HashMap<(u64, SubId), NegSession>,
     /// Total bytes the open negentropy sessions have reserved against
@@ -182,10 +201,13 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     /// [`RelayError::Config`] on an invalid config,
     /// [`RelayError::ConnId`] on an attachment conn id above 2^53 − 1,
     /// [`RelayError::Store`] on SQL failures or corrupt `subs` rows.
+    /// `policy` tells the relay a write-policy endpoint exists — the
+    /// glue passes the `POLICY` binding's presence.
     pub fn open(
         store: SqlStore<E>,
         config: Config,
         sockets: Vec<(S, Attachment)>,
+        policy: bool,
     ) -> Result<Self, RelayError> {
         let limits = Arc::new(config.limits()?);
         store
@@ -207,6 +229,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             conns: HashMap::new(),
             buckets: HashMap::new(),
             monitors: Monitors::new(),
+            policy,
             negs: HashMap::new(),
             sync_reserved: 0,
         };
@@ -562,7 +585,9 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     fn command(&mut self, conn: u64, command: Command, now_ms: u64, effects: &mut Effects) {
         match command {
             Command::Send { text, .. } => self.send(conn, &text),
-            Command::Publish { event, .. } => self.publish(conn, &event, effects),
+            Command::Publish { event, authed } => {
+                self.publish(conn, &event, authed, now_ms, effects);
+            }
             Command::Subscribe { sub, filters, gate } => {
                 self.subscribe(conn, sub, filters, gate, now_ms / 1000);
             }
@@ -799,15 +824,21 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
     }
 
-    /// A verified event: answer `OK`, persist non-ephemeral kinds,
-    /// and deliver a `Stored` or accepted ephemeral event to every
-    /// current subscription, the publisher's own included.
-    fn publish(&mut self, conn: u64, event: &Arc<Event>, effects: &mut Effects) {
-        // NIP-86: the moderation snapshot gates every publish,
-        // ephemeral kinds included — the same position the native
-        // connection checks. AUTH events and a relay-scoped request
-        // to vanish are exempt (a banned author may still
-        // authenticate or vanish).
+    /// A verified event: the moderation gate, then the write-policy
+    /// point (the glue answers it and calls [`Relay::decided`]), then
+    /// the store. NIP-86 runs first, exactly where the native
+    /// connection checks it; AUTH events and a relay-scoped request
+    /// to vanish are exempt (a banned author may still authenticate
+    /// or vanish), and a vanish request also bypasses the policy —
+    /// restricted relays MUST comply with NIP-62.
+    fn publish(
+        &mut self,
+        conn: u64,
+        event: &Arc<Event>,
+        authed: Option<PublicKey>,
+        now_ms: u64,
+        effects: &mut Effects,
+    ) {
         if event.kind() != AUTH_KIND
             && !event.requests_vanish(self.limits.auth.relay())
             && let Some(reason) = self.moderation.blocked_reason(event)
@@ -815,6 +846,59 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             self.send(conn, &ok_frame(&event.id(), false, reason));
             return;
         }
+        if self.policy && !event.requests_vanish(self.limits.auth.relay()) {
+            let ip = self
+                .conns
+                .get(&conn)
+                .and_then(|c| c.ip)
+                .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+            effects.policy = Some(PolicyCheck {
+                conn,
+                event: Arc::clone(event),
+                line: policy::request_line(event.json(), now_ms / 1000, ip, authed),
+            });
+            return;
+        }
+        self.store_publish(conn, event, effects);
+    }
+
+    /// Finish a publish paused for the write policy — the native
+    /// `policy_accepts` outcome: `reject` answers `OK false`
+    /// (`blocked: rejected by write policy` on an empty `msg`),
+    /// `shadowReject` answers `OK true` without storing or
+    /// broadcasting, `accept` continues to the store. The connection
+    /// may be gone by the time the verdict arrives (another message
+    /// ran while the glue awaited): an `Accept` still writes and
+    /// delivers — only its `OK` is skipped (`send` is a no-op).
+    pub fn decided(
+        &mut self,
+        conn: u64,
+        event: &Arc<Event>,
+        decision: Decision,
+        _now_ms: u64,
+    ) -> Effects {
+        let mut effects = Effects::default();
+        match decision {
+            Decision::Accept => self.store_publish(conn, event, &mut effects),
+            Decision::Reject(m) if m.is_empty() => self.send(
+                conn,
+                &ok_frame(&event.id(), false, "blocked: rejected by write policy"),
+            ),
+            Decision::Reject(m) => {
+                self.send(conn, &ok_frame(&event.id(), false, &m));
+            }
+            Decision::ShadowReject(m) => {
+                self.send(conn, &ok_frame(&event.id(), true, &m));
+            }
+        }
+        effects
+    }
+
+    /// The publish tail shared by the synchronous path and a policy
+    /// `accept`: persist non-ephemeral kinds and deliver a `Stored`
+    /// or ephemeral event to every current subscription, the
+    /// publisher's own included.
+    fn store_publish(&mut self, conn: u64, event: &Arc<Event>, effects: &mut Effects) {
         if event.kind().is_ephemeral() {
             self.send(conn, &ok_frame(&event.id(), true, ""));
             self.deliver(event);

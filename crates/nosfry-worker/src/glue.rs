@@ -6,6 +6,13 @@
 //! [`worker::Storage::transaction`] runs the KV transaction path, so
 //! [`DoSql::transaction`] calls `transactionSync` on the raw
 //! `DurableObjectStorage` through `js-sys` instead.
+//!
+//! The write policy is an optional `POLICY` service binding: each
+//! event reaching the policy point is `POST`ed to it as the strfry
+//! request line and its `{"id","action","msg"}` answer finishes the
+//! publish. Unlike the native plugin's serial stdio pipe, checks on
+//! different connections interleave inside the object while a fetch
+//! is in flight — a service-bound policy must not rely on ordering.
 
 #![allow(
     tail_expr_drop_order,
@@ -17,19 +24,22 @@
 use std::cell::{Cell, RefCell};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
+use std::time::Duration;
 
 use js_sys::{Date, Function, Reflect};
 use nosfry_core::message::notice_frame;
+use nosfry_core::policy::{self, Decision};
 use nosfry_sql::{Executor, Param, SqlStore, StoreError, Value};
 use wasm_bindgen::closure::ScopedClosure;
 use wasm_bindgen::{JsCast, JsValue};
 use worker::{
-    Context, DurableObject, Env, Error, Method, Request, Response, Result, ScheduledTime, State,
-    WebSocket, WebSocketIncomingMessage, WebSocketPair, console_error, durable_object, event,
+    Context, DurableObject, Env, Error, Fetcher, Method, Request, RequestInit, Response, Result,
+    ScheduledTime, State, WebSocket, WebSocketIncomingMessage, WebSocketPair, console_error,
+    durable_object, event,
 };
 
 use crate::config::Config;
-use crate::relay::{Attachment, Relay, Socket};
+use crate::relay::{Attachment, PolicyCheck, Relay, Socket};
 
 /// The `NOSFRY_CONFIG` variable's TOML; a missing variable is an
 /// empty document, which `Config::parse` fills with defaults.
@@ -266,6 +276,10 @@ pub struct RelayObject {
     /// "not yet loaded from storage" — `schedule_alarm` reads it once
     /// when the cache is empty.
     alarm: Cell<Option<u64>>,
+    /// The `POLICY` service binding; `None` means no write policy.
+    policy: Option<Fetcher>,
+    /// `[relay.write_policy] timeout_seconds` — the check deadline.
+    policy_timeout: Duration,
 }
 
 impl std::fmt::Debug for RelayObject {
@@ -400,6 +414,106 @@ impl RelayObject {
         Ok(())
     }
 
+    /// Apply the alarm effects of a `message`/`decided` call: move
+    /// the alarm forward for the earliest expiration, and run it now
+    /// when vanish work queued.
+    async fn apply_effects(&self, effects: &crate::relay::Effects) -> Result<()> {
+        if let Some(expiration) = effects.expiration {
+            self.schedule_alarm(expiration.saturating_mul(1000)).await?;
+        }
+        if effects.vanish {
+            self.schedule_alarm(worker::Date::now().as_millis()).await?;
+        }
+        Ok(())
+    }
+
+    /// Ask the `POLICY` service binding about `check` and finish the
+    /// publish: POST the strfry request line, race
+    /// `[relay.write_policy] timeout_seconds`, and parse the verdict.
+    /// Every failure — fetch error, non-2xx, timeout, an over-long or
+    /// unparseable body, an id mismatch — maps to the native
+    /// `error: internal error` reject, logged at error.
+    async fn run_policy(&self, check: &PolicyCheck) -> Result<()> {
+        use futures_util::future::{self, Either};
+        let id = check.event.id().to_string();
+        let decision = match &self.policy {
+            None => {
+                console_error!("write policy enabled without a POLICY binding");
+                Decision::Reject("error: internal error".to_owned())
+            }
+            Some(fetcher) => {
+                let mut init = RequestInit::new();
+                init.with_method(Method::Post)
+                    .with_body(Some(JsValue::from_str(&check.line)));
+                let fetch = fetcher.fetch("https://policy.invalid/", Some(init));
+                let delay = worker::Delay::from(self.policy_timeout);
+                futures_util::pin_mut!(fetch, delay);
+                let answered = match future::select(fetch, delay).await {
+                    Either::Left((answered, _)) => answered,
+                    Either::Right(_) => {
+                        console_error!("write policy timed out");
+                        return self
+                            .decide(check, Decision::Reject("error: internal error".to_owned()))
+                            .await;
+                    }
+                };
+                match answered {
+                    Err(error) => {
+                        console_error!("write policy fetch failed: {error}");
+                        Decision::Reject("error: internal error".to_owned())
+                    }
+                    Ok(mut response) => match self.policy_response(&mut response, &id).await {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            console_error!("write policy check failed: {error}");
+                            Decision::Reject("error: internal error".to_owned())
+                        }
+                    },
+                }
+            }
+        };
+        self.decide(check, decision).await
+    }
+
+    /// Read a policy response body into a [`Decision`]; every failure
+    /// mode is an error the caller logs and maps to
+    /// `error: internal error`.
+    async fn policy_response(&self, response: &mut Response, id: &str) -> Result<Decision, String> {
+        if !(200..300).contains(&response.status_code()) {
+            return Err(format!("policy answered HTTP {}", response.status_code()));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| format!("policy body unreadable: {e}"))?;
+        // strfry's maximum record size, applied to the whole body.
+        if body.len() > 8192 {
+            return Err("policy response exceeds 8192 bytes".to_owned());
+        }
+        policy::parse_response(&body, id).map_err(|err| format!("bad policy response: {err:?}"))
+    }
+
+    /// Hand the policy's verdict to the relay and apply the effects
+    /// its answer produced.
+    async fn decide(&self, check: &PolicyCheck, decision: Decision) -> Result<()> {
+        let effects = {
+            let mut borrowed = self.relay.borrow_mut();
+            match borrowed.as_mut() {
+                Ok(relay) => relay.decided(
+                    check.conn,
+                    &check.event,
+                    decision,
+                    worker::Date::now().as_millis(),
+                ),
+                Err(err) => {
+                    console_error!("relay object failed to initialize: {err}");
+                    return Ok(());
+                }
+            }
+        };
+        self.apply_effects(&effects).await
+    }
+
     /// Reconcile the stored alarm with the wanted time `ms` once on
     /// wake: a crash between a store commit and `set_alarm` would
     /// otherwise strand queued vanish or expiry work forever. The
@@ -435,8 +549,16 @@ impl RelayObject {
 
 impl DurableObject for RelayObject {
     fn new(state: State, env: Env) -> Self {
+        // A present `POLICY` binding enables the write policy; its
+        // absence is not an error.
+        let policy = env.service("POLICY").ok();
+        let config = config(&env);
+        let policy_timeout = config.as_ref().map_or_else(
+            |_| Duration::from_secs(10),
+            |c| Duration::from_secs(c.relay.write_policy.timeout_seconds),
+        );
         let relay = (|| -> Result<Relay<DoSql, DoSocket>, String> {
-            let config = config(&env).map_err(|e| e.to_string())?;
+            let config = config.map_err(|e| e.to_string())?;
             let storage = state.storage();
             let store = SqlStore::open(DoSql { storage }).map_err(|e| e.to_string())?;
             let mut sockets = Vec::new();
@@ -447,7 +569,7 @@ impl DurableObject for RelayObject {
                     .ok_or_else(|| "websocket missing its attachment".to_owned())?;
                 sockets.push((DoSocket(ws), attachment));
             }
-            Relay::open(store, config, sockets).map_err(|e| e.to_string())
+            Relay::open(store, config, sockets, policy.is_some()).map_err(|e| e.to_string())
         })();
         // Reconcile the alarm once on wake: `next_alarm` is
         // synchronous, so the wanted time is computed before any
@@ -465,6 +587,8 @@ impl DurableObject for RelayObject {
             state,
             relay: RefCell::new(relay),
             alarm: Cell::new(None),
+            policy,
+            policy_timeout,
         }
     }
 
@@ -536,7 +660,7 @@ impl DurableObject for RelayObject {
             // connection state to drive.
             return ws.close(Some(1011), Some("internal error"));
         };
-        let effects = {
+        let mut effects = {
             let mut borrowed = self.relay.borrow_mut();
             match borrowed.as_mut() {
                 Ok(relay) => relay.message(attachment.conn, worker::Date::now().as_millis(), &text),
@@ -546,15 +670,15 @@ impl DurableObject for RelayObject {
                 }
             }
         };
-        if let Some(updated) = effects.attachment {
+        if let Some(updated) = effects.attachment.take() {
             ws.serialize_attachment(&updated)?;
         }
-        if let Some(expiration) = effects.expiration {
-            self.schedule_alarm(expiration.saturating_mul(1000)).await?;
+        // The `RefCell` borrow ended with `effects`; the policy fetch
+        // awaits freely and `decided` borrows again.
+        if let Some(check) = effects.policy.take() {
+            self.run_policy(&check).await?;
         }
-        if effects.vanish {
-            self.schedule_alarm(worker::Date::now().as_millis()).await?;
-        }
+        self.apply_effects(&effects).await?;
         Ok(())
     }
 

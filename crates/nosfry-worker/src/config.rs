@@ -50,12 +50,33 @@ pub struct Relay {
     pub auth: AuthConfig,
     /// NIP-86 management API.
     pub management: ManagementConfig,
+    /// The write-policy service binding's knobs. There is no
+    /// `plugin` on Workers — the `POLICY` binding's presence decides
+    /// whether a policy runs.
+    pub write_policy: WritePolicy,
     /// Process-wide budget for sealed negentropy sync storages,
     /// `0` = unlimited. Workers keeps a tighter default than native
     /// because a Durable Object holds all of them on one isolate.
     pub max_sync_memory_bytes: usize,
     /// NIP-11 relay information.
     pub info: Info,
+}
+
+/// `[relay.write_policy]` — strfry write-policy settings Workers
+/// keeps; `plugin` stays unknown (no child processes on Workers).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WritePolicy {
+    /// Seconds the policy has to answer each request.
+    pub timeout_seconds: u64,
+}
+
+impl Default for WritePolicy {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 10,
+        }
+    }
 }
 
 /// `[worker]` — Workers platform knobs.
@@ -83,6 +104,7 @@ impl Default for Relay {
             rate_limits: RateLimits::default(),
             auth: AuthConfig::default(),
             management: ManagementConfig::default(),
+            write_policy: WritePolicy::default(),
             max_sync_memory_bytes: 33_554_432,
             info: Info::default(),
         }
