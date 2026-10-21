@@ -14,7 +14,7 @@ use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 
 use crate::exec::{Executor, Param, Value};
-use crate::{Count, Scan, StoreError};
+use crate::{Count, Records, Scan, StoreError};
 
 /// The on-disk schema version `meta.format` must hold.
 pub const FORMAT_VERSION: i64 = 3;
@@ -286,6 +286,28 @@ impl<E: Executor> SqlStore<E> {
         max_rows: usize,
     ) -> Result<Scan, StoreError> {
         crate::scan::scan(&self.exec, filters, gate, now, max_limit, max_rows)
+    }
+
+    /// The `(created_at, id)` records `filters` match under `gate`,
+    /// at NIP-40 cutoff `now` (`0` disables it) — the same engine
+    /// `query` uses, without the payload fetch. `max_limit` is the
+    /// caller's cap plus one so "at the cap" and "over" differ;
+    /// `max_rows` bounds index rows examined, reported through
+    /// `budget_exhausted`.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure,
+    /// [`StoreError::Corrupt`] on a broken index invariant.
+    pub fn records(
+        &self,
+        filters: &[Filter],
+        gate: &ReadGate,
+        now: u64,
+        max_limit: u64,
+        max_rows: usize,
+    ) -> Result<Records, StoreError> {
+        crate::scan::records(&self.exec, filters, gate, now, max_limit, max_rows)
     }
 
     /// The number of stored events `filters` match under `gate` —
