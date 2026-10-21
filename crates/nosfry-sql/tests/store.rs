@@ -18,7 +18,7 @@
     reason = "tests may panic on failure"
 )]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -88,6 +88,62 @@ impl Executor for Counting {
     }
 }
 
+/// A [`Connection`] that records how many seqs each payload
+/// statement binds — `SQL_WINNERS` is the only query selecting
+/// `json` without `packed`.
+#[derive(Debug)]
+struct ChunkCounting {
+    conn: Connection,
+    sizes: RefCell<Vec<usize>>,
+}
+
+impl ChunkCounting {
+    fn open() -> Self {
+        Self {
+            conn: Connection::open_in_memory().unwrap(),
+            sizes: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The seq count of each payload statement, in call order.
+    fn payload_sizes(&self) -> Vec<usize> {
+        self.sizes.borrow().clone()
+    }
+}
+
+impl Executor for ChunkCounting {
+    type Error = ::rusqlite::Error;
+
+    fn query(
+        &self,
+        sql: &str,
+        params: &[Param<'_>],
+        row: &mut dyn FnMut(Vec<Value>) -> ControlFlow<()>,
+    ) -> Result<(), Self::Error> {
+        if sql.contains("SELECT seq, json") {
+            // `usize::MAX` marks a statement missing its seq list; the
+            // assertions below catch it.
+            let bound = params
+                .first()
+                .and_then(|param| match param {
+                    Param::Text(list) => serde_json::from_str::<Vec<u64>>(list).ok(),
+                    _ => None,
+                })
+                .map_or(usize::MAX, |v| v.len());
+            self.sizes.borrow_mut().push(bound);
+        }
+        self.conn.query(sql, params, row)
+    }
+
+    fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<(), Self::Error> {
+        self.conn.execute(sql, params)
+    }
+
+    fn transaction<T>(&self, f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, StoreError> {
+        self.conn.transaction(f)
+    }
+}
+
 /// `MAX(seq)` — the SQL store has no snapshot concept.
 fn max_seq<E: Executor>(store: &SqlStore<E>) -> u64 {
     let mut max = 0u64;
@@ -104,6 +160,7 @@ fn max_seq<E: Executor>(store: &SqlStore<E>) -> u64 {
 }
 
 fn seqs(store: &SqlStore<Connection>, json: &str, now: u64) -> Vec<u64> {
+    let mut seqs = Vec::new();
     store
         .query(
             &[filter(json)],
@@ -111,12 +168,10 @@ fn seqs(store: &SqlStore<Connection>, json: &str, now: u64) -> Vec<u64> {
             now,
             u64::MAX,
             usize::MAX,
+            &mut |hit| seqs.push(hit.seq),
         )
-        .unwrap()
-        .hits
-        .iter()
-        .map(|hit| hit.seq)
-        .collect()
+        .unwrap();
+    seqs
 }
 
 #[test]
@@ -171,17 +226,19 @@ fn write_outcomes_and_scan_order() {
     assert!(matches!(outcomes[2], WriteOutcome::Stored { seq: 3 }));
     assert_eq!(outcomes[3], WriteOutcome::Duplicate);
 
-    let hits = store
+    let mut hits = Vec::new();
+    let scan = store
         .query(
             &[filter("{\"kinds\":[1]}")],
             &ReadGate::default(),
             0,
             u64::MAX,
             usize::MAX,
+            &mut |hit| hits.push(hit),
         )
         .unwrap();
-    assert!(!hits.budget_exhausted);
-    let jsons: Vec<&str> = hits.hits.iter().map(|h| h.json.as_ref()).collect();
+    assert!(!scan.budget_exhausted);
+    let jsons: Vec<&str> = hits.iter().map(|h| h.json.as_ref()).collect();
     assert_eq!(jsons, vec![c.json(), b.json(), a.json()]);
 }
 
@@ -200,17 +257,19 @@ fn replaceable_supersedes_and_loses() {
     let late = store.write(&[old], None).unwrap().outcomes;
     assert_eq!(late[0], WriteOutcome::Superseded);
     // Only the winner serves.
-    let hits = store
+    let mut hits = Vec::new();
+    store
         .query(
             &[filter("{\"kinds\":[0]}")],
             &ReadGate::default(),
             0,
             u64::MAX,
             usize::MAX,
+            &mut |hit| hits.push(hit),
         )
         .unwrap();
-    assert_eq!(hits.hits.len(), 1);
-    assert_eq!(hits.hits[0].json.as_ref(), new.json());
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].json.as_ref(), new.json());
 }
 
 #[test]
@@ -226,17 +285,19 @@ fn nip09_blocks_and_deletes() {
     let out = store.write(&[del], None).unwrap().outcomes;
     assert!(matches!(out[0], WriteOutcome::Stored { .. }));
     // The victim is gone and stays blocked.
-    let hits = store
+    let mut hits = Vec::new();
+    store
         .query(
             &[filter("{\"kinds\":[1]}")],
             &ReadGate::default(),
             0,
             u64::MAX,
             usize::MAX,
+            &mut |hit| hits.push(hit),
         )
         .unwrap();
-    assert_eq!(hits.hits.len(), 1);
-    assert_eq!(hits.hits[0].json.as_ref(), kept.json());
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].json.as_ref(), kept.json());
     let blocked = store.write(&[victim], None).unwrap().outcomes;
     assert_eq!(blocked[0], WriteOutcome::Deleted);
 }
@@ -288,6 +349,7 @@ fn row_budget_bounds_rows_read() {
     store.write(&events, None).unwrap();
     store.exec().take_index_rows();
 
+    let mut hits = Vec::new();
     let scan = store
         .query(
             &[filter("{\"kinds\":[1]}")],
@@ -295,12 +357,13 @@ fn row_budget_bounds_rows_read() {
             0,
             u64::MAX,
             5,
+            &mut |hit| hits.push(hit),
         )
         .unwrap();
     assert!(scan.budget_exhausted);
-    assert!(!scan.hits.is_empty());
+    assert!(!hits.is_empty());
     // Results stay newest-first even when truncated by the budget.
-    let first = scan.hits.first().unwrap().json.clone();
+    let first = hits.first().unwrap().json.clone();
     assert_eq!(first.as_ref(), events[19].json());
     // `max_rows` bounds rows read: the budget may overshoot by at
     // most the page in flight (here the 16-row first page).
@@ -332,16 +395,18 @@ fn first_page_scales_with_the_cursor_count() {
     store.exec().take_index_rows();
     // limit 4 over 4 author cursors: first pages of 1 row each read
     // about `limit` rows, not 4 × 16.
-    let scan = store
+    let mut hits = Vec::new();
+    store
         .query(
             &[filter(&format!("{{\"authors\":[{authors}]}}"))],
             &ReadGate::default(),
             0,
             4,
             usize::MAX,
+            &mut |hit| hits.push(hit),
         )
         .unwrap();
-    assert_eq!(scan.hits.len(), 4);
+    assert_eq!(hits.len(), 4);
     let read = store.exec().take_index_rows();
     assert!(read <= 24, "read {read} index rows for limit 4");
 }
@@ -388,6 +453,35 @@ fn count_budget_marks_approximate() {
         .unwrap();
     assert!(partial.approximate);
     assert!(partial.count <= full.count);
+}
+
+/// Payloads are fetched in 64-seq chunks and streamed to the sink
+/// in scan order — a REQ never holds more than one chunk.
+#[test]
+fn payloads_stream_in_64_seq_chunks() {
+    let store = SqlStore::open(ChunkCounting::open()).unwrap();
+    let k = key(6);
+    let events: Vec<Arc<Event>> = (0..150u64)
+        .map(|i| event(&k, 1, 100 + i, &json!([]), "e"))
+        .collect();
+    store.write(&events, None).unwrap();
+
+    let mut hits = Vec::new();
+    store
+        .query(
+            &[filter("{\"kinds\":[1]}")],
+            &ReadGate::default(),
+            0,
+            u64::MAX,
+            usize::MAX,
+            &mut |hit| hits.push(hit),
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 150);
+    assert_eq!(store.exec().payload_sizes(), vec![64, 64, 22]);
+    // Per-filter newest-first order survives the chunking.
+    assert_eq!(hits[0].json.as_ref(), events[149].json());
+    assert_eq!(hits[149].json.as_ref(), events[0].json());
 }
 
 #[test]

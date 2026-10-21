@@ -14,7 +14,7 @@ use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 
 use crate::exec::{Executor, Param, Value};
-use crate::{Count, Records, Scan, StoreError};
+use crate::{Count, Hit, Records, Scan, StoreError};
 
 /// The on-disk schema version `meta.format` must hold.
 pub const FORMAT_VERSION: i64 = 3;
@@ -269,9 +269,10 @@ impl<E: Executor> SqlStore<E> {
     }
 
     /// The stored events matching `filters`, per filter newest-first
-    /// and deduplicated by seq across filters, fetched with at most
-    /// `max_rows` index rows examined. See [`crate::Scan`] for the
-    /// budget semantics.
+    /// and deduplicated by seq across filters, streamed to `sink` in
+    /// order; payloads are fetched in chunks so at most one chunk is
+    /// resident at a time. `max_rows` bounds index rows examined; see
+    /// [`crate::Scan`] for the budget semantics.
     ///
     /// # Errors
     ///
@@ -284,8 +285,9 @@ impl<E: Executor> SqlStore<E> {
         now: u64,
         max_limit: u64,
         max_rows: usize,
+        sink: &mut dyn FnMut(Hit),
     ) -> Result<Scan, StoreError> {
-        crate::scan::scan(&self.exec, filters, gate, now, max_limit, max_rows)
+        crate::scan::scan(&self.exec, filters, gate, now, max_limit, max_rows, sink)
     }
 
     /// The `(created_at, id)` records `filters` match under `gate`,
