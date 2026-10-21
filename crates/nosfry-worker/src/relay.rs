@@ -8,8 +8,9 @@ use std::sync::Arc;
 use nosfry_core::auth::ReadGate;
 use nosfry_core::event::{Event, PublicKey};
 use nosfry_core::filter::Filter;
+use nosfry_core::hll::Hll;
 use nosfry_core::limits::{AddressBuckets, Limits};
-use nosfry_core::message::{SubId, closed_frame, eose_frame, event_frame, ok_frame};
+use nosfry_core::message::{SubId, closed_frame, count_frame, eose_frame, event_frame, ok_frame};
 use nosfry_core::monitor::Monitors;
 use nosfry_core::session::{Command, Session, SubKey};
 use nosfry_core::store::WriteOutcome;
@@ -315,11 +316,14 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         self.store.next_expiration()
     }
 
-    /// The NIP-11 document: the implemented NIPs only — NIP-42 when
-    /// `service_url` is set.
+    /// The NIP-11 document: the implemented NIPs only — NIP-45 when
+    /// COUNT is enabled, NIP-42 when `service_url` is set.
     #[must_use]
     pub fn nip11(&self) -> String {
         let mut nips = vec![1, 9, 11, 40, 70];
+        if self.limits.req.max_filter_limit_count > 0 {
+            nips.push(45);
+        }
         if !self.config.relay.service_url.is_empty() {
             nips.push(42);
         }
@@ -374,13 +378,13 @@ impl<E: Executor, S: Socket> Relay<E, S> {
                 self.subscribe(conn, sub, filters, gate, now);
             }
             Command::Unsubscribe { sub_id } => self.unsubscribe(conn, &sub_id),
-            // COUNT and negentropy are refused by the session itself:
-            // the worker's limits force max_filter_limit_count and
-            // max_sync_events to 0, so these arms never fire.
-            Command::Count { .. }
-            | Command::NegOpen { .. }
-            | Command::NegMsg { .. }
-            | Command::NegClose { .. } => {}
+            Command::Count { sub, filters, gate } => {
+                self.count(conn, &sub, &filters, &gate, now);
+            }
+            // Negentropy is refused by the session itself: the
+            // worker's limits force max_sync_events to 0, so these
+            // arms never fire.
+            Command::NegOpen { .. } | Command::NegMsg { .. } | Command::NegClose { .. } => {}
         }
     }
 
@@ -485,6 +489,39 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             if let Some(c) = self.conns.get_mut(&conn) {
                 c.session.close_by_relay(&sub);
             }
+        }
+    }
+
+    /// A `COUNT`: one frame over the stored union, then the relay
+    /// closes the sub — a COUNT is a one-shot subscription and
+    /// persists nothing to `subs`. The row budget is the smaller of
+    /// the COUNT entry budget and the platform's scan-row cap;
+    /// hitting it marks the answer `approximate`.
+    fn count(&mut self, conn: u64, sub: &SubKey, filters: &[Filter], gate: &ReadGate, now: u64) {
+        let budget = usize::try_from(
+            self.limits
+                .req
+                .max_filter_limit_count
+                .min(self.config.worker.max_scan_rows as u64),
+        )
+        .unwrap_or(usize::MAX);
+        match self
+            .store
+            .count(filters, gate, now, budget, Hll::for_filters(filters))
+        {
+            Ok(result) => self.send(
+                conn,
+                &count_frame(
+                    &sub.id,
+                    result.count,
+                    result.approximate,
+                    result.hll.as_ref(),
+                ),
+            ),
+            Err(_) => self.send(conn, &closed_frame(&sub.id, "error: internal error")),
+        }
+        if let Some(c) = self.conns.get_mut(&conn) {
+            c.session.close_by_relay(sub);
         }
     }
 

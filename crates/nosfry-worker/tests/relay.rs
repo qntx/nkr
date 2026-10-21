@@ -27,6 +27,10 @@ use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
+use nosfry_core::event::PublicKey;
+use nosfry_core::filter::Filter;
+use nosfry_core::hll::Hll;
+use nosfry_core::message::{SubId, count_frame};
 use nosfry_core::sign::{event, key};
 use nosfry_sql::rusqlite::Connection;
 use nosfry_sql::{Executor, SqlStore, Value};
@@ -100,6 +104,19 @@ fn event_frame(event: &nosfry_core::event::Event) -> String {
 
 fn req_frame(sub: &str, filter: &serde_json::Value) -> String {
     format!("[\"REQ\",\"{sub}\",{filter}]")
+}
+
+fn count_wire(sub: &str, filter: &serde_json::Value) -> String {
+    format!("[\"COUNT\",\"{sub}\",{filter}]")
+}
+
+/// The JSON body of the `["COUNT",sub,{..}]` frame.
+fn count_body(frames: &[String], sub: &str) -> serde_json::Value {
+    let frame = frames
+        .iter()
+        .find(|f| f.starts_with(&format!("[\"COUNT\",\"{sub}\"")))
+        .unwrap_or_else(|| panic!("no COUNT frame for {sub}: {frames:?}"));
+    serde_json::from_str::<serde_json::Value>(frame).unwrap()[2].clone()
 }
 
 fn auth_frame(secret: u8, challenge: &str, at: u64) -> String {
@@ -459,6 +476,134 @@ fn hibernation_restores_subscriptions() {
         assert_eq!(count, 2, "one row per live subscription");
     }
     drop((att_c, c));
+}
+
+#[test]
+fn count_exact_and_union_dedup() {
+    let mut r = relay("");
+    let socket = connect(&mut r, 1);
+    // key(1): two kind-1 + one kind-3; key(2): one kind-1.
+    let events = [
+        event(&key(1), 1, NOW, &json!([]), "a"),
+        event(&key(1), 1, NOW, &json!([]), "b"),
+        event(&key(2), 1, NOW, &json!([]), "c"),
+        event(&key(1), 3, NOW, &json!([]), "d"),
+    ];
+    for ev in &events {
+        msg(&mut r, 1, &event_frame(ev));
+    }
+    msg(&mut r, 1, &count_wire("c", &json!({"kinds": [1]})));
+    let body = count_body(&socket.sent(), "c");
+    assert_eq!(body["count"], 3, "{body}");
+    assert!(body.get("approximate").is_none(), "{body}");
+
+    // Overlapping filters count each event once: 3 kind-1s plus
+    // key(1)'s kind-3 — not 3 + 3.
+    let wire = format!(
+        "[\"COUNT\",\"d\",{{\"kinds\":[1]}},{{\"authors\":[\"{}\"]}}]",
+        pubkey_of(1)
+    );
+    msg(&mut r, 1, &wire);
+    assert_eq!(count_body(&socket.sent(), "d")["count"], 4);
+
+    // A filter `limit` is ignored for COUNT.
+    msg(
+        &mut r,
+        1,
+        &count_wire("e", &json!({"kinds": [1], "limit": 1})),
+    );
+    assert_eq!(count_body(&socket.sent(), "e")["count"], 3);
+}
+
+#[test]
+fn count_hll_registers_match_the_core_sketch() {
+    let mut r = relay("");
+    let socket = connect(&mut r, 1);
+    let target = pubkey_of(2);
+    // Three followers p-tag key(2); a kind-1 without the tag does not
+    // match the filter.
+    let mut signers = Vec::new();
+    for n in [1u8, 3, 5] {
+        let ev = event(&key(n), 3, NOW, &json!([["p", target]]), "");
+        msg(&mut r, 1, &event_frame(&ev));
+        signers.push(n);
+    }
+    let stray = event(&key(7), 1, NOW, &json!([]), "");
+    msg(&mut r, 1, &event_frame(&stray));
+
+    msg(&mut r, 1, &count_wire("c", &json!({"#p": [target]})));
+    // The whole frame equals what `count_frame` builds from the core
+    // sketch over the counted authors.
+    let filter = Filter::parse(&format!("{{\"#p\":[\"{target}\"]}}")).unwrap();
+    let mut hll = Hll::for_filters(std::slice::from_ref(&filter)).unwrap();
+    for n in signers {
+        hll.add(&PublicKey(key(n).x_only_public_key().0.to_byte_array()));
+    }
+    let want = count_frame(&SubId::parse("c").unwrap(), 3, false, Some(hll.registers()));
+    assert!(socket.sent().contains(&want), "{:?}", socket.sent());
+}
+
+#[test]
+fn count_restricted_kind_needs_auth() {
+    let mut r = relay("[relay]\nservice_url = \"wss://relay.example.com\"\n");
+    connect(&mut r, 1);
+    let socket = connect(&mut r, 2);
+    let for_me = event(&key(5), 4, NOW, &json!([["p", pubkey_of(9)]]), "yours");
+    let for_other = event(&key(5), 4, NOW, &json!([["p", pubkey_of(1)]]), "not yours");
+    msg(&mut r, 1, &event_frame(&for_me));
+    msg(&mut r, 1, &event_frame(&for_other));
+
+    // A fully restricted COUNT is refused like a REQ: challenge plus
+    // `auth-required:` CLOSED, nothing counted.
+    msg(&mut r, 2, &count_wire("c", &json!({"kinds": [4]})));
+    let frames = socket.sent();
+    assert!(
+        frames.iter().any(|f| f.starts_with("[\"AUTH\"")),
+        "{frames:?}"
+    );
+    let closed = frames
+        .iter()
+        .find(|f| f.starts_with("[\"CLOSED\",\"c\""))
+        .unwrap();
+    assert!(closed.contains("auth-required:"), "{closed}");
+
+    // Authenticated as key(9) only the involved DM counts.
+    msg(&mut r, 2, &auth_frame(9, "challenge-2", NOW));
+    msg(&mut r, 2, &count_wire("d", &json!({"kinds": [4]})));
+    assert_eq!(count_body(&socket.sent(), "d")["count"], 1);
+}
+
+#[test]
+fn count_marks_approximate_at_the_row_budget() {
+    let mut r = relay("[worker]\nmax_scan_rows = 3\n");
+    let socket = connect(&mut r, 1);
+    // Two kind cursors; a 3-row budget lets the first drain inside
+    // its page, then refuses the second.
+    for i in 0..5u64 {
+        let one = event(&key(1), 1, NOW + i, &json!([]), "a");
+        let two = event(&key(1), 2, NOW + i, &json!([]), "b");
+        msg(&mut r, 1, &event_frame(&one));
+        msg(&mut r, 1, &event_frame(&two));
+    }
+    msg(&mut r, 1, &count_wire("c", &json!({"kinds": [1, 2]})));
+    let body = count_body(&socket.sent(), "c");
+    assert_eq!(body["approximate"], true, "{body}");
+    assert!(body["count"].as_u64().unwrap() <= 10, "{body}");
+}
+
+#[test]
+fn count_then_req_reuses_the_sub_id() {
+    let mut r = relay("");
+    let socket = connect(&mut r, 1);
+    let ev = event(&key(1), 1, NOW, &json!([]), "hi");
+    msg(&mut r, 1, &event_frame(&ev));
+    msg(&mut r, 1, &count_wire("s", &json!({"kinds": [1]})));
+    assert_eq!(count_body(&socket.sent(), "s")["count"], 1);
+    // The COUNT closed the sub relay-side; the id is free for a REQ.
+    msg(&mut r, 1, &req_frame("s", &json!({"kinds": [1]})));
+    let frames = socket.sent();
+    assert_eq!(event_frames(&frames, "s").len(), 1, "{frames:?}");
+    assert!(frames.iter().any(|f| f == "[\"EOSE\",\"s\"]"), "{frames:?}");
 }
 
 #[test]
