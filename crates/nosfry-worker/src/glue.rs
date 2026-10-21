@@ -41,6 +41,14 @@ fn config(env: &Env) -> Result<Config> {
     Config::parse(&toml).map_err(|err| Error::from(err.to_string()))
 }
 
+/// Install the panic hook once per isolate: a Rust panic aborts the
+/// isolate — the runtime reports it as `Network connection lost` —
+/// so the message must reach the workerd log to be diagnosable.
+#[event(start)]
+fn start() {
+    console_error_panic_hook::set_once();
+}
+
 /// Forward every request to the `relay` object, honouring
 /// `[worker] location_hint` when it is set.
 #[event(fetch)]
