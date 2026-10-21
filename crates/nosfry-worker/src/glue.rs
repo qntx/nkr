@@ -24,6 +24,7 @@
 use std::cell::{Cell, RefCell};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use js_sys::{Date, Function, Reflect};
@@ -41,14 +42,25 @@ use worker::{
 use crate::config::Config;
 use crate::relay::{Attachment, PolicyCheck, Relay, Socket};
 
-/// The `NOSFRY_CONFIG` variable's TOML; a missing variable is an
-/// empty document, which `Config::parse` fills with defaults.
+/// The `NOSFRY_CONFIG` variable's TOML, parsed once per isolate —
+/// the variable cannot change between requests, and the entry
+/// `fetch` needs only `location_hint` out of it. A parse error still
+/// answers 500 and is logged every request.
 fn config(env: &Env) -> Result<Config> {
-    let toml = env
-        .var("NOSFRY_CONFIG")
-        .map(|v| v.to_string())
-        .unwrap_or_default();
-    Config::parse(&toml).map_err(|err| Error::from(err.to_string()))
+    static PARSED: OnceLock<Result<Config, String>> = OnceLock::new();
+    match PARSED.get_or_init(|| {
+        let toml = env
+            .var("NOSFRY_CONFIG")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        Config::parse(&toml).map_err(|err| err.to_string())
+    }) {
+        Ok(config) => Ok(config.clone()),
+        Err(err) => {
+            console_error!("invalid NOSFRY_CONFIG: {err}");
+            Err(Error::from(err.clone()))
+        }
+    }
 }
 
 /// Install the panic hook once per isolate: a Rust panic aborts the
