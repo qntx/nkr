@@ -68,13 +68,13 @@ impl StoreDriver for SqlDriver {
         max_limit: u64,
         now: u64,
     ) -> Vec<String> {
+        let mut hits = Vec::new();
         self.store
-            .query(&filters, gate, now, max_limit, usize::MAX)
-            .unwrap()
-            .hits
-            .iter()
-            .map(|hit| hit.json.to_string())
-            .collect()
+            .query(&filters, gate, now, max_limit, usize::MAX, &mut |hit| {
+                hits.push(hit.json.to_string());
+            })
+            .unwrap();
+        hits
     }
 
     fn records(

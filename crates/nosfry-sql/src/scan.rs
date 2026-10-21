@@ -34,15 +34,21 @@ const MAX_PAGE: usize = 512;
 /// to complete.
 type Match = (u64, EventId, u64);
 
-/// The stored events one `query` found.
-#[derive(Debug)]
+/// What one `query` reports: the matching events themselves are
+/// streamed to the caller's sink, so `Scan` only carries the
+/// budget flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scan {
-    /// Matching `(seq, canonical JSON)` rows, per filter newest-first.
-    pub hits: Vec<Hit>,
-    /// The `max_rows` budget stopped the scan early; `hits` is what
-    /// complete `created_at` groups yielded before exhaustion.
+    /// The `max_rows` budget stopped the scan early; the emitted
+    /// hits are what complete `created_at` groups yielded before
+    /// exhaustion.
     pub budget_exhausted: bool,
 }
+
+/// One payload statement binds at most this many winning seqs; the
+/// sink drains each chunk before the next fetch, so a `query` never
+/// holds more than one chunk of event JSON.
+const PAYLOAD_CHUNK: usize = 64;
 
 /// One matching stored event.
 #[derive(Debug)]
@@ -594,39 +600,46 @@ fn scan_ranges<E: Executor>(
     Ok(out)
 }
 
-/// The canonical JSON of the winning seqs, one statement per filter.
-fn fetch_jsons<E: Executor>(exec: &E, seqs: Vec<u64>) -> Result<Vec<Hit>, StoreError> {
-    if seqs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let list = format!(
-        "[{}]",
-        seqs.iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let mut jsons = HashMap::new();
-    let mut failure = None;
-    let result = exec.query(SQL_WINNERS, &[Param::Text(&list)], &mut |row| {
-        if let (Ok(seq), Ok(json)) = (uint(&row, 0), text(&row, 1)) {
-            jsons.insert(seq, Box::from(json));
-        } else {
-            failure = Some(StoreError::Corrupt("bad payload row"));
-            return ControlFlow::Break(());
+/// The canonical JSON of the winning seqs, streamed to `sink` in
+/// `seqs` order [`PAYLOAD_CHUNK`] winners per statement.
+fn fetch_jsons<E: Executor>(
+    exec: &E,
+    seqs: &[u64],
+    sink: &mut dyn FnMut(Hit),
+) -> Result<(), StoreError> {
+    for chunk in seqs.chunks(PAYLOAD_CHUNK) {
+        let list = format!(
+            "[{}]",
+            chunk
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let mut jsons = HashMap::new();
+        let mut failure = None;
+        let result = exec.query(SQL_WINNERS, &[Param::Text(&list)], &mut |row| {
+            if let (Ok(seq), Ok(json)) = (uint(&row, 0), text(&row, 1)) {
+                jsons.insert(seq, Box::from(json));
+            } else {
+                failure = Some(StoreError::Corrupt("bad payload row"));
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        });
+        if let Err(err) = result {
+            return Err(StoreError::sql(err));
         }
-        ControlFlow::Continue(())
-    });
-    if let Err(err) = result {
-        return Err(StoreError::sql(err));
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        for &seq in chunk {
+            if let Some(json) = jsons.remove(&seq) {
+                sink(Hit { seq, json });
+            }
+        }
     }
-    if let Some(err) = failure {
-        return Err(err);
-    }
-    Ok(seqs
-        .into_iter()
-        .filter_map(|seq| jsons.remove(&seq).map(|json: Box<str>| Hit { seq, json }))
-        .collect())
+    Ok(())
 }
 
 /// Run the whole filter set once: per-filter modes, shared dedup.
@@ -687,7 +700,7 @@ fn scan_matches<E: Executor>(
     Ok((matches, budget_exhausted))
 }
 
-/// [`scan_matches`] plus the payload fetch.
+/// [`scan_matches`] plus the chunked payload fetch, streamed.
 pub(crate) fn scan<E: Executor>(
     exec: &E,
     filters: &[Filter],
@@ -695,13 +708,12 @@ pub(crate) fn scan<E: Executor>(
     now: u64,
     max_limit: u64,
     max_rows: usize,
+    sink: &mut dyn FnMut(Hit),
 ) -> Result<Scan, StoreError> {
     let (matches, budget_exhausted) = scan_matches(exec, filters, gate, now, max_limit, max_rows)?;
-    let seqs = matches.iter().map(|m| m.2).collect();
-    Ok(Scan {
-        hits: fetch_jsons(exec, seqs)?,
-        budget_exhausted,
-    })
+    let seqs: Vec<u64> = matches.iter().map(|m| m.2).collect();
+    fetch_jsons(exec, &seqs, sink)?;
+    Ok(Scan { budget_exhausted })
 }
 
 /// [`scan_matches`] alone: the records a `NEG-OPEN` syncs, without

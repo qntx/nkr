@@ -934,21 +934,27 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         gate: ReadGate,
         now: u64,
     ) {
-        let Ok(scan) = self.store.query(
+        // EVENTs go out from the scan's sink, so a REQ never holds
+        // more than one chunk of payloads.
+        let conns = &self.conns;
+        let scanned = self.store.query(
             &filters,
             &gate,
             now,
             self.limits.req.max_filter_limit,
             self.config.worker.max_scan_rows,
-        ) else {
+            &mut |hit| {
+                if let Some(c) = conns.get(&conn) {
+                    c.socket.send(&event_frame(&sub.id, &hit.json));
+                }
+            },
+        );
+        if scanned.is_err() {
             self.send(conn, &closed_frame(&sub.id, "error: internal error"));
             if let Some(c) = self.conns.get_mut(&conn) {
                 c.session.close_by_relay(&sub);
             }
             return;
-        };
-        for hit in &scan.hits {
-            self.send(conn, &event_frame(&sub.id, &hit.json));
         }
         self.send(conn, &eose_frame(&sub.id));
         let authed = self
