@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Run the black-box conformance suite against one edition.
+#
+#   run.sh native   build nosfry and run it with profile.toml
+#   run.sh worker   build nosfry-worker and run it under wrangler dev
+#
+# Both get the shared profile plus an injected service_url, then the
+# suite runs against NOSFRY_URL.
+set -euo pipefail
+
+edition="${1:?usage: run.sh <native|worker>}"
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/../.." && pwd)"
+profile="$here/profile.toml"
+tmpdir="$(mktemp -d)"
+server_pid=""
+
+cleanup() {
+    if [ -n "$server_pid" ]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" 2>/dev/null || true
+    fi
+    rm -rf "$tmpdir"
+}
+trap cleanup EXIT
+
+port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+export NOSFRY_URL="ws://127.0.0.1:$port"
+
+wait_ready() {
+    for _ in $(seq 1 600); do
+        if curl -fsS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then
+            return 0
+        fi
+        if [ -n "$server_pid" ] && ! kill -0 "$server_pid" 2>/dev/null; then
+            echo "server died; log follows" >&2
+            cat "$tmpdir/server.log" >&2 2>/dev/null || true
+            return 1
+        fi
+        sleep 0.5
+    done
+    echo "server did not become ready; log follows" >&2
+    cat "$tmpdir/server.log" >&2 2>/dev/null || true
+    return 1
+}
+
+case "$edition" in
+native)
+    cat "$profile" >"$tmpdir/config.toml"
+    cat >>"$tmpdir/config.toml" <<EOF
+[db]
+path = "$tmpdir/db"
+
+[relay]
+bind = "127.0.0.1"
+port = $port
+service_url = "$NOSFRY_URL"
+EOF
+    cargo build --release --manifest-path "$root/Cargo.toml" -p nosfry
+    "$root/target/release/nosfry" relay --config "$tmpdir/config.toml" \
+        >"$tmpdir/server.log" 2>&1 &
+    server_pid=$!
+    ;;
+worker)
+    cat "$profile" >"$tmpdir/config.toml"
+    cat >>"$tmpdir/config.toml" <<EOF
+
+[relay]
+service_url = "$NOSFRY_URL"
+EOF
+    (
+        cd "$root/crates/nosfry-worker"
+        # worker-build needs a wasm32-capable clang, and the wasm must
+        # keep its target_features section (release profile strips it).
+        if [ -z "${CC_wasm32_unknown_unknown:-}" ]; then
+            if brew_prefix="$(brew --prefix llvm 2>/dev/null)"; then
+                CC_wasm32_unknown_unknown="$brew_prefix/bin/clang"
+            else
+                CC_wasm32_unknown_unknown="clang"
+            fi
+            export CC_wasm32_unknown_unknown
+        fi
+        export CARGO_PROFILE_RELEASE_STRIP=false
+        npx --yes wrangler@4.150.0 dev --local --port "$port" \
+            --var "NOSFRY_CONFIG:$(cat "$tmpdir/config.toml")" \
+            >"$tmpdir/server.log" 2>&1
+    ) &
+    server_pid=$!
+    ;;
+*)
+    echo "usage: run.sh <native|worker>" >&2
+    exit 2
+    ;;
+esac
+
+wait_ready
+cd "$root" && cargo test -p nosfry-conformance -- --ignored --test-threads 8
