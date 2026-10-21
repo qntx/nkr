@@ -140,6 +140,20 @@ impl Session {
     /// it) and the client address's shared token buckets.
     #[must_use]
     pub fn new(limits: Arc<Limits>, challenge: String, address: Arc<AddressBuckets>) -> Self {
+        Self::resume(limits, challenge, address, false, Arc::from([]))
+    }
+
+    /// A session restored from persisted connection state (Workers
+    /// hibernation): the challenge and whether it was already sent,
+    /// plus the pubkeys authenticated before the wake.
+    #[must_use]
+    pub fn resume(
+        limits: Arc<Limits>,
+        challenge: String,
+        address: Arc<AddressBuckets>,
+        challenge_sent: bool,
+        authed: Arc<[PublicKey]>,
+    ) -> Self {
         let event_bucket = (limits.rate.events_per_second > 0)
             .then(|| TokenBucket::new(limits.rate.events_per_second, limits.rate.events_burst));
         let req_bucket = (limits.rate.reqs_per_second > 0)
@@ -147,8 +161,8 @@ impl Session {
         Self {
             limits,
             challenge: challenge.into_boxed_str(),
-            challenge_sent: false,
-            authed: Arc::from([]),
+            challenge_sent,
+            authed,
             subs: HashMap::with_hasher(foldhash::fast::RandomState::default()),
             neg: HashMap::with_hasher(foldhash::fast::RandomState::default()),
             next_generation: 1,
@@ -162,6 +176,24 @@ impl Session {
     #[must_use]
     pub fn authenticated(&self) -> &[PublicKey] {
         &self.authed
+    }
+
+    /// Whether the NIP-42 challenge was already sent on this
+    /// connection (it is sent at most once).
+    #[must_use]
+    pub const fn challenge_sent(&self) -> bool {
+        self.challenge_sent
+    }
+
+    /// Restore a subscription that was open when the connection state
+    /// was persisted (Workers hibernation): registers the id under a
+    /// fresh generation so [`Session::is_current`] gates its frames.
+    /// The adapter registers the monitor itself.
+    pub fn resume_sub(&mut self, id: SubId) -> SubKey {
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        self.subs.insert(id.clone(), generation);
+        SubKey { id, generation }
     }
 
     /// Whether `sub` still identifies the live subscription under its id —
