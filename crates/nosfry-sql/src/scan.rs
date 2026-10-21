@@ -362,7 +362,7 @@ fn try_candidate(
     gate: &ReadGate,
     now: u64,
     seq: u64,
-    packed: &PackedRef<'_>,
+    packed: PackedRef<'_>,
     collected: &mut Vec<Match>,
     last_seq: &mut Option<u64>,
 ) {
@@ -374,10 +374,10 @@ fn try_candidate(
     if expiration != 0 && expiration <= now {
         return;
     }
-    if !gate.allows(*packed) {
+    if !gate.allows(packed) {
         return;
     }
-    if filter.matches(*packed) {
+    if filter.matches(packed) {
         collected.push((packed.created_at(), packed.id(), seq));
     }
 }
@@ -443,7 +443,7 @@ fn scan_ids<E: Executor>(
                     gate,
                     now,
                     seq,
-                    &packed,
+                    packed,
                     &mut collected,
                     &mut last_seq,
                 );
@@ -527,7 +527,7 @@ fn scan_ranges<E: Executor>(
             gate,
             now,
             head.row.seq,
-            &packed,
+            packed,
             &mut group,
             &mut last_seq,
         );
