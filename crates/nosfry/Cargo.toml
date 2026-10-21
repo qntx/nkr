@@ -36,6 +36,7 @@ yawc.workspace               = true
 
 [dev-dependencies]
 base64.workspace     = true
+flate2.workspace     = true
 negentropy.workspace = true
 proptest.workspace   = true
 secp256k1.workspace  = true

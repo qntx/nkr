@@ -118,11 +118,9 @@ pub struct Threads {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Compression {
-    /// Negotiate permessage-deflate. Off by default: yawc bounds the
-    /// *compressed* frame sizes only, so a small frame can inflate far
-    /// beyond `max_websocket_payload_size`
-    /// (<https://github.com/infinitefield/yawc/issues/55>) — enable it
-    /// only for trusted clients.
+    /// Negotiate permessage-deflate. On by default: yawc bounds the
+    /// inflated size of an inbound message by
+    /// `max_websocket_payload_size` (0.4.4).
     pub enabled: bool,
     /// Keep the LZ77 sliding window between messages.
     pub sliding_window: bool,
@@ -204,7 +202,7 @@ impl Default for Threads {
 impl Default for Compression {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             sliding_window: true,
         }
     }
