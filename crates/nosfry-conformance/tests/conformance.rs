@@ -242,6 +242,9 @@ async fn close_stops_delivery() {
     let filter = format!("{{\"authors\":[\"{}\"]}}", pubkey(&k));
     req(&mut sub, "s", &filter).await;
     send(&mut sub, "[\"CLOSE\",\"s\"]").await;
+    // Inbound frames apply in order, so the barrier's EOSE proves the
+    // CLOSE took effect before the other connection publishes.
+    req(&mut sub, "barrier", "{\"ids\":[]}").await;
 
     let ev = sign::event(&k, 1, now(), &json!([]), "after close");
     let (ok, reason) = publish(&mut writer, &ev).await;
