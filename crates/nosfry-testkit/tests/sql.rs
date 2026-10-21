@@ -29,7 +29,7 @@ use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 use nosfry_sql::rusqlite::Connection;
 use nosfry_sql::{Executor, SqlStore, Value};
-use nosfry_testkit::driver::{Count, StoreDriver, build_case, check};
+use nosfry_testkit::driver::{Count, StoreDriver, StoreRecords, build_case, check};
 use nosfry_testkit::spec::{SERVICE_URL, event_spec_strategy, filter_spec_strategy};
 use proptest::prelude::*;
 
@@ -75,6 +75,24 @@ impl StoreDriver for SqlDriver {
             .iter()
             .map(|hit| hit.json.to_string())
             .collect()
+    }
+
+    fn records(
+        &mut self,
+        filters: Arc<[Filter]>,
+        gate: &ReadGate,
+        _snapshot: u64,
+        max_limit: u64,
+        now: u64,
+    ) -> StoreRecords {
+        let result = self
+            .store
+            .records(&filters, gate, now, max_limit, usize::MAX)
+            .unwrap();
+        StoreRecords {
+            records: result.records,
+            budget_exhausted: result.budget_exhausted,
+        }
     }
 
     fn count(
