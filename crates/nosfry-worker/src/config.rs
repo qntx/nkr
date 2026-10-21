@@ -5,6 +5,7 @@ use nosfry_core::auth::{AuthConfig, AuthRules};
 use nosfry_core::event::EventLimits;
 use nosfry_core::info::Info;
 use nosfry_core::limits::{Limits, RateLimits, ReqLimits};
+use nosfry_core::management::{AdminsError, ManagementConfig};
 use nosfry_core::url::RelayUrlError;
 use serde::Deserialize;
 
@@ -47,6 +48,8 @@ pub struct Relay {
     pub rate_limits: RateLimits,
     /// NIP-42 authentication and restricted read kinds.
     pub auth: AuthConfig,
+    /// NIP-86 management API.
+    pub management: ManagementConfig,
     /// NIP-11 relay information.
     pub info: Info,
 }
@@ -75,6 +78,7 @@ impl Default for Relay {
             limits: ReqLimits::default(),
             rate_limits: RateLimits::default(),
             auth: AuthConfig::default(),
+            management: ManagementConfig::default(),
             info: Info::default(),
         }
     }
@@ -103,6 +107,9 @@ pub enum ConfigError {
     /// nothing, so the configuration is refused.
     #[error("[worker] max_scan_rows must be at least 1")]
     MaxScanRows,
+    /// A malformed `[relay.management] admins` entry.
+    #[error(transparent)]
+    Admins(#[from] AdminsError),
 }
 
 impl Config {
@@ -113,13 +120,15 @@ impl Config {
     /// [`ConfigError::Toml`] on syntax errors or unknown keys,
     /// [`ConfigError::ServiceUrl`] on an invalid
     /// `[relay] service_url`, [`ConfigError::MaxScanRows`] when
-    /// `[worker] max_scan_rows` is 0.
+    /// `[worker] max_scan_rows` is 0, [`ConfigError::Admins`] on a
+    /// malformed `[relay.management] admins` entry.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text)?;
         config.limits()?;
         if config.worker.max_scan_rows == 0 {
             return Err(ConfigError::MaxScanRows);
         }
+        config.relay.management.admin_keys()?;
         Ok(config)
     }
 

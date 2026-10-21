@@ -119,6 +119,53 @@ fn count_body(frames: &[String], sub: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(frame).unwrap()[2].clone()
 }
 
+/// `[relay]` + `[relay.management]` with `key(9)` as the admin, at
+/// the service URL the NIP-98 `u` tag must name.
+fn admin_config() -> String {
+    format!(
+        "[relay]\nservice_url = \"wss://relay.example.com\"\n\
+         [relay.management]\nadmins = [\"{}\"]\n",
+        pubkey_of(9)
+    )
+}
+
+/// `Authorization: Nostr <base64(event)>` — a NIP-98 kind-27235
+/// event naming the service URL, `POST`, and the body's SHA-256.
+fn nip98(secret: u8, body: &[u8], now: u64) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let digest = faster_hex::hex_string(&sha2::Sha256::digest(body));
+    let auth = event(
+        &key(secret),
+        27_235,
+        now,
+        &json!([
+            ["u", "wss://relay.example.com"],
+            ["method", "POST"],
+            ["payload", digest],
+        ]),
+        "",
+    );
+    format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(auth.json())
+    )
+}
+
+/// One management call: sign `body` as `secret` and run
+/// `Relay::manage`; returns `(status, parsed body)`.
+fn rpc(relay: &mut TestRelay, secret: u8, body: &serde_json::Value) -> (u16, serde_json::Value) {
+    let text = body.to_string();
+    let managed = relay.manage(
+        Some("application/nostr+json+rpc"),
+        Some(&nip98(secret, text.as_bytes(), NOW)),
+        text.as_bytes(),
+        NOW,
+    );
+    let parsed = serde_json::from_str(&managed.body).unwrap();
+    (managed.status, parsed)
+}
+
 fn auth_frame(secret: u8, challenge: &str, at: u64) -> String {
     let auth = event(
         &key(secret),
@@ -730,4 +777,354 @@ fn nip11_lists_62() {
     let doc: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
     let nips = doc["supported_nips"].as_array().unwrap();
     assert!(nips.contains(&json!(62)), "{nips:?}");
+}
+
+/// NIP-86: without the RPC content type or a configured admin list the
+/// endpoint answers 405, like native.
+#[test]
+fn management_requires_rpc_and_admins() {
+    let mut r = relay(&admin_config());
+    let body = br#"{"method":"supportedmethods"}"#;
+    let managed = r.manage(Some("text/plain"), None, body, NOW);
+    assert_eq!(managed.status, 405);
+    let managed = r.manage(None, None, body, NOW);
+    assert_eq!(managed.status, 405);
+    // Without admins the endpoint does not exist at all.
+    let mut r = relay("[relay]\nservice_url = \"wss://relay.example.com\"\n");
+    let managed = r.manage(Some("application/nostr+json+rpc"), None, body, NOW);
+    assert_eq!(managed.status, 405);
+}
+
+/// NIP-98 failures are 401 `{"error":"unauthorized: <reason>"}`; bad
+/// bodies are 400 plain text; over the limit is 413.
+#[test]
+fn management_unauthorized_and_bad_requests() {
+    let mut r = relay(&admin_config());
+    let body = br#"{"method":"supportedmethods"}"#;
+    let managed = r.manage(Some("application/nostr+json+rpc"), None, body, NOW);
+    assert_eq!(managed.status, 401);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&managed.body).unwrap()["error"],
+        "unauthorized: missing authorization header"
+    );
+    // A `payload` tag naming another body fails the hash check.
+    let other = nip98(9, b"different", NOW);
+    let managed = r.manage(Some("application/nostr+json+rpc"), Some(&other), body, NOW);
+    assert_eq!(managed.status, 401, "{}", managed.body);
+    assert!(
+        managed
+            .body
+            .contains("unauthorized: `payload` tag does not match the body"),
+        "{}",
+        managed.body
+    );
+    // A non-admin signature is refused after the crypto passes.
+    let (_, body) = rpc(&mut r, 1, &json!({"method": "supportedmethods"}));
+    assert_eq!(body["error"], "unauthorized: pubkey is not an admin");
+    // Invalid UTF-8 and invalid JSON are 400 with the native wording.
+    let managed = r.manage(
+        Some("application/nostr+json+rpc"),
+        Some(&nip98(9, b"\xff\xfe", NOW)),
+        b"\xff\xfe",
+        NOW,
+    );
+    assert_eq!(
+        (managed.status, managed.body.as_str()),
+        (400, "invalid utf-8")
+    );
+    let managed = r.manage(
+        Some("application/nostr+json+rpc"),
+        Some(&nip98(9, b"not json", NOW)),
+        b"not json",
+        NOW,
+    );
+    assert_eq!(
+        (managed.status, managed.body.as_str()),
+        (400, "invalid request json")
+    );
+    // Over the 64 KiB body limit is 413.
+    let big = vec![b' '; nosfry_core::management::BODY_LIMIT + 1];
+    let managed = r.manage(Some("application/nostr+json+rpc"), None, &big, NOW);
+    assert_eq!(managed.status, 413);
+}
+
+/// The pubkey and event method families dispatch and mutate.
+#[test]
+fn management_pubkey_and_event_methods() {
+    let mut r = relay(&admin_config());
+    let a = pubkey_of(1);
+    let b = pubkey_of(2);
+    let note = event(&key(1), 1, NOW, &json!([]), "victim")
+        .id()
+        .to_string();
+
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "supportedmethods"}));
+    assert_eq!(
+        body["result"].as_array().unwrap().len(),
+        nosfry_core::management::METHODS.len()
+    );
+
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "banpubkey", "params": [a, "spam"]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "listbannedpubkeys"}));
+    assert_eq!(
+        body["result"],
+        json!([{"pubkey": a, "reason": "spam"}]),
+        "{body}"
+    );
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "unbanpubkey", "params": [a]}));
+    assert_eq!(body["result"], true, "{body}");
+
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "allowpubkey", "params": [b, "vip"]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "listallowedpubkeys"}));
+    assert_eq!(
+        body["result"],
+        json!([{"pubkey": b, "reason": "vip"}]),
+        "{body}"
+    );
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "unallowpubkey", "params": [b]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "banevent", "params": [note, "bad"]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "listbannedevents"}));
+    assert_eq!(
+        body["result"],
+        json!([{"id": note, "reason": "bad"}]),
+        "{body}"
+    );
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "unbanevent", "params": [note]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+}
+
+/// The kind, IP, and info method families dispatch and mutate, and
+/// method/parameter errors answer `{"error": …}` at 200.
+#[test]
+fn management_kind_ip_and_info_methods() {
+    let mut r = relay(&admin_config());
+
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "allowkind", "params": [4]}));
+    assert_eq!(body["result"], true, "{body}");
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "listallowedkinds"}));
+    assert_eq!(body["result"], json!([4]), "{body}");
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "disallowkind", "params": [5]}));
+    assert_eq!(body["result"], true, "{body}");
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "listdisallowedkinds"}));
+    assert_eq!(body["result"], json!([5]), "{body}");
+
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "blockip", "params": ["192.0.2.1", "abuse"]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "listblockedips"}));
+    assert_eq!(
+        body["result"],
+        json!([{"ip": "192.0.2.1", "reason": "abuse"}]),
+        "{body}"
+    );
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "unblockip", "params": ["192.0.2.1"]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+
+    for method in [
+        "changerelayname",
+        "changerelaydescription",
+        "changerelayicon",
+    ] {
+        let (_, body) = rpc(&mut r, 9, &json!({"method": method, "params": ["v"]}));
+        assert_eq!(body["result"], true, "{body}");
+    }
+
+    // Method and parameter errors are `{"error": …}` at 200.
+    let (status, body) = rpc(&mut r, 9, &json!({"method": "nosuch"}));
+    assert_eq!(
+        (status, body["error"].as_str().unwrap()),
+        (200, "unsupported method: nosuch")
+    );
+    let (_, body) = rpc(&mut r, 9, &json!({"method": "banpubkey", "params": ["zz"]}));
+    assert_eq!(
+        body["error"], "invalid params: expected a 64-hex pubkey",
+        "{body}"
+    );
+}
+
+/// A banned pubkey's publishes — ephemeral kinds included — answer
+/// `OK false` with the native reason; its request to vanish stays
+/// exempt.
+#[test]
+fn management_banpubkey_refuses_publish() {
+    let mut r = relay(&admin_config());
+    let socket = connect(&mut r, 1);
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "banpubkey", "params": [pubkey_of(1)]}),
+    );
+
+    let e = event(&key(1), 1, NOW, &json!([]), "banned");
+    msg(&mut r, 1, &event_frame(&e));
+    let ephemeral = event(&key(1), 20_000, NOW, &json!([]), "eph");
+    msg(&mut r, 1, &event_frame(&ephemeral));
+    let oks = ok_frames(&socket.sent());
+    assert_eq!(oks.len(), 2, "{oks:?}");
+    assert!(
+        oks.iter()
+            .all(|f| f.contains("blocked: pubkey not allowed")),
+        "{oks:?}"
+    );
+    // A request to vanish is exempt so a banned author can still
+    // vanish.
+    let vanish = event(
+        &key(1),
+        62,
+        NOW,
+        &json!([["relay", "wss://relay.example.com"]]),
+        "",
+    );
+    msg(&mut r, 1, &event_frame(&vanish));
+    let oks = ok_frames(&socket.sent());
+    assert!(oks.last().unwrap().contains(",true,"), "{oks:?}");
+}
+
+/// `banevent` deletes the stored event in the same transaction and
+/// blocks its republish.
+#[test]
+fn management_banevent_deletes_and_blocks() {
+    let mut r = relay(&admin_config());
+    let socket = connect(&mut r, 1);
+    let victim = event(&key(1), 1, NOW, &json!([]), "victim");
+    msg(&mut r, 1, &event_frame(&victim));
+
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "banevent", "params": [victim.id().to_string()]}),
+    );
+    let reader = connect(&mut r, 2);
+    msg(&mut r, 2, &req_frame("s", &json!({"kinds": [1]})));
+    assert!(
+        event_frames(&reader.sent(), "s").is_empty(),
+        "{:?}",
+        reader.sent()
+    );
+    msg(&mut r, 1, &event_frame(&victim));
+    assert!(
+        socket
+            .sent()
+            .iter()
+            .any(|f| f.contains("blocked: event banned")),
+        "{:?}",
+        socket.sent()
+    );
+}
+
+/// `blockip` flips `ip_blocked` for the glue's 403 gate.
+#[test]
+fn management_ip_block() {
+    let mut r = relay(&admin_config());
+    let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+    assert!(!r.ip_blocked(Some(ip)));
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "blockip", "params": ["192.0.2.1"]}),
+    );
+    assert!(r.ip_blocked(Some(ip)));
+    assert!(!r.ip_blocked(Some("198.51.100.1".parse().unwrap())));
+    assert!(!r.ip_blocked(None));
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "unblockip", "params": ["192.0.2.1"]}),
+    );
+    assert!(!r.ip_blocked(Some(ip)));
+}
+
+/// NIP-11 lists 86 with admins configured and applies the info
+/// overrides.
+#[test]
+fn management_nip11_overrides_and_86() {
+    let mut r = relay(&admin_config());
+    let doc: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
+    assert!(
+        doc["supported_nips"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(86))
+    );
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "changerelayicon", "params": ["https://mod/icon.png"]}),
+    );
+    let doc: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
+    assert_eq!(doc["icon"], "https://mod/icon.png", "{doc}");
+    // Without admins there is no 86.
+    let r = relay("");
+    let doc: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
+    assert!(
+        !doc["supported_nips"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(86))
+    );
+}
+
+/// The moderation snapshot survives a reopen (it is persisted).
+#[test]
+fn management_persists_across_reopen() {
+    let exec = Connection::open_in_memory().unwrap();
+    let config = admin_config();
+    let mut r = relay_on(exec, &config, vec![]);
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "banpubkey", "params": [pubkey_of(1)]}),
+    );
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "blockip", "params": ["192.0.2.1"]}),
+    );
+    let exec = r.into_store().into_exec();
+
+    let mut r = relay_on(exec, &config, vec![]);
+    let socket = connect(&mut r, 1);
+    assert!(r.ip_blocked(Some("192.0.2.1".parse().unwrap())));
+    let e = event(&key(1), 1, NOW, &json!([]), "still banned");
+    msg(&mut r, 1, &event_frame(&e));
+    assert!(
+        socket
+            .sent()
+            .iter()
+            .any(|f| f.contains("blocked: pubkey not allowed")),
+        "{:?}",
+        socket.sent()
+    );
 }

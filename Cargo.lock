@@ -1357,13 +1357,16 @@ dependencies = [
 name = "nosfry-worker"
 version = "0.2.0"
 dependencies = [
+ "base64",
  "faster-hex",
+ "futures-util",
  "getrandom 0.4.3",
  "js-sys",
  "nosfry-core",
  "nosfry-sql",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "toml",
  "wasm-bindgen",
