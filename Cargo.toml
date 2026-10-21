@@ -46,9 +46,10 @@ proptest  = "1.12.0"
 criterion = "0.8.2"
 
 # Cloudflare Workers (nosfry-worker glue only)
-worker       = "=0.8.7"
-wasm-bindgen = "=0.2.129"
-js-sys       = "=0.3.106"
+worker                   = "=0.8.7"
+wasm-bindgen             = "=0.2.129"
+js-sys                   = "=0.3.106"
+console_error_panic_hook = "0.1.7"
 
 # Server (native only)
 tokio              = { version = "1.53", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
