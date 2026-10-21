@@ -27,7 +27,7 @@ const EXPIRE_INTERVAL: Duration = Duration::from_secs(10);
 /// [`EXPIRE_CAP`].
 const VANISH_CAP: usize = 10_000;
 
-/// A store commit, shard enqueue, or expiry sweep slower than this is
+/// A store commit, shard enqueue, or expiry/vanish sweep slower than this is
 /// logged — it stalls every publisher's `OK` while reads keep flowing.
 const SLOW_WRITE: Duration = Duration::from_secs(1);
 
