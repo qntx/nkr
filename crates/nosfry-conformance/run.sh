@@ -79,7 +79,10 @@ EOF
             fi
             export CC_wasm32_unknown_unknown
         fi
+        # Persist into the run's temp dir so a stale local store
+        # (e.g. an older FORMAT_VERSION) never poisons the suite.
         npx --yes wrangler@4.150.0 dev --local --port "$port" \
+            --persist-to "$tmpdir/persist" \
             --var "NOSFRY_CONFIG:$(cat "$tmpdir/config.toml")" \
             >"$tmpdir/server.log" 2>&1
     ) &
