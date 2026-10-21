@@ -1,5 +1,5 @@
 [workspace]
-members  = ["crates/nosfry", "crates/nosfry-core", "crates/nosfry-lmdb", "crates/nosfry-sql", "crates/nosfry-testkit"]
+members  = ["crates/nosfry", "crates/nosfry-core", "crates/nosfry-lmdb", "crates/nosfry-sql", "crates/nosfry-testkit", "crates/nosfry-worker"]
 exclude  = ["bench/nosfry-bench", "fuzz"]
 resolver = "3"
 
