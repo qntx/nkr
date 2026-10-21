@@ -73,10 +73,20 @@ fn relay(config: &str) -> TestRelay {
 }
 
 fn relay_on(exec: Connection, config: &str, sockets: Vec<(FakeSocket, Attachment)>) -> TestRelay {
+    relay_with_policy(exec, config, sockets, false)
+}
+
+fn relay_with_policy(
+    exec: Connection,
+    config: &str,
+    sockets: Vec<(FakeSocket, Attachment)>,
+    policy: bool,
+) -> TestRelay {
     Relay::open(
         SqlStore::open(exec).unwrap(),
         Config::parse(config).unwrap(),
         sockets,
+        policy,
     )
     .unwrap()
 }
@@ -1465,5 +1475,248 @@ fn nip11_lists_77_when_sync_enabled() {
             .as_array()
             .unwrap()
             .contains(&json!(77))
+    );
+}
+
+/// The write-policy point: a policy-enabled relay pauses a publish
+/// into `Effects.policy`, and `decided` finishes it with the native
+/// wording. The request line carries the strfry fields.
+#[test]
+fn policy_accept_writes_and_answers_ok() {
+    let exec = Connection::open_in_memory().unwrap();
+    let mut r = relay_with_policy(exec, "", vec![], true);
+    let socket = connect(&mut r, 1);
+    let e = event(&key(1), 1, NOW, &json!([]), "policy-checked");
+    let effects = r.message(1, NOW * 1000, &event_frame(&e));
+    let check = effects.policy.expect("a policy-enabled relay pauses");
+    assert_eq!(check.conn, 1);
+    let line: serde_json::Value = serde_json::from_str(&check.line).unwrap();
+    assert_eq!(line["type"], "new");
+    assert_eq!(line["receivedAt"], NOW);
+    assert_eq!(line["event"]["id"], e.id().to_string());
+    assert_eq!(line["event"]["content"], "policy-checked");
+    assert!(line.get("authed").is_none(), "{line}");
+    // Nothing answered or stored yet — the publish is paused.
+    assert!(socket.sent().is_empty(), "{:?}", socket.sent());
+    let effects = r.decided(
+        1,
+        &check.event,
+        nosfry_core::policy::Decision::Accept,
+        NOW * 1000,
+    );
+    assert!(effects.policy.is_none());
+    let oks = ok_frames(&socket.sent());
+    assert_eq!(
+        oks,
+        [format!("[\"OK\",\"{}\",true,\"\"]", e.id())],
+        "{oks:?}"
+    );
+    msg(
+        &mut r,
+        1,
+        &req_frame("s", &json!({"authors": [pubkey_of(1)]})),
+    );
+    assert!(
+        event_frames(&socket.sent(), "s")
+            .iter()
+            .any(|f| f.contains("policy-checked")),
+        "{:?}",
+        socket.sent()
+    );
+}
+
+/// `reject` answers `OK false` with the plugin's message; the event
+/// is neither stored nor delivered.
+#[test]
+fn policy_reject_blocks_the_event() {
+    let exec = Connection::open_in_memory().unwrap();
+    let mut r = relay_with_policy(exec, "", vec![], true);
+    let socket = connect(&mut r, 1);
+    let watcher = connect(&mut r, 2);
+    msg(&mut r, 2, &req_frame("w", &json!({"kinds": [1]})));
+    let e = event(&key(1), 1, NOW, &json!([]), "no");
+    let check = r
+        .message(1, NOW * 1000, &event_frame(&e))
+        .policy
+        .expect("a policy-enabled relay pauses");
+    let _ = r.decided(
+        1,
+        &check.event,
+        nosfry_core::policy::Decision::Reject("blocked: test policy".into()),
+        NOW * 1000,
+    );
+    let oks = ok_frames(&socket.sent());
+    assert_eq!(
+        oks,
+        [format!(
+            "[\"OK\",\"{}\",false,\"blocked: test policy\"]",
+            e.id()
+        )],
+        "{oks:?}"
+    );
+    assert!(event_frames(&watcher.sent(), "w").is_empty());
+    msg(
+        &mut r,
+        1,
+        &req_frame("s", &json!({"authors": [pubkey_of(1)]})),
+    );
+    assert!(event_frames(&socket.sent(), "s").is_empty());
+}
+
+/// An empty `msg` gets the native NIP-01 default.
+#[test]
+fn policy_reject_empty_msg_gets_the_default() {
+    let exec = Connection::open_in_memory().unwrap();
+    let mut r = relay_with_policy(exec, "", vec![], true);
+    let socket = connect(&mut r, 1);
+    let e = event(&key(1), 1, NOW, &json!([]), "empty");
+    let check = r
+        .message(1, NOW * 1000, &event_frame(&e))
+        .policy
+        .expect("a policy-enabled relay pauses");
+    let _ = r.decided(
+        1,
+        &check.event,
+        nosfry_core::policy::Decision::Reject(String::new()),
+        NOW * 1000,
+    );
+    let oks = ok_frames(&socket.sent());
+    assert_eq!(
+        oks,
+        [format!(
+            "[\"OK\",\"{}\",false,\"blocked: rejected by write policy\"]",
+            e.id()
+        )],
+        "{oks:?}"
+    );
+}
+
+/// `shadowReject` answers `OK true` yet stores and broadcasts
+/// nothing.
+#[test]
+fn policy_shadow_reject_acknowledges_without_storing() {
+    let exec = Connection::open_in_memory().unwrap();
+    let mut r = relay_with_policy(exec, "", vec![], true);
+    let socket = connect(&mut r, 1);
+    let watcher = connect(&mut r, 2);
+    msg(&mut r, 2, &req_frame("w", &json!({"kinds": [1]})));
+    let e = event(&key(1), 1, NOW, &json!([]), "shadowed");
+    let check = r
+        .message(1, NOW * 1000, &event_frame(&e))
+        .policy
+        .expect("a policy-enabled relay pauses");
+    let _ = r.decided(
+        1,
+        &check.event,
+        nosfry_core::policy::Decision::ShadowReject("shadowed".into()),
+        NOW * 1000,
+    );
+    let oks = ok_frames(&socket.sent());
+    assert_eq!(
+        oks,
+        [format!("[\"OK\",\"{}\",true,\"shadowed\"]", e.id())],
+        "{oks:?}"
+    );
+    assert!(event_frames(&watcher.sent(), "w").is_empty());
+    msg(
+        &mut r,
+        1,
+        &req_frame("s", &json!({"authors": [pubkey_of(1)]})),
+    );
+    assert!(event_frames(&socket.sent(), "s").is_empty());
+}
+
+/// NIP-62: a request to vanish naming this relay bypasses the
+/// policy, exactly like native.
+#[test]
+fn policy_does_not_gate_vanish_requests() {
+    let exec = Connection::open_in_memory().unwrap();
+    let config = "[relay]\nservice_url = \"wss://relay.example.com\"\n";
+    let mut r = relay_with_policy(exec, config, vec![], true);
+    let socket = connect(&mut r, 1);
+    let e = event(
+        &key(1),
+        62,
+        NOW,
+        &json!([["relay", "wss://relay.example.com"]]),
+        "",
+    );
+    let effects = r.message(1, NOW * 1000, &event_frame(&e));
+    assert!(effects.policy.is_none(), "vanish bypasses the policy");
+    let oks = ok_frames(&socket.sent());
+    assert_eq!(
+        oks,
+        [format!("[\"OK\",\"{}\",true,\"\"]", e.id())],
+        "{oks:?}"
+    );
+    assert!(effects.vanish, "the vanish request queues the sweep");
+}
+
+/// The NIP-86 gate runs before the policy: a banned author's event
+/// is refused without ever reaching the policy point.
+#[test]
+fn policy_runs_after_moderation() {
+    let config = admin_config();
+    let exec = Connection::open_in_memory().unwrap();
+    let mut r = relay_with_policy(exec, &config, vec![], true);
+    let socket = connect(&mut r, 1);
+    // Ban key(1) through the management snapshot.
+    let (_, body) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "banpubkey", "params": [pubkey_of(1)]}),
+    );
+    assert_eq!(body["result"], true, "{body}");
+    let e = event(&key(1), 1, NOW, &json!([]), "banned");
+    let effects = r.message(1, NOW * 1000, &event_frame(&e));
+    assert!(effects.policy.is_none(), "moderation wins first");
+    let oks = ok_frames(&socket.sent());
+    assert_eq!(
+        oks,
+        [format!(
+            "[\"OK\",\"{}\",false,\"blocked: pubkey not allowed\"]",
+            e.id()
+        )],
+        "{oks:?}"
+    );
+}
+
+/// A verdict that arrives after the publishing connection closed
+/// still applies an `Accept`: the event is written and delivered,
+/// only the `OK` is skipped.
+#[test]
+fn policy_accept_survives_a_lost_connection() {
+    let exec = Connection::open_in_memory().unwrap();
+    let mut r = relay_with_policy(exec, "", vec![], true);
+    let socket = connect(&mut r, 1);
+    let watcher = connect(&mut r, 2);
+    msg(&mut r, 2, &req_frame("w", &json!({"kinds": [1]})));
+    let e = event(&key(1), 1, NOW, &json!([]), "late verdict");
+    let check = r
+        .message(1, NOW * 1000, &event_frame(&e))
+        .policy
+        .expect("a policy-enabled relay pauses");
+    r.close(1);
+    let _ = r.decided(
+        1,
+        &check.event,
+        nosfry_core::policy::Decision::Accept,
+        NOW * 1000,
+    );
+    assert!(socket.sent().is_empty(), "no OK on a dead connection");
+    let hits = event_frames(&watcher.sent(), "w");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert!(hits[0].contains("late verdict"));
+    msg(
+        &mut r,
+        2,
+        &req_frame("s", &json!({"authors": [pubkey_of(1)]})),
+    );
+    assert!(
+        event_frames(&watcher.sent(), "s")
+            .iter()
+            .any(|f| f.contains("late verdict")),
+        "{:?}",
+        watcher.sent()
     );
 }
