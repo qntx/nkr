@@ -30,3 +30,7 @@ bench/**/results/
 
 # Local-only Fumadocs tree (never pushed)
 docs/
+
+# Workers build output
+crates/nosfry-worker/build/
+.wrangler/
