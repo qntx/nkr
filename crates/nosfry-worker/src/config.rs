@@ -91,6 +91,14 @@ pub struct Worker {
     /// max_filter_limit_count`: the effective COUNT budget is their
     /// minimum, `0` disabling COUNT entirely.
     pub max_scan_rows: usize,
+    /// Process-wide budget for live subscriptions, charged as the
+    /// length of each subscription's persisted filters JSON
+    /// (`0` = unlimited). `max_connections` ×
+    /// `max_subs_per_connection` × payload-sized filters would far
+    /// exceed an isolate's memory, so a REQ that would cross the
+    /// budget answers `blocked: subscription capacity exhausted` —
+    /// there is no native equivalent.
+    pub max_subscription_bytes: usize,
 }
 
 impl Default for Relay {
@@ -116,6 +124,7 @@ impl Default for Worker {
         Self {
             location_hint: String::new(),
             max_scan_rows: 100_000,
+            max_subscription_bytes: 33_554_432,
         }
     }
 }

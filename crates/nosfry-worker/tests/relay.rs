@@ -34,7 +34,7 @@ use nosfry_core::hll::Hll;
 use nosfry_core::message::{SubId, count_frame};
 use nosfry_core::sign::{event, key};
 use nosfry_sql::rusqlite::Connection;
-use nosfry_sql::{Executor, SqlStore, Value};
+use nosfry_sql::{Executor, Param, SqlStore, StoreError, Value};
 use nosfry_worker::{Attachment, Config, Relay, Socket};
 use serde_json::json;
 
@@ -1719,4 +1719,187 @@ fn policy_accept_survives_a_lost_connection() {
         "{:?}",
         watcher.sent()
     );
+}
+
+/// `[worker] max_subscription_bytes`: a REQ that would push the
+/// persisted-filters byte total over the budget is refused
+/// `blocked:` and registers nothing.
+#[test]
+fn subscription_byte_budget_refuses_over_capacity() {
+    let mut r = relay("[worker]\nmax_subscription_bytes = 1\n");
+    let socket = connect(&mut r, 1);
+    msg(&mut r, 1, &req_frame("s", &json!({"kinds": [1]})));
+    assert_eq!(
+        socket.sent().last().unwrap(),
+        "[\"CLOSED\",\"s\",\"blocked: subscription capacity exhausted\"]"
+    );
+    // The sub was never registered: a matching event reaches nobody.
+    let ev = event(&key(1), 1, NOW, &json!([]), "x");
+    msg(&mut r, 1, &event_frame(&ev));
+    assert!(event_frames(&socket.sent(), "s").is_empty());
+}
+
+/// CLOSE and connection close release a subscription's charge.
+#[test]
+fn subscription_byte_budget_releases() {
+    // The persisted filters JSON of one `{"kinds":[1]}` REQ.
+    let bytes = format!("[{}]", Filter::parse("{\"kinds\":[1]}").unwrap().to_json()).len();
+    let config = format!("[worker]\nmax_subscription_bytes = {bytes}\n");
+    let mut r = relay(&config);
+    let a = connect(&mut r, 1);
+    msg(&mut r, 1, &req_frame("s", &json!({"kinds": [1]})));
+    msg(&mut r, 1, &req_frame("t", &json!({"kinds": [1]})));
+    assert!(
+        a.sent()
+            .iter()
+            .any(|f| f == "[\"CLOSED\",\"t\",\"blocked: subscription capacity exhausted\"]"),
+        "{:?}",
+        a.sent()
+    );
+    // CLOSE frees the budget: the same REQ is now admitted.
+    msg(&mut r, 1, "[\"CLOSE\",\"s\"]");
+    msg(&mut r, 1, &req_frame("t", &json!({"kinds": [1]})));
+    assert!(a.sent().iter().any(|f| f == "[\"EOSE\",\"t\"]"));
+    // A closed connection frees its whole charge.
+    r.close(1);
+    let b = connect(&mut r, 2);
+    msg(&mut r, 2, &req_frame("u", &json!({"kinds": [1]})));
+    msg(&mut r, 2, &req_frame("v", &json!({"kinds": [1]})));
+    assert!(b.sent().iter().any(|f| f == "[\"EOSE\",\"u\"]"));
+    assert!(
+        b.sent()
+            .iter()
+            .any(|f| f == "[\"CLOSED\",\"v\",\"blocked: subscription capacity exhausted\"]"),
+        "{:?}",
+        b.sent()
+    );
+}
+
+/// An executor counting the rows the `subs` restore SELECT streams.
+#[derive(Debug)]
+struct SubsCounting {
+    conn: Connection,
+    rows: std::cell::Cell<usize>,
+}
+
+impl Executor for SubsCounting {
+    type Error = <Connection as Executor>::Error;
+
+    fn query(
+        &self,
+        sql: &str,
+        params: &[Param<'_>],
+        row: &mut dyn FnMut(Vec<Value>) -> ControlFlow<()>,
+    ) -> Result<(), Self::Error> {
+        if sql.starts_with("SELECT conn, sub_id, filters, authed FROM subs") {
+            return self.conn.query(sql, params, &mut |values| {
+                self.rows.set(self.rows.get() + 1);
+                row(values)
+            });
+        }
+        self.conn.query(sql, params, row)
+    }
+
+    fn execute(&self, sql: &str, params: &[Param<'_>]) -> Result<(), Self::Error> {
+        self.conn.execute(sql, params)
+    }
+
+    fn transaction<T>(&self, f: impl FnOnce() -> Result<T, StoreError>) -> Result<T, StoreError> {
+        self.conn.transaction(f)
+    }
+}
+
+/// Dead connections' rows are deleted in one statement before the
+/// restore SELECT runs — they never reach the row callback, however
+/// corrupt their payload.
+#[test]
+fn restore_deletes_stale_subs_without_loading_them() {
+    let exec = Connection::open_in_memory().unwrap();
+    let socket = FakeSocket::default();
+    // A dropped relay strands `subs` rows.
+    let (att, exec) = {
+        let mut r = relay_on(exec, "", vec![]);
+        let att = r.accept(socket.clone(), 1, None, "c".into()).unwrap();
+        msg(&mut r, 1, &req_frame("s", &json!({"kinds": [1]})));
+        (att, r.into_store().into_exec())
+    };
+    // Two rows for dead connections, one with filters that would
+    // fail to decode if it were ever read.
+    exec.execute(
+        "INSERT INTO subs (conn, sub_id, filters, authed) VALUES (9, 'x', 'not json', 0)",
+        &[],
+    )
+    .unwrap();
+    exec.execute(
+        "INSERT INTO subs (conn, sub_id, filters, authed) VALUES (8, 'y', '[{\"kinds\":[1]}]', 0)",
+        &[],
+    )
+    .unwrap();
+
+    let counting = SubsCounting {
+        conn: exec,
+        rows: std::cell::Cell::new(0),
+    };
+    let r = Relay::open(
+        SqlStore::open(counting).unwrap(),
+        Config::parse("").unwrap(),
+        vec![(socket, att)],
+        false,
+    )
+    .unwrap();
+    // Only the live connection's row was ever streamed; both stale
+    // rows were deleted by the sweep before it.
+    let exec = r.into_store().into_exec();
+    assert_eq!(exec.rows.get(), 1, "the SELECT streamed only live rows");
+    let mut count = 0u64;
+    exec.query("SELECT COUNT(*) FROM subs", &[], &mut |row| {
+        if let Some(Value::Int(v)) = row.first() {
+            count = u64::try_from(*v).unwrap();
+        }
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert_eq!(count, 1);
+}
+
+/// Restore charges the same `[worker] max_subscription_bytes`
+/// budget: rows over it are deleted, not restored.
+#[test]
+fn restore_honors_the_subscription_byte_budget() {
+    let bytes = format!("[{}]", Filter::parse("{\"kinds\":[1]}").unwrap().to_json()).len();
+    let socket = FakeSocket::default();
+    let (att, exec) = {
+        let mut r = relay("[relay]\nservice_url = \"wss://x\"\n");
+        let att = r.accept(socket.clone(), 1, None, "c".into()).unwrap();
+        msg(&mut r, 1, &req_frame("a", &json!({"kinds": [1]})));
+        msg(&mut r, 1, &req_frame("b", &json!({"kinds": [1]})));
+        (att, r.into_store().into_exec())
+    };
+    // PK order streams "a" before "b"; the budget fits one row.
+    let config = format!("[worker]\nmax_subscription_bytes = {bytes}\n");
+    let mut r = relay_on(exec, &config, vec![(socket.clone(), att)]);
+    let ev = event(&key(1), 1, NOW + 1, &json!([]), "y");
+    msg(&mut r, 1, &event_frame(&ev));
+    assert_eq!(
+        event_frames(&socket.sent(), "a").len(),
+        1,
+        "{:?}",
+        socket.sent()
+    );
+    assert!(
+        event_frames(&socket.sent(), "b").is_empty(),
+        "{:?}",
+        socket.sent()
+    );
+    // The over-budget row was deleted, not just skipped.
+    let exec = r.into_store().into_exec();
+    let mut count = 0u64;
+    exec.query("SELECT COUNT(*) FROM subs", &[], &mut |row| {
+        if let Some(Value::Int(v)) = row.first() {
+            count = u64::try_from(*v).unwrap();
+        }
+        ControlFlow::Continue(())
+    })
+    .unwrap();
+    assert_eq!(count, 1);
 }
