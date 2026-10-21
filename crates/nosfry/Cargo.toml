@@ -22,7 +22,6 @@ futures-util.workspace       = true
 getrandom.workspace          = true
 hyper.workspace              = true
 hyper-util.workspace         = true
-negentropy.workspace         = true
 rlimit.workspace             = true
 serde.workspace              = true
 serde_json.workspace         = true

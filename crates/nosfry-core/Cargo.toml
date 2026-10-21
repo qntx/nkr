@@ -19,6 +19,7 @@ secp256k1.workspace  = true
 sha2.workspace       = true
 faster-hex.workspace = true
 thiserror.workspace  = true
+negentropy.workspace = true
 foldhash.workspace   = true
 slab.workspace       = true
 
