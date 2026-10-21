@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use nosfry_core::auth::{AuthRules, ReadGate};
-use nosfry_core::event::{Event, PublicKey};
+use nosfry_core::event::{Event, EventId, PublicKey};
 use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
-use nosfry_core::sign::{keys, pubkey_hex};
+use nosfry_core::moderation::{InfoField, ModOp, Moderation};
+use nosfry_core::sign::{event, keys, pubkey_hex};
 use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 use proptest::prelude::*;
@@ -48,6 +49,9 @@ pub trait StoreDriver {
     /// Drain every queued NIP-62 vanish sweep with a small step
     /// limit so resumption is exercised.
     fn drain_vanish(&mut self);
+
+    /// Apply one NIP-86 `op`, returning the rebuilt snapshot.
+    fn moderate(&mut self, op: ModOp) -> Moderation;
 }
 
 /// The count [`StoreDriver::count`] reports, mirrored per store.
@@ -340,4 +344,189 @@ fn count_checks(
         Some(*sketch.registers()),
         "hll registers != model sketch"
     );
+}
+
+/// A deterministic NIP-86 script every store must replay to the same
+/// [`Moderation`] snapshots.
+///
+/// Each [`ModOp`], the ban↔allow and allow↔disallow exclusivity rules
+/// (and that `unban`/`unallow` only clear their own state), reason
+/// storage, the NIP-11 info overrides, and `BanEvent` deleting the
+/// stored event.
+///
+/// # Panics
+///
+/// Panics on any divergence.
+pub fn moderation_check(store: &mut impl StoreDriver) {
+    let a = PublicKey::from_hex(&pubkey_hex(0)).unwrap();
+    let b = PublicKey::from_hex(&pubkey_hex(1)).unwrap();
+
+    let note = event(&keys()[0], 1, 1_700_000_000, &serde_json::json!([]), "note");
+    assert!(
+        matches!(
+            store.write(std::slice::from_ref(&note)).first(),
+            Some(WriteOutcome::Stored { .. })
+        ),
+        "the scripted event did not store"
+    );
+
+    moderate_pubkeys(store, a);
+    moderate_event(store, note.id());
+    moderate_kinds(store);
+    moderate_ips(store);
+    moderate_info(store);
+
+    // The final snapshot: exactly this state, nothing more.
+    let snapshot = store.moderate(ModOp::BanPubkey {
+        pubkey: b,
+        reason: None,
+    });
+    let mut expected = Moderation::default();
+    expected.banned_pubkeys.insert(a, None);
+    expected.banned_pubkeys.insert(b, None);
+    expected.disallowed_kinds.insert(4);
+    expected.allowed_kinds.insert(9);
+    expected
+        .blocked_ips
+        .insert("2001:db8::1".parse().unwrap(), None);
+    expected.name = Some(Box::from("relay-name"));
+    expected.description = Some(Box::from("relay-desc"));
+    expected.icon = Some(Box::from("https://icon"));
+    assert_eq!(snapshot, expected, "final moderation snapshot diverged");
+}
+
+/// `banpubkey` stores the reason, `allowpubkey` replaces the ban
+/// (exclusivity) and `unban` leaves the allow entry; `unallow` leaves
+/// a ban untouched. Ends with `a` banned, no reason.
+fn moderate_pubkeys(store: &mut dyn StoreDriver, a: PublicKey) {
+    let banned = store.moderate(ModOp::BanPubkey {
+        pubkey: a,
+        reason: Some("spam".to_owned()),
+    });
+    assert_eq!(
+        banned.banned_pubkeys.get(&a).map(|r| r.as_deref()),
+        Some(Some("spam")),
+        "banned pubkey lost its reason"
+    );
+    let allowed = store.moderate(ModOp::AllowPubkey {
+        pubkey: a,
+        reason: Some("vip".to_owned()),
+    });
+    assert!(
+        !allowed.banned_pubkeys.contains_key(&a),
+        "allow did not drop the ban"
+    );
+    assert_eq!(
+        allowed.allowed_pubkeys.get(&a).map(|r| r.as_deref()),
+        Some(Some("vip")),
+        "allowed pubkey lost its reason"
+    );
+    let unbanned = store.moderate(ModOp::UnbanPubkey { pubkey: a });
+    assert_eq!(
+        unbanned.allowed_pubkeys.get(&a).map(|r| r.as_deref()),
+        Some(Some("vip")),
+        "unban cleared the allow entry"
+    );
+    let unallowed = store.moderate(ModOp::UnallowPubkey { pubkey: a });
+    assert!(
+        unallowed.allowed_pubkeys.is_empty(),
+        "unallow left the allow entry"
+    );
+    store.moderate(ModOp::BanPubkey {
+        pubkey: a,
+        reason: None,
+    });
+    let snapshot = store.moderate(ModOp::UnallowPubkey { pubkey: a });
+    assert!(
+        snapshot.banned_pubkeys.contains_key(&a),
+        "unallow cleared the ban"
+    );
+}
+
+/// `banevent` records the ban and deletes the stored event (the store
+/// layer does not gate republishes — the session does). Ends with the
+/// ban list empty.
+fn moderate_event(store: &mut dyn StoreDriver, id: EventId) {
+    let ids_filter: Arc<[Filter]> = Arc::from(vec![
+        Filter::parse(&format!("{{\"ids\":[\"{id}\"]}}")).unwrap(),
+    ]);
+    let banned = store.moderate(ModOp::BanEvent {
+        id,
+        reason: Some("bad".to_owned()),
+    });
+    assert_eq!(
+        banned.banned_events.get(&id).map(|r| r.as_deref()),
+        Some(Some("bad")),
+        "banned event lost its reason"
+    );
+    assert!(
+        store
+            .scan(
+                Arc::clone(&ids_filter),
+                &ReadGate::default(),
+                u64::MAX,
+                10,
+                u64::MAX,
+            )
+            .is_empty(),
+        "banevent did not delete the stored event"
+    );
+    let unbanned = store.moderate(ModOp::UnbanEvent { id });
+    assert!(unbanned.banned_events.is_empty(), "unbanevent left the ban");
+}
+
+/// Kind exclusivity: `disallow` replaces `allow` and vice versa.
+/// Ends with kind 4 disallowed and kind 9 allowed.
+fn moderate_kinds(store: &mut dyn StoreDriver) {
+    store.moderate(ModOp::AllowKind { kind: 4 });
+    let disallowed = store.moderate(ModOp::DisallowKind { kind: 4 });
+    assert!(
+        !disallowed.allowed_kinds.contains(&4),
+        "disallow left the allow"
+    );
+    assert!(
+        disallowed.disallowed_kinds.contains(&4),
+        "disallow did not record"
+    );
+    store.moderate(ModOp::DisallowKind { kind: 9 });
+    let allowed = store.moderate(ModOp::AllowKind { kind: 9 });
+    assert!(
+        !allowed.disallowed_kinds.contains(&9),
+        "allow left the disallow"
+    );
+    assert!(allowed.allowed_kinds.contains(&9), "allow did not record");
+}
+
+/// IPs persist in canonical form, with and without a reason. Ends
+/// with only the v6 address blocked.
+fn moderate_ips(store: &mut dyn StoreDriver) {
+    let v4: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+    let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+    store.moderate(ModOp::BlockIp {
+        ip: v4,
+        reason: Some("vpn".to_owned()),
+    });
+    store.moderate(ModOp::BlockIp {
+        ip: v6,
+        reason: None,
+    });
+    let unblocked = store.moderate(ModOp::UnblockIp { ip: v4 });
+    assert!(
+        !unblocked.blocked_ips.contains_key(&v4),
+        "unblockip left the block"
+    );
+}
+
+/// The NIP-11 info overrides persist in `mod_info`.
+fn moderate_info(store: &mut dyn StoreDriver) {
+    for (field, value) in [
+        (InfoField::Name, "relay-name"),
+        (InfoField::Description, "relay-desc"),
+        (InfoField::Icon, "https://icon"),
+    ] {
+        store.moderate(ModOp::SetInfo {
+            field,
+            value: value.to_owned(),
+        });
+    }
 }
