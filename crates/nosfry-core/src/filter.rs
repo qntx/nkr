@@ -42,7 +42,7 @@ impl<'de> Visitor<'de> for PairsVisitor {
 }
 
 /// Fields inside a filter are `AND`ed.
-#[derive(Debug)]
+#[derive(Debug, Eq)]
 pub struct Filter {
     ids: Option<Box<[[u8; 32]]>>,
     authors: Option<Box<[[u8; 32]]>>,
@@ -52,6 +52,26 @@ pub struct Filter {
     limit: Option<u64>,
     tags: Box<[(u8, Box<[TagValueBuf]>)]>,
     impossible: bool,
+}
+
+impl PartialEq for Filter {
+    /// Field-wise equality, except that every impossible filter
+    /// compares equal — the canonical shape [`Filter::to_json`]
+    /// emits (`{"ids":[]}`) must round-trip to an equal filter, and
+    /// `{"kinds":[]}` keeps its fields so read policies like
+    /// `fully_restricts` can still inspect them.
+    fn eq(&self, other: &Self) -> bool {
+        if self.impossible || other.impossible {
+            return self.impossible == other.impossible;
+        }
+        self.ids == other.ids
+            && self.authors == other.authors
+            && self.kinds == other.kinds
+            && self.tags == other.tags
+            && self.since == other.since
+            && self.until == other.until
+            && self.limit == other.limit
+    }
 }
 
 impl Filter {
@@ -193,6 +213,39 @@ impl Filter {
     #[must_use]
     pub fn effective_limit(&self, max: u64) -> u64 {
         self.intrinsic_limit().unwrap_or(max).min(max)
+    }
+
+    /// Canonical JSON: `Filter::parse` of the output produces an equal
+    /// filter. An impossible filter serializes as `{"ids":[]}`.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        if self.impossible {
+            return r#"{"ids":[]}"#.to_owned();
+        }
+        let mut fields = Vec::new();
+        if let Some(ids) = &self.ids {
+            fields.push(hex_list("ids", ids));
+        }
+        if let Some(authors) = &self.authors {
+            fields.push(hex_list("authors", authors));
+        }
+        if let Some(kinds) = &self.kinds {
+            let values: Vec<String> = kinds.iter().map(u16::to_string).collect();
+            fields.push(format!("\"kinds\":[{}]", values.join(",")));
+        }
+        for (name, values) in &self.tags {
+            fields.push(tag_field(*name, values));
+        }
+        for (key, value) in [
+            ("since", self.since),
+            ("until", self.until),
+            ("limit", self.limit),
+        ] {
+            if let Some(value) = value {
+                fields.push(format!("\"{key}\":{value}"));
+            }
+        }
+        format!("{{{}}}", fields.join(","))
     }
 
     /// Whether `ev` satisfies every present condition. Allocation-free.
@@ -369,6 +422,44 @@ pub enum FilterError {
     Unsupported(String),
 }
 
+/// `"key":["hex","hex"]"` — the ids/authors list fields.
+fn hex_list(key: &str, values: &[[u8; 32]]) -> String {
+    let mut field = format!("\"{key}\":[");
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            field.push(',');
+        }
+        field.push('"');
+        field.push_str(&faster_hex::hex_string(value));
+        field.push('"');
+    }
+    field.push(']');
+    field
+}
+
+/// `"#x":[...]` — e/p values hex-encode their 32 packed bytes; other
+/// names carry their original UTF-8 bytes as JSON strings.
+fn tag_field(name: u8, values: &[TagValueBuf]) -> String {
+    let mut field = format!("\"#{name}\":[", name = name as char);
+    for (i, value) in values.iter().enumerate() {
+        if i > 0 {
+            field.push(',');
+        }
+        if name == b'e' || name == b'p' {
+            field.push('"');
+            field.push_str(&faster_hex::hex_string(value.as_bytes()));
+            field.push('"');
+        } else {
+            field.push_str(
+                &serde_json::to_string(&String::from_utf8_lossy(value.as_bytes()))
+                    .unwrap_or_else(|_| "\"\"".to_owned()),
+            );
+        }
+    }
+    field.push(']');
+    field
+}
+
 impl FilterError {
     /// NIP-01 machine-readable reason string; always prefixed.
     #[must_use]
@@ -479,6 +570,58 @@ mod tests {
             .expect("parse");
         assert_eq!(filter.since(), Some(9_007_199_254_740_992));
         assert_eq!(filter.limit(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn to_json_round_trips() {
+        let id = encode_32(&[0xAB; 32]);
+        let pk = encode_32(&[0xCD; 32]);
+        for json in [
+            r#"{"kinds":[3,1],"since":5,"until":9,"limit":2}"#,
+            &format!(
+                r##"{{"ids":["{id}"],"authors":["{pk}"],"#e":["{id}"],"#p":["{pk}"],"#t":["x","y"]}}"##
+            ),
+            r#"{"ids":[]}"#,
+            r##"{"#t":[],"kinds":[1]}"##,
+            r"{}",
+        ] {
+            let filter = Filter::parse(json).expect(json);
+            let reparsed = Filter::parse(&filter.to_json()).expect("to_json parses");
+            assert_eq!(reparsed, filter, "{json} -> {}", filter.to_json());
+        }
+    }
+
+    #[test]
+    fn to_json_canonical_form() {
+        assert_eq!(
+            Filter::parse(r#"{"kinds":[3,1]}"#).unwrap().to_json(),
+            r#"{"kinds":[1,3]}"#
+        );
+        assert_eq!(
+            Filter::parse(r##"{"#t":[],"kinds":[1]}"##)
+                .unwrap()
+                .to_json(),
+            r#"{"ids":[]}"#
+        );
+        let filter = Filter::parse(
+            r##"{"authors":["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"],"#e":["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            filter.to_json(),
+            concat!(
+                r#"{"authors":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],"#,
+                r##""#e":["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]}"##
+            )
+        );
+    }
+
+    #[test]
+    fn impossible_filters_are_equal() {
+        assert_eq!(
+            Filter::parse(r##"{"#t":[],"kinds":[1]}"##).unwrap(),
+            Filter::parse(r#"{"ids":[]}"#).unwrap()
+        );
     }
 
     #[test]
