@@ -45,3 +45,43 @@ jobs:
       contents: read
     with:
       max-total-time: 60
+
+  conformance-native:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run the conformance suite against the native edition
+        run: crates/nosfry-conformance/run.sh native
+
+  conformance-worker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - name: Install the wasm32 target and worker-build
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install worker-build --version 0.8.7 --locked
+      - name: Run the conformance suite against the Workers edition
+        env:
+          CC_wasm32_unknown_unknown: clang
+          CARGO_PROFILE_RELEASE_STRIP: "false"
+        run: crates/nosfry-conformance/run.sh worker
+      - name: Report the worker bundle size
+        run: |
+          WASM="crates/nosfry-worker/build/index_bg.wasm"
+          {
+            echo "worker bundle"
+            echo "- raw: $(stat -c%s "$WASM") bytes"
+            echo "- gzip: $(gzip -c "$WASM" | wc -c) bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
