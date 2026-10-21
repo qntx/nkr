@@ -21,7 +21,8 @@ use yawc::close::CloseCode;
 use yawc::{Frame, HttpWebSocket, OpCode};
 
 use crate::channels::{
-    ConnId, Out, Outbound, ScanKind, ScanStart, ShardMsg, WriteRequest, WriterMsg, route,
+    ConnId, Out, Outbound, OutboundRx, ScanKind, ScanStart, ShardMsg, WriteRequest, WriterMsg,
+    route,
 };
 use crate::metrics::Metrics;
 use crate::policy::Decision;
@@ -103,7 +104,7 @@ impl<'a> Connection<'a> {
         handle: &'a Handle,
         peer: IpAddr,
         address: Arc<AddressBuckets>,
-    ) -> Option<(Self, mpsc::UnboundedReceiver<Out>)> {
+    ) -> Option<(Self, OutboundRx)> {
         let conn = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
         // Limits and the outbound budget are fixed at connect time;
         // reloads apply to the next connection.
@@ -348,7 +349,7 @@ impl<'a> Connection<'a> {
         &mut self,
         ws: &mut HttpWebSocket,
         first: Out,
-        out_rx: &mut mpsc::UnboundedReceiver<Out>,
+        out_rx: &mut OutboundRx,
     ) -> Result<(), WriteError> {
         let mut batch = std::mem::take(&mut self.batch);
         let mut bytes = first.accounted_bytes();
@@ -366,7 +367,7 @@ impl<'a> Connection<'a> {
         // drops the rest, and their bytes must not stay charged to the
         // outbound queue.
         for msg in &batch {
-            self.out.written(msg.accounted_bytes());
+            out_rx.written(msg.accounted_bytes());
         }
         // One deadline covers every surviving feed plus the flush.
         let result = tokio::time::timeout(self.ping_interval, async {
@@ -386,7 +387,7 @@ impl<'a> Connection<'a> {
         &mut self,
         ws: &mut HttpWebSocket,
         first: Option<Out>,
-        out_rx: &mut mpsc::UnboundedReceiver<Out>,
+        out_rx: &mut OutboundRx,
     ) -> bool {
         let Some(first) = first else {
             return false;

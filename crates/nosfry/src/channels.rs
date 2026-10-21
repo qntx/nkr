@@ -215,20 +215,18 @@ impl Outbound {
     /// New queue; `max_pending` is the byte budget and `total` the
     /// process-wide pending-byte counter shared by every connection.
     #[must_use]
-    pub(crate) fn new(
-        max_pending: usize,
-        total: Arc<AtomicUsize>,
-    ) -> (Self, mpsc::UnboundedReceiver<Out>) {
+    pub(crate) fn new(max_pending: usize, total: Arc<AtomicUsize>) -> (Self, OutboundRx) {
         let (tx, rx) = mpsc::unbounded_channel();
+        let pending = Arc::new(AtomicUsize::new(0));
         (
             Self {
                 tx,
-                pending: Arc::new(AtomicUsize::new(0)),
-                total,
+                pending: Arc::clone(&pending),
+                total: Arc::clone(&total),
                 dead: Arc::new(AtomicBool::new(false)),
                 max_pending,
             },
-            rx,
+            OutboundRx { rx, pending, total },
         )
     }
 
@@ -248,12 +246,6 @@ impl Outbound {
             self.pending.fetch_sub(len, Ordering::Relaxed);
             self.total.fetch_sub(len, Ordering::Relaxed);
         }
-    }
-
-    /// Account for a frame actually written to the socket.
-    pub(crate) fn written(&self, bytes: usize) {
-        self.pending.fetch_sub(bytes, Ordering::Relaxed);
-        self.total.fetch_sub(bytes, Ordering::Relaxed);
     }
 
     /// Pending outbound bytes.
@@ -285,5 +277,110 @@ impl Clone for Outbound {
             dead: Arc::clone(&self.dead),
             max_pending: self.max_pending,
         }
+    }
+}
+
+/// Receiving end of an [`Outbound`] queue; owns the consumer-side byte
+/// accounting. `written` releases the bytes of frames popped for the
+/// socket, and dropping releases every byte still queued so a closed
+/// connection never leaves its `pending` charged into `total`.
+#[derive(Debug)]
+pub(crate) struct OutboundRx {
+    rx: mpsc::UnboundedReceiver<Out>,
+    pending: Arc<AtomicUsize>,
+    total: Arc<AtomicUsize>,
+}
+
+impl OutboundRx {
+    /// Next queued frame; `None` once every `Outbound` sender dropped.
+    pub(crate) async fn recv(&mut self) -> Option<Out> {
+        self.rx.recv().await
+    }
+
+    /// Next queued frame without waiting.
+    pub(crate) fn try_recv(&mut self) -> Result<Out, mpsc::error::TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Next queued frame, blocking the calling thread (tests only).
+    #[cfg(test)]
+    pub(crate) fn blocking_recv(&mut self) -> Option<Out> {
+        self.rx.blocking_recv()
+    }
+
+    /// Release the bytes of frames removed from the queue (written to
+    /// the socket or dropped mid-batch).
+    pub(crate) fn written(&self, bytes: usize) {
+        self.pending.fetch_sub(bytes, Ordering::Relaxed);
+        self.total.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for OutboundRx {
+    fn drop(&mut self) {
+        // Close first: a `push` racing the drop fails its `send` and
+        // subtracts the bytes it charged. Every frame that made it in
+        // before the close is still queued, so draining afterwards
+        // releases exactly the remaining charge — nothing can arrive
+        // after `close` that the drain would miss.
+        self.rx.close();
+        while let Ok(out) = self.rx.try_recv() {
+            let len = out.accounted_bytes();
+            self.pending.fetch_sub(len, Ordering::Relaxed);
+            self.total.fetch_sub(len, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(bytes: usize) -> Out {
+        Out::Frame {
+            sub: None,
+            verb: RelayVerb::Notice,
+            text: "x".repeat(bytes),
+        }
+    }
+
+    /// Frames still queued when the consumer drops release both the
+    /// per-connection `pending` and the process-wide `total`.
+    #[test]
+    fn dropping_the_receiver_releases_queued_bytes() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let (out, rx) = Outbound::new(usize::MAX, Arc::clone(&total));
+        out.push(frame(100));
+        out.push(frame(200));
+        assert_eq!(out.pending(), 300);
+        assert_eq!(out.total(), 300);
+        drop(rx);
+        assert_eq!(out.pending(), 0);
+        assert_eq!(out.total(), 0);
+    }
+
+    /// A `push` racing a dropped receiver fails its `send` and
+    /// subtracts the bytes it charged.
+    #[test]
+    fn push_after_receiver_drop_charges_nothing() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let (out, rx) = Outbound::new(usize::MAX, Arc::clone(&total));
+        drop(rx);
+        out.push(frame(100));
+        assert_eq!(out.pending(), 0);
+        assert_eq!(out.total(), 0);
+    }
+
+    /// `written` releases exactly the received frame's bytes.
+    #[test]
+    fn written_releases_only_the_received_frame() {
+        let total = Arc::new(AtomicUsize::new(0));
+        let (out, mut rx) = Outbound::new(usize::MAX, Arc::clone(&total));
+        out.push(frame(100));
+        out.push(frame(200));
+        let first = rx.blocking_recv().unwrap();
+        rx.written(first.accounted_bytes());
+        assert_eq!(out.pending(), 200);
+        assert_eq!(out.total(), 200);
     }
 }

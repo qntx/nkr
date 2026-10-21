@@ -190,6 +190,12 @@ down`; CLOSE is never charged.
 
 ### Fixed
 
+- Frames still queued when a connection ended (slow consumer, socket
+  error, stall, shutdown) kept their bytes charged to the
+  process-wide outbound budget forever: `nosfry_outbound_pending_bytes`
+  grew without bound and, past `max_pending_outbound_bytes_total`,
+  paused the scans of every connection. The queue's receiving end now
+  releases all still-queued bytes when it is dropped.
 - A reader process killed while holding a read transaction left its
   slot in `lock.mdb` permanently, so LMDB kept that reader's pages
   pinned and `data.mdb` grew without bound. `Store::open` now runs

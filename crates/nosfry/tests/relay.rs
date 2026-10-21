@@ -633,6 +633,53 @@ async fn slow_consumer_is_disconnected() {
 }
 
 #[tokio::test]
+async fn slow_consumer_releases_outbound_bytes() {
+    let mut config = common::config();
+    config.relay.metrics = true;
+    config.relay.max_pending_outbound_bytes = 256 * 1024;
+    // The write deadline and the silent-client keepalive timeout both
+    // scale with the ping interval; shrink it so the cut happens fast.
+    config.relay.auto_ping_seconds = 2;
+    let relay = Relay::start_with(config).await;
+
+    // Live-only subscriber (`limit: 0` skips the stored scan) that
+    // never reads its socket.
+    let mut slow = relay.connect().await;
+    send_text(&mut slow, &req_wire("s", "{\"kinds\":[1],\"limit\":0}")).await;
+
+    // Live fan-out is what trips the per-connection byte cap: ~8 MiB
+    // of 32 KiB events far exceeds both the socket buffers and the
+    // 256 KiB queue.
+    let mut pub_ws = relay.connect().await;
+    let content = "x".repeat(32 * 1024);
+    for i in 0..256u64 {
+        let ev = common::event(&key(30), 1, now(), &json!([]), &format!("{content}{i}"));
+        send_text(&mut pub_ws, &event_wire(&ev)).await;
+        let ok = json(&recv_text(&mut pub_ws, T).await);
+        assert_eq!(ok[2], true, "{ok}");
+    }
+
+    // The slow consumer was cut; once its connection is gone its
+    // queued bytes must leave the process-wide gauge at 0.
+    let deadline = Instant::now() + T;
+    let mut pending = None;
+    while Instant::now() < deadline {
+        let body = http_get(relay.addr, "/metrics").await;
+        pending = metric_value(&body, "nosfry_outbound_pending_bytes");
+        if pending == Some(0) && metric_value(&body, "nosfry_connections") == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        pending,
+        Some(0),
+        "queued bytes stayed charged to a closed connection"
+    );
+    relay.stop().await;
+}
+
+#[tokio::test]
 async fn half_open_connection_times_out() {
     let mut config = common::config();
     config.relay.auto_ping_seconds = 1;
