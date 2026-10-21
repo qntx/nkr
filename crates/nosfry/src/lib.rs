@@ -38,7 +38,9 @@ use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use nosfry_lmdb::{Moderation, Store};
+use nosfry_core::event::PublicKey;
+use nosfry_core::moderation::Moderation;
+use nosfry_lmdb::Store;
 use rlimit as _;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
@@ -98,6 +100,9 @@ pub(crate) struct Live {
     /// Active write-policy plugin; read at each publish so a reload
     /// applies to the next event on every connection.
     pub(crate) policy: Option<policy::WritePolicy>,
+    /// Parsed `[relay.management] admins` — hex strings are validated
+    /// at load; this set is parsed once per snapshot.
+    pub(crate) admins: Arc<[PublicKey]>,
 }
 
 /// The `monitors` shard channel pairs.
@@ -175,8 +180,9 @@ fn reload_once(
         tracing::warn!(?ignored, "restart-only keys ignored on config reload");
     }
     let limits = merged.limits().inspect_err(log_invalid_reload).ok()?;
+    let admins = merged.admins().inspect_err(log_invalid_reload).ok()?;
     Some(Arc::new(apply_reload(
-        merged, limits, live, limiter, moderation,
+        merged, limits, admins, live, limiter, moderation,
     )))
 }
 
@@ -190,6 +196,7 @@ fn log_invalid_reload(err: &ServerError) {
 fn apply_reload(
     merged: Config,
     limits: nosfry_core::limits::Limits,
+    admins: Arc<[PublicKey]>,
     live: &Live,
     limiter: &limiter::ConnectionLimiter,
     moderation: &Moderation,
@@ -210,6 +217,7 @@ fn apply_reload(
         config: Arc::new(merged),
         limits: Arc::new(limits),
         policy,
+        admins,
     }
 }
 
@@ -300,11 +308,13 @@ impl Server {
         // The live-config channel exists before the writer spawn so
         // the vanish path re-reads `service_url` on every batch.
         let limits = config.limits()?;
+        let admins = config.admins()?;
         let (live_tx, live_rx) = watch::channel(Arc::new(Live {
             config: Arc::clone(&config),
             nip11: http::nip11(&config, &limits, &moderation).into(),
             limits: Arc::new(limits),
             policy: start_policy(&config.relay.write_policy),
+            admins,
         }));
 
         // Writer.

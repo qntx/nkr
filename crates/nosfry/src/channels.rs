@@ -8,8 +8,9 @@ use nosfry_core::auth::ReadGate;
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
 use nosfry_core::message::{RelayVerb, SubId};
+use nosfry_core::moderation::{ModOp, Moderation};
 use nosfry_core::session::SubKey;
-use nosfry_lmdb::{ModOp, Moderation, StoreError};
+use nosfry_lmdb::StoreError;
 use tokio::sync::{mpsc, oneshot};
 
 /// Connection identifier; also the shard/reader routing key.
