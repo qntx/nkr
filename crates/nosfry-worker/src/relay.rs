@@ -288,6 +288,13 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         })
     }
 
+    /// Whether `conn` is a live connection — the glue regenerates
+    /// its random id until this answers false.
+    #[must_use]
+    pub fn is_live(&self, conn: u64) -> bool {
+        self.conns.contains_key(&conn)
+    }
+
     /// Register a new socket. `conn` is caller-chosen and must be
     /// unique among live connections and below 2^53 (it is bound into
     /// `subs` rows). Returns the initial attachment to persist on the
