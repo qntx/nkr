@@ -28,13 +28,15 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
     subscribers counting deliveries, short-lived connections churning
     historical REQs, and periodically spawned `REQ {}` consumers that
     never read. Every `--sample-secs` it prints one cumulative JSON
-    line with relay RSS, `data.mdb` size, connection and rate-limit
-    metrics, and the workload counters; a final `end` line and a
+    line with relay RSS, `data.mdb` size, connection, rate-limit and
+    `nosfry_outbound_pending_bytes` metrics, and the workload
+    counters; a final `end` line (with `outbound_pending_after_close`,
+    the gauge value once every harness connection is closed) and a
     `relay_exit` line close the JSONL.
 - **aggregate.py**: `python3 bench/aggregate.py <results-dir>` prints the
   median and [min, max] of every metric across repeated runs.
 - **soak_analyze.py**: `python3 bench/soak_analyze.py <run.jsonl>
-  --warmup-secs N` applies the soak criteria (anonymous-memory slope,
+--warmup-secs N` applies the soak criteria (anonymous-memory slope,
   `data.mdb` plateau, connection gauge, zero errors) and exits non-zero
   on a failure. Use a warm-up of at least the 600 s event expiration;
   the 72 h gate run uses 6 h.

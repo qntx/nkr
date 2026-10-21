@@ -16,6 +16,9 @@ Criteria (fixed before any run was analyzed):
   are reaped);
 - errors: zero harness errors, zero failed churn queries, zero
   subscriber reconnects, every OK accepted, relay exit status 0.
+- outbound: once every harness connection is closed, the relay's
+  `nosfry_outbound_pending_bytes` gauge reads 0 (no queued bytes stay
+  charged to closed connections; added 2026-10-21 before the definitive run).
 """
 
 import argparse
@@ -61,40 +64,49 @@ def main():
     checks = []
 
     ts = [s["t"] for s in post]
-    rss = [s["rss_anon_kib"] for s in post]
-    total_rss = [s["rss_kib"] for s in post]
-    mean_rss = sum(rss) / len(rss)
-    rss_slope_h = slope(ts, rss) * 3600
-    projected = rss_slope_h * 72
-    budget = max(64 * MIB, 0.10 * mean_rss)
-    checks.append((
-        "memory",
-        abs(projected) <= budget,
-        f"anon mean {mean_rss / MIB:.1f} MiB, min {min(rss) / MIB:.1f}, max {max(rss) / MIB:.1f}, "
-        f"total RSS max {max(total_rss) / MIB:.1f} MiB, "
-        f"slope {rss_slope_h / MIB:+.2f} MiB/h, 72 h projection {projected / MIB:+.1f} MiB "
-        f"(budget {budget / MIB:.1f} MiB)",
-    ))
+    # A missing series (e.g. no procfs RssAnon off Linux) is a failed
+    # check, not a traceback.
+    rss = [v for s in post if (v := s["rss_anon_kib"]) is not None]
+    total_rss = [v for s in post if (v := s["rss_kib"]) is not None]
+    if rss:
+        mean_rss = sum(rss) / len(rss)
+        rss_slope_h = slope(ts, rss) * 3600
+        projected = rss_slope_h * 72
+        budget = max(64 * MIB, 0.10 * mean_rss)
+        checks.append((
+            "memory",
+            abs(projected) <= budget,
+            f"anon mean {mean_rss / MIB:.1f} MiB, min {min(rss) / MIB:.1f}, max {max(rss) / MIB:.1f}, "
+            f"total RSS max {max(total_rss) / MIB:.1f} MiB, "
+            f"slope {rss_slope_h / MIB:+.2f} MiB/h, 72 h projection {projected / MIB:+.1f} MiB "
+            f"(budget {budget / MIB:.1f} MiB)",
+        ))
+    else:
+        checks.append(("memory", False, "no rss_anon_kib samples"))
 
     third = len(post) // 3
     middle = post[third:2 * third]
     last = post[2 * third:]
-    db_mid = max(s["db_bytes"] for s in middle)
-    db_last = max(s["db_bytes"] for s in last)
-    checks.append((
-        "database",
-        db_last <= db_mid * 1.05,
-        f"middle-third max {db_mid / 2**20:.1f} MiB, last-third max {db_last / 2**20:.1f} MiB, "
-        f"final {post[-1]['db_bytes'] / 2**20:.1f} MiB",
-    ))
+    db_mid_l = [v for s in middle if (v := s["db_bytes"]) is not None]
+    db_last_l = [v for s in last if (v := s["db_bytes"]) is not None]
+    if db_mid_l and db_last_l:
+        db_mid, db_last = max(db_mid_l), max(db_last_l)
+        checks.append((
+            "database",
+            db_last <= db_mid * 1.05,
+            f"middle-third max {db_mid / 2**20:.1f} MiB, last-third max {db_last / 2**20:.1f} MiB, "
+            f"final {post[-1]['db_bytes'] / 2**20:.1f} MiB",
+        ))
+    else:
+        checks.append(("database", False, "no db_bytes samples"))
 
     base = args.publishers + args.subscribers
-    conns = [s["conns"] for s in samples]
-    final = samples[-1]["conns"]
+    conns = [v for s in samples if (v := s["conns"]) is not None]
+    final = conns[-1] if conns else None
     checks.append((
         "connections",
-        max(conns) <= base + 50 and final <= base + 20,
-        f"max {max(conns)}, final {final}, baseline {base}",
+        conns and max(conns) <= base + 50 and final <= base + 20,
+        f"max {max(conns) if conns else 'n/a'}, final {final}, baseline {base}",
     ))
 
     counts = end or samples[-1]
@@ -105,6 +117,14 @@ def main():
         "churn_failed": counts.get("churn_failed", 0),
         "sub_reconnects": counts.get("sub_reconnects", 0),
     }
+    drained = end.get("outbound_pending_after_close") if end else None
+    checks.append((
+        "outbound",
+        drained == 0,
+        f"pending after all connections closed: "
+        f"{drained if end else 'run not finished'} bytes, "
+        f"last sample {post[-1].get('outbound_pending')} bytes",
+    ))
     checks.append((
         "errors",
         not any(failures.values()) and not rejected and exit_status == 0,
