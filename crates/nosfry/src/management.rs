@@ -282,7 +282,7 @@ async fn apply(state: &AppState, op: ModOp) -> Result<Value, String> {
     state.mod_tx.send_replace(Arc::clone(&moderation));
     if is_info {
         let mut next = (**state.live.borrow()).clone();
-        next.nip11 = crate::http::nip11(&next.config, &moderation).into();
+        next.nip11 = crate::http::nip11(&next.config, &next.limits, &moderation).into();
         state.live_tx.send_replace(Arc::new(next));
     }
     Ok(Value::Bool(true))

@@ -206,7 +206,7 @@ fn apply_reload(
     };
     tracing::info!("configuration reloaded");
     Live {
-        nip11: http::nip11(&merged, moderation).into(),
+        nip11: http::nip11(&merged, &limits, moderation).into(),
         config: Arc::new(merged),
         limits: Arc::new(limits),
         policy,
@@ -299,10 +299,11 @@ impl Server {
 
         // The live-config channel exists before the writer spawn so
         // the vanish path re-reads `service_url` on every batch.
+        let limits = config.limits()?;
         let (live_tx, live_rx) = watch::channel(Arc::new(Live {
             config: Arc::clone(&config),
-            limits: Arc::new(config.limits()?),
-            nip11: http::nip11(&config, &moderation).into(),
+            nip11: http::nip11(&config, &limits, &moderation).into(),
+            limits: Arc::new(limits),
             policy: start_policy(&config.relay.write_policy),
         }));
 

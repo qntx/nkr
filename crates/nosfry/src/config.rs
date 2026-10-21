@@ -3,7 +3,9 @@
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use nosfry_core::auth::AuthConfig;
 use nosfry_core::event::EventLimits;
+use nosfry_core::info::Info;
 use nosfry_core::limits::{Limits, RateLimits, ReqLimits};
 use nosfry_lmdb::StoreOptions;
 use serde::Deserialize;
@@ -94,24 +96,11 @@ pub struct Relay {
     /// Write-policy plugin.
     pub write_policy: WritePolicy,
     /// NIP-42 authentication and restricted read kinds.
-    pub auth: Auth,
+    pub auth: AuthConfig,
     /// NIP-86 management API.
     pub management: Management,
     /// NIP-11 relay information.
     pub info: Info,
-}
-
-/// `[relay.auth]` — NIP-42 restricted read kinds (strfry
-/// `relay.auth.*`; the URL moved to `[relay] service_url`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Auth {
-    /// Kinds served only to authenticated readers.
-    pub restricted_read_kinds: Vec<u16>,
-    /// Restricted kinds are served only to authenticated pubkeys
-    /// involved in the event (author or `p` tag); `false` serves them
-    /// to any authenticated reader.
-    pub restrict_read_to_involved: bool,
 }
 
 /// `[relay.management]` — the NIP-86 relay management API.
@@ -122,15 +111,6 @@ pub struct Management {
     /// `application/nostr+json+rpc`. The endpoint exists only when
     /// non-empty, and `u`-tag checks need `[relay] service_url`.
     pub admins: Vec<String>,
-}
-
-impl Default for Auth {
-    fn default() -> Self {
-        Self {
-            restricted_read_kinds: vec![4, 1059],
-            restrict_read_to_involved: true,
-        }
-    }
 }
 
 /// `[relay.threads]` — worker thread counts.
@@ -181,22 +161,6 @@ impl Default for WritePolicy {
     }
 }
 
-/// `[relay.info]` — NIP-11 document fields.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Info {
-    /// Relay name.
-    pub name: String,
-    /// Plain-text description.
-    pub description: String,
-    /// Relay operator pubkey (hex).
-    pub pubkey: String,
-    /// Relay operator contact.
-    pub contact: String,
-    /// Relay icon URL.
-    pub icon: String,
-}
-
 impl Default for Db {
     fn default() -> Self {
         Self {
@@ -230,7 +194,7 @@ impl Default for Relay {
             threads: Threads::default(),
             compression: Compression::default(),
             write_policy: WritePolicy::default(),
-            auth: Auth::default(),
+            auth: AuthConfig::default(),
             management: Management::default(),
             info: Info::default(),
         }
@@ -251,18 +215,6 @@ impl Default for Compression {
         Self {
             enabled: false,
             sliding_window: true,
-        }
-    }
-}
-
-impl Default for Info {
-    fn default() -> Self {
-        Self {
-            name: "nosfry".into(),
-            description: String::new(),
-            pubkey: String::new(),
-            contact: String::new(),
-            icon: String::new(),
         }
     }
 }
