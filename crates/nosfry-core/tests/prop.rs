@@ -279,6 +279,14 @@ proptest! {
     }
 
     #[test]
+    fn filter_to_json_round_trip(filter_json in arb_filter_json()) {
+        let filter = Filter::parse(&serde_json::to_string(&filter_json).unwrap())
+            .expect("generated filters are always valid");
+        let reparsed = Filter::parse(&filter.to_json()).expect("to_json output parses");
+        prop_assert_eq!(reparsed, filter);
+    }
+
+    #[test]
     fn packed_round_trip(
         (id, pubkey, created_at, kind, tags) in arb_event(),
     ) {
