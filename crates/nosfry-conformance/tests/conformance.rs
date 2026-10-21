@@ -16,6 +16,7 @@
     reason = "conformance assertions may panic on black-box replies"
 )]
 
+use std::fmt::Write;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -166,7 +167,7 @@ async fn nip11_document() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    for nip in [1, 9, 11, 40, 42, 45, 62, 70] {
+    for nip in [1, 9, 11, 40, 42, 45, 62, 70, 86] {
         assert!(nips.contains(&nip), "missing NIP-{nip}: {nips:?}");
     }
 }
@@ -705,4 +706,238 @@ async fn request_to_vanish_sweeps_and_blocks() {
     let (ok, reason) = publish(&mut ws, &old).await;
     assert!(!ok, "vanished author republish accepted");
     assert_eq!(reason, "blocked: request to vanish", "{reason}");
+}
+
+// NIP-86: the management RPC over HTTP POST. Mutations stay scoped to
+// fresh keys and ids so parallel tests are undisturbed.
+
+/// The fixed admin key the shared profile lists under
+/// `[relay.management] admins`.
+fn admin() -> Keypair {
+    sign::key(9)
+}
+
+/// `Authorization: Nostr <base64>` — the NIP-98 kind-27235 event
+/// covering `hashed` as its `payload` tag (pass a body the request
+/// does not carry to exercise the hash check).
+fn nip98(signer: &Keypair, hashed: &[u8]) -> String {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let digest = faster_hex::hex_string(&sha2::Sha256::digest(hashed));
+    let ev = sign::event(
+        signer,
+        27_235,
+        now(),
+        &json!([["u", url()], ["method", "POST"], ["payload", digest],]),
+        "",
+    );
+    format!(
+        "Nostr {}",
+        base64::engine::general_purpose::STANDARD.encode(ev.json())
+    )
+}
+
+/// One NIP-86 `POST /`; returns (HTTP status, response body text).
+async fn manage_call(body: &Value, authorization: Option<&str>) -> (u16, String) {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let relay = url();
+    let authority = relay.strip_prefix("ws://").unwrap().trim_end_matches('/');
+    let mut tcp = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let mut request = format!(
+        "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        nosfry_core::management::CONTENT_TYPE,
+        bytes.len()
+    );
+    if let Some(auth) = authorization {
+        write!(request, "Authorization: {auth}\r\n").unwrap();
+    }
+    request.push_str("\r\n");
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    tcp.write_all(&bytes).await.unwrap();
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8(buf).unwrap();
+    let status: u16 = text
+        .split_ascii_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_owned();
+    (status, body)
+}
+
+/// An authorized NIP-86 call; asserts 200 and returns the parsed body.
+async fn rpc(method: &str, params: Value) -> Value {
+    let body = json!({"method": method, "params": params});
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (status, text) = manage_call(&body, Some(&nip98(&admin(), &bytes))).await;
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn nip86_requires_nip98() {
+    let body = json!({"method": "supportedmethods", "params": []});
+    let (status, text) = manage_call(&body, None).await;
+    assert_eq!(status, 401, "{text}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["error"],
+        "unauthorized: missing authorization header"
+    );
+    // A `payload` tag covering different bytes fails the hash check.
+    let (status, text) = manage_call(&body, Some(&nip98(&admin(), b"other"))).await;
+    assert_eq!(status, 401, "{text}");
+    assert!(
+        text.contains("`payload` tag does not match the body"),
+        "{text}"
+    );
+    // A well-formed NIP-98 from a non-admin key is refused.
+    let bytes = serde_json::to_vec(&body).unwrap();
+    let (status, text) = manage_call(&body, Some(&nip98(&key(), &bytes))).await;
+    assert_eq!(status, 401, "{text}");
+    assert!(text.contains("pubkey is not an admin"), "{text}");
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn nip86_supportedmethods() {
+    let answer = rpc("supportedmethods", json!([])).await;
+    let methods: Vec<&str> = answer["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(methods, nosfry_core::management::METHODS, "{answer}");
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn nip86_ban_list_unban_pubkey() {
+    let k = key();
+    let mut ws = connect().await;
+    let ev = sign::event(&k, 1, now(), &json!([]), "pre-ban");
+    let (ok, reason) = publish(&mut ws, &ev).await;
+    assert!(ok, "pre-ban publish: {reason}");
+
+    let answer = rpc("banpubkey", json!([pubkey(&k), "conformance"])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let answer = rpc("listbannedpubkeys", json!([])).await;
+    assert!(
+        answer["result"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"pubkey": pubkey(&k), "reason": "conformance"})),
+        "{answer}"
+    );
+    let ev = sign::event(&k, 1, now(), &json!([]), "while banned");
+    let (ok, reason) = publish(&mut ws, &ev).await;
+    assert!(
+        !ok && reason == "blocked: pubkey not allowed",
+        "banned publish: {reason}"
+    );
+
+    let answer = rpc("unbanpubkey", json!([pubkey(&k)])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let (ok, reason) = publish(&mut ws, &ev).await;
+    assert!(ok, "publish after unban: {reason}");
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn nip86_banevent_removes_the_event() {
+    let k = key();
+    let ev = sign::event(&k, 1, now(), &json!([]), "to ban");
+    let mut ws = connect().await;
+    let (ok, reason) = publish(&mut ws, &ev).await;
+    assert!(ok, "publish: {reason}");
+    let id = ev.id().to_string();
+
+    let answer = rpc("banevent", json!([id, "conformance"])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let answer = rpc("listbannedevents", json!([])).await;
+    assert!(
+        answer["result"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"id": id, "reason": "conformance"})),
+        "{answer}"
+    );
+    let frames = req(&mut ws, "b", &format!("{{\"ids\":[\"{id}\"]}}")).await;
+    assert!(
+        events(&frames).is_empty(),
+        "banned event served: {frames:?}"
+    );
+    let (ok, reason) = publish(&mut ws, &ev).await;
+    assert!(
+        !ok && reason == "blocked: event banned",
+        "banned republish: {reason}"
+    );
+    let answer = rpc("unbanevent", json!([id])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn nip86_kind_disallow() {
+    // Kind 9000 is unused by the suite, and the op persists: NIP-86
+    // has no undisallow. allowkind is deliberately not exercised —
+    // even a momentary non-empty allow list switches the relay to
+    // allow-list mode and blocks the suite's parallel publishes (the
+    // allow↔disallow exclusivity is covered by the shared store
+    // moderation script).
+    let answer = rpc("disallowkind", json!([9000])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let answer = rpc("listdisallowedkinds", json!([])).await;
+    assert!(
+        answer["result"].as_array().unwrap().contains(&json!(9000)),
+        "{answer}"
+    );
+    let ev = sign::event(&key(), 9000, now(), &json!([]), "disallowed kind");
+    let mut ws = connect().await;
+    let (ok, reason) = publish(&mut ws, &ev).await;
+    assert!(
+        !ok && reason == "blocked: kind not allowed",
+        "disallowed kind publish: {reason}"
+    );
+    // Nothing else was touched: the allow list stays empty.
+    let answer = rpc("listallowedkinds", json!([])).await;
+    assert_eq!(answer["result"], json!([]), "allow list populated");
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn nip86_block_list_unblock_ip() {
+    // 192.0.2.0/24 is TEST-NET-1: it is never a real client address.
+    let answer = rpc("blockip", json!(["192.0.2.1", "conformance"])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let answer = rpc("listblockedips", json!([])).await;
+    assert!(
+        answer["result"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"ip": "192.0.2.1", "reason": "conformance"})),
+        "{answer}"
+    );
+    let answer = rpc("unblockip", json!(["192.0.2.1"])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let answer = rpc("listblockedips", json!([])).await;
+    assert_eq!(answer["result"], json!([]), "blocked ip left listed");
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn nip86_icon_override_and_restore() {
+    let answer = rpc("changerelayicon", json!(["https://icon.example/m.png"])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let doc = nip11().await;
+    assert_eq!(doc["icon"], "https://icon.example/m.png", "{doc}");
+    // Restore: the profile sets no icon, so the override returns to
+    // the empty value (absent from the document as before).
+    let answer = rpc("changerelayicon", json!([""])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    let doc = nip11().await;
+    assert_ne!(doc["icon"], "https://icon.example/m.png", "{doc}");
 }
