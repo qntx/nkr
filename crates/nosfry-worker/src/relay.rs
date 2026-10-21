@@ -11,11 +11,15 @@ use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
 use nosfry_core::limits::{AddressBuckets, Limits};
 use nosfry_core::management::{self, Action, Request};
-use nosfry_core::message::{SubId, closed_frame, count_frame, eose_frame, event_frame, ok_frame};
+use nosfry_core::message::{
+    SubId, closed_frame, count_frame, eose_frame, event_frame, neg_err_frame,
+    neg_err_frame_with_limit, neg_msg_frame, ok_frame,
+};
 use nosfry_core::moderation::Moderation;
 use nosfry_core::monitor::Monitors;
 use nosfry_core::session::{Command, Session, SubKey};
 use nosfry_core::store::WriteOutcome;
+use nosfry_core::sync::{self, NegentropyStorageVector};
 use nosfry_sql::{Executor, Param, SqlStore, StoreError, Value};
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +29,10 @@ use crate::config::{Config, ConfigError};
 /// where integers are JavaScript doubles. The glue assigns them
 /// (e.g. random 53-bit) and `accept`/`open` refuse larger ones.
 const JS_MAX: u64 = (1 << 53) - 1;
+
+/// A negentropy session idle this long is reaped with
+/// `closed: idle timeout` — the native 60 seconds.
+const NEG_IDLE_MS: u64 = 60_000;
 
 /// A `u64` bound into SQL: ids stay under 2^53 already, so the
 /// clamp is unreachable except for corrupt `subs` rows.
@@ -120,6 +128,23 @@ struct Conn<S> {
     challenge: String,
 }
 
+/// One open negentropy sync: the sealed storage `NEG-MSG`s reconcile
+/// against. Sessions live only in the object's memory — a Durable
+/// Object wake drops them all and the next `NEG-MSG` answers
+/// `closed: unknown subscription` (ADR 0007: sync state does not
+/// hibernate).
+#[derive(Debug)]
+struct NegSession {
+    /// The session generation the slot opened under.
+    generation: u64,
+    /// The sealed `(created_at, id)` records.
+    storage: NegentropyStorageVector,
+    /// The sync-memory reservation this session holds.
+    reserved: usize,
+    /// Last `NEG-OPEN`/`NEG-MSG` time; [`NEG_IDLE_MS`] reaps idle ones.
+    last_active_ms: u64,
+}
+
 /// The relay object: the SQL store, the session per connection, and
 /// the monitor index — everything but the platform's socket, timer,
 /// and persistence calls.
@@ -139,6 +164,11 @@ pub struct Relay<E: Executor, S: Socket> {
     /// address; the entry dies with the last.
     buckets: HashMap<IpAddr, Arc<AddressBuckets>>,
     monitors: Monitors<u64>,
+    /// Open negentropy sessions by `(conn, subscription id)`.
+    negs: HashMap<(u64, SubId), NegSession>,
+    /// Total bytes the open negentropy sessions have reserved against
+    /// `[relay] max_sync_memory_bytes` (`0` = unlimited).
+    sync_reserved: usize,
 }
 
 impl<E: Executor, S: Socket> Relay<E, S> {
@@ -177,6 +207,8 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             conns: HashMap::new(),
             buckets: HashMap::new(),
             monitors: Monitors::new(),
+            negs: HashMap::new(),
+            sync_reserved: 0,
         };
         for (socket, attachment) in sockets {
             if attachment.conn > JS_MAX {
@@ -278,6 +310,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     #[must_use]
     pub fn message(&mut self, conn: u64, now_ms: u64, text: &str) -> Effects {
         let mut effects = Effects::default();
+        self.reap_negs(now_ms);
         if text.len() > self.config.relay.max_websocket_payload_size {
             if let Some(c) = self.conns.get(&conn) {
                 c.socket.close(1009, "message too big");
@@ -295,7 +328,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         // worker has no metrics.
         let _received = c.session.on_text(now_ms, text, &mut commands);
         for command in commands {
-            self.command(conn, command, now_ms / 1000, &mut effects);
+            self.command(conn, command, now_ms, &mut effects);
         }
         if let Some(live) = self.conns.get(&conn)
             && (live.session.challenge_sent() != challenge_sent
@@ -318,9 +351,10 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     }
 
     /// Drop a connection: remove its subscriptions from the monitor
-    /// index, delete its `subs` rows, and release its share of the
-    /// address buckets.
+    /// index, delete its `subs` rows, release its negentropy
+    /// reservations, and release its share of the address buckets.
     pub fn close(&mut self, conn: u64) {
+        self.drop_conn_negs(conn);
         self.monitors.remove_connection(conn);
         self.exec("DELETE FROM subs WHERE conn = ?1", &[int(conn)]);
         let Some(c) = self.conns.remove(&conn) else {
@@ -454,6 +488,9 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         if self.limits.req.max_filter_limit_count > 0 {
             nips.push(45);
         }
+        if self.sync_cap() > 0 {
+            nips.push(77);
+        }
         if !self.config.relay.service_url.is_empty() {
             nips.push(42);
         }
@@ -520,22 +557,245 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
     }
 
-    /// Execute one session command in order.
-    fn command(&mut self, conn: u64, command: Command, now: u64, effects: &mut Effects) {
+    /// Execute one session command in order. `now_ms` is unix time in
+    /// milliseconds; store queries take its seconds.
+    fn command(&mut self, conn: u64, command: Command, now_ms: u64, effects: &mut Effects) {
         match command {
             Command::Send { text, .. } => self.send(conn, &text),
             Command::Publish { event, .. } => self.publish(conn, &event, effects),
             Command::Subscribe { sub, filters, gate } => {
-                self.subscribe(conn, sub, filters, gate, now);
+                self.subscribe(conn, sub, filters, gate, now_ms / 1000);
             }
             Command::Unsubscribe { sub_id } => self.unsubscribe(conn, &sub_id),
             Command::Count { sub, filters, gate } => {
-                self.count(conn, &sub, &filters, &gate, now);
+                self.count(conn, &sub, &filters, &gate, now_ms / 1000);
             }
-            // Negentropy is refused by the session itself: the
-            // worker's limits force max_sync_events to 0, so these
-            // arms never fire.
-            Command::NegOpen { .. } | Command::NegMsg { .. } | Command::NegClose { .. } => {}
+            Command::NegOpen {
+                sub,
+                filters,
+                gate,
+                msg,
+            } => self.neg_open(conn, &sub, &filters, &gate, &msg, now_ms),
+            Command::NegMsg { sub, msg } => self.neg_msg(conn, &sub, &msg, now_ms),
+            Command::NegClose { sub_id } => self.neg_close(conn, &sub_id),
+        }
+    }
+
+    /// `min([relay.limits] max_sync_events, [worker] max_scan_rows)` —
+    /// the record cap a `NEG-OPEN` answer obeys and NIP-11 advertises.
+    fn sync_cap(&self) -> u64 {
+        self.limits
+            .req
+            .max_sync_events
+            .min(self.config.worker.max_scan_rows as u64)
+    }
+
+    /// Send `text` as the negentropy frame native sends, closing the
+    /// session slot after it when `closes`. A stale generation drops
+    /// the frame without sending, like native.
+    fn neg_frame(&mut self, conn: u64, sub: &SubKey, text: &str, closes: bool) {
+        let Some(c) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        if !c.session.is_current_neg(sub) {
+            return;
+        }
+        c.socket.send(text);
+        if closes {
+            c.session.close_neg_by_relay(sub);
+        }
+    }
+
+    /// A `NEG-OPEN`: the records scan admits the session, over-cap or
+    /// exhausted-budget scans are refused `blocked:` with the
+    /// effective limit, and the memory budget refuses
+    /// `blocked: sync capacity exhausted` — the native wording.
+    /// Success always answers `NEG-MSG`, even an empty protocol round.
+    fn neg_open(
+        &mut self,
+        conn: u64,
+        sub: &SubKey,
+        filters: &[Filter],
+        gate: &ReadGate,
+        msg: &[u8],
+        now_ms: u64,
+    ) {
+        self.reap_negs(now_ms);
+        let cap = self.sync_cap();
+        let found = self.store.records(
+            filters,
+            gate,
+            now_ms / 1000,
+            cap.saturating_add(1),
+            self.config.worker.max_scan_rows,
+        );
+        let records = match found {
+            Err(_) => {
+                self.neg_frame(
+                    conn,
+                    sub,
+                    &neg_err_frame(&sub.id, "error: internal error"),
+                    true,
+                );
+                return;
+            }
+            Ok(found) if found.budget_exhausted || found.records.len() as u64 > cap => {
+                self.neg_frame(
+                    conn,
+                    sub,
+                    &neg_err_frame_with_limit(&sub.id, "blocked: too many query results", cap),
+                    true,
+                );
+                return;
+            }
+            Ok(found) => found.records,
+        };
+        let reserved = records.len() * sync::SYNC_RECORD_BYTES;
+        let budget = self.config.relay.max_sync_memory_bytes;
+        if budget != 0 && self.sync_reserved.saturating_add(reserved) > budget {
+            self.neg_frame(
+                conn,
+                sub,
+                &neg_err_frame(&sub.id, "blocked: sync capacity exhausted"),
+                true,
+            );
+            return;
+        }
+        let opened = sync::build_storage(&records)
+            .map_err(|_| ())
+            .and_then(|storage| {
+                sync::reconcile(&storage, msg)
+                    .map(|reply| (storage, reply))
+                    .map_err(|_| ())
+            });
+        match opened {
+            Ok((storage, reply)) => {
+                self.neg_frame(
+                    conn,
+                    sub,
+                    &neg_msg_frame(&sub.id, &faster_hex::hex_string(&reply)),
+                    false,
+                );
+                let live = self
+                    .conns
+                    .get(&conn)
+                    .is_some_and(|c| c.session.is_current_neg(sub));
+                if live {
+                    self.sync_reserved += reserved;
+                    self.negs.insert(
+                        (conn, sub.id.clone()),
+                        NegSession {
+                            generation: sub.generation,
+                            storage,
+                            reserved,
+                            last_active_ms: now_ms,
+                        },
+                    );
+                }
+            }
+            Err(()) => {
+                self.neg_frame(
+                    conn,
+                    sub,
+                    &neg_err_frame(&sub.id, "invalid: malformed negentropy message"),
+                    true,
+                );
+            }
+        }
+    }
+
+    /// A `NEG-MSG`: reconcile against the stored records and answer
+    /// `NEG-MSG` (even an empty round), or close with the native
+    /// wording — `closed: unknown subscription` when no session
+    /// answers, `invalid: malformed negentropy message` on a wire
+    /// error. Both failures release the reservation.
+    fn neg_msg(&mut self, conn: u64, sub: &SubKey, msg: &[u8], now_ms: u64) {
+        let key = (conn, sub.id.clone());
+        match self.negs.get_mut(&key) {
+            Some(session) if session.generation == sub.generation => {
+                if let Ok(reply) = sync::reconcile(&session.storage, msg) {
+                    session.last_active_ms = now_ms;
+                    self.neg_frame(
+                        conn,
+                        sub,
+                        &neg_msg_frame(&sub.id, &faster_hex::hex_string(&reply)),
+                        false,
+                    );
+                } else {
+                    self.drop_neg(&key);
+                    self.neg_frame(
+                        conn,
+                        sub,
+                        &neg_err_frame(&sub.id, "invalid: malformed negentropy message"),
+                        true,
+                    );
+                }
+            }
+            _ => self.neg_frame(
+                conn,
+                sub,
+                &neg_err_frame(&sub.id, "closed: unknown subscription"),
+                true,
+            ),
+        }
+    }
+
+    /// A `NEG-CLOSE`: drop the session and release its reservation
+    /// (the session slot is already gone — `drop_neg` ran first).
+    fn neg_close(&mut self, conn: u64, sub_id: &SubId) {
+        self.drop_neg(&(conn, sub_id.clone()));
+    }
+
+    /// Release `key`'s session reservation and drop it.
+    fn drop_neg(&mut self, key: &(u64, SubId)) {
+        if let Some(session) = self.negs.remove(key) {
+            self.sync_reserved -= session.reserved;
+        }
+    }
+
+    /// Drop every negentropy session `conn` owns — socket close or
+    /// message-too-big teardown.
+    fn drop_conn_negs(&mut self, conn: u64) {
+        let keys: Vec<(u64, SubId)> = self
+            .negs
+            .keys()
+            .filter(|(c, _)| *c == conn)
+            .cloned()
+            .collect();
+        for key in keys {
+            self.drop_neg(&key);
+        }
+    }
+
+    /// Reap sessions idle [`NEG_IDLE_MS`] or longer with
+    /// `closed: idle timeout` — the lazy native reaper, run at the
+    /// head of every `message()` and before admitting a session.
+    fn reap_negs(&mut self, now_ms: u64) {
+        if self.negs.is_empty() {
+            return;
+        }
+        let dead: Vec<(u64, SubKey)> = self
+            .negs
+            .iter()
+            .filter(|(_, s)| now_ms.saturating_sub(s.last_active_ms) >= NEG_IDLE_MS)
+            .map(|((conn, id), s)| {
+                (
+                    *conn,
+                    SubKey {
+                        id: id.clone(),
+                        generation: s.generation,
+                    },
+                )
+            })
+            .collect();
+        for (conn, sub) in dead {
+            self.drop_neg(&(conn, sub.id.clone()));
+            self.neg_frame(
+                conn,
+                &sub,
+                &neg_err_frame(&sub.id, "closed: idle timeout"),
+                true,
+            );
         }
     }
 
