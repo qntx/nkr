@@ -75,7 +75,6 @@ jobs:
       - name: Run the conformance suite against the Workers edition
         env:
           CC_wasm32_unknown_unknown: clang
-          CARGO_PROFILE_RELEASE_STRIP: "false"
         run: crates/nosfry-conformance/run.sh worker
       - name: Report the worker bundle size
         run: |

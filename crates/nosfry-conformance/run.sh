@@ -70,8 +70,7 @@ service_url = "$NOSFRY_URL"
 EOF
     (
         cd "$root/crates/nosfry-worker"
-        # worker-build needs a wasm32-capable clang, and the wasm must
-        # keep its target_features section (release profile strips it).
+        # worker-build needs a wasm32-capable clang.
         if [ -z "${CC_wasm32_unknown_unknown:-}" ]; then
             if brew_prefix="$(brew --prefix llvm 2>/dev/null)"; then
                 CC_wasm32_unknown_unknown="$brew_prefix/bin/clang"
@@ -80,7 +79,6 @@ EOF
             fi
             export CC_wasm32_unknown_unknown
         fi
-        export CARGO_PROFILE_RELEASE_STRIP=false
         npx --yes wrangler@4.150.0 dev --local --port "$port" \
             --var "NOSFRY_CONFIG:$(cat "$tmpdir/config.toml")" \
             >"$tmpdir/server.log" 2>&1
