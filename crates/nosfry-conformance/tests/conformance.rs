@@ -166,7 +166,7 @@ async fn nip11_document() {
         .iter()
         .map(|v| v.as_u64().unwrap())
         .collect();
-    for nip in [1, 9, 11, 40, 42, 45, 70] {
+    for nip in [1, 9, 11, 40, 42, 45, 62, 70] {
         assert!(nips.contains(&nip), "missing NIP-{nip}: {nips:?}");
     }
 }
@@ -640,4 +640,69 @@ async fn count_restricted_kind_needs_auth() {
     let ok = collect_until(&mut ws, |v| v[0] == "OK").await;
     assert_eq!(ok.last().unwrap()[2], true, "AUTH rejected");
     assert_eq!(count(&mut ws, "d", &filter).await["count"], 1);
+}
+
+/// NIP-62: a request to vanish (`["relay","ALL_RELAYS"]`) deletes
+/// the author's older events and `p`-tagged gift wraps, keeps the
+/// request itself, and blocks a later equal-or-older publish. The
+/// worker sweeps in the Durable Object alarm and the native writer
+/// asynchronously — the polls wait for the sweep instead of
+/// assuming it.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn request_to_vanish_sweeps_and_blocks() {
+    let author = key();
+    let mut ws = connect().await;
+    for content in ["a", "b", "c"] {
+        let ev = sign::event(&author, 1, now() - 20, &json!([]), content);
+        let (ok, reason) = publish(&mut ws, &ev).await;
+        assert!(ok, "publish: {reason}");
+    }
+    let wrap = sign::event(
+        &key(),
+        1059,
+        now() - 10,
+        &json!([["p", pubkey(&author)]]),
+        "gift",
+    );
+    let (ok, reason) = publish(&mut ws, &wrap).await;
+    assert!(ok, "wrap publish: {reason}");
+    let vanish = sign::event(&author, 62, now(), &json!([["relay", "ALL_RELAYS"]]), "");
+    let (ok, reason) = publish(&mut ws, &vanish).await;
+    assert!(ok, "vanish publish: {reason}");
+
+    // Poll until the author's stream holds only the request and no
+    // wrap `p`-tagged to them remains — the sweep is asynchronous on
+    // both editions.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let author_filter = format!("{{\"authors\":[\"{}\"]}}", pubkey(&author));
+    let wrap_filter = format!("{{\"#p\":[\"{}\"]}}", pubkey(&author));
+    let mut round = 0;
+    loop {
+        round += 1;
+        let sub = format!("v{round}");
+        let gone = {
+            let frames = req(&mut ws, &sub, &author_filter).await;
+            let got = events(&frames);
+            got.len() == 1 && got[0]["kind"] == 62
+        } && {
+            let sub = format!("w{round}");
+            let frames = req(&mut ws, &sub, &wrap_filter).await;
+            events(&frames).is_empty()
+        };
+        if gone {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "vanish sweep did not finish in 15 s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // An equal-or-older publish by the author is refused.
+    let old = sign::event(&author, 1, now() - 5, &json!([]), "late");
+    let (ok, reason) = publish(&mut ws, &old).await;
+    assert!(!ok, "vanished author republish accepted");
+    assert_eq!(reason, "blocked: request to vanish", "{reason}");
 }
