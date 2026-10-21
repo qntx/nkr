@@ -156,6 +156,18 @@ async fn read_ok(ws: &mut TcpWebSocket, id: &str) -> Option<(bool, String)> {
     None
 }
 
+/// Keep the newest `capacity` accepted kind-1 event ids for `mix` to
+/// reply to.
+fn track_recent(recent: &mut VecDeque<(usize, String)>, keep: bool, key: usize, id: String) {
+    if !keep {
+        return;
+    }
+    if recent.len() == recent.capacity() {
+        recent.pop_front();
+    }
+    recent.push_back((key, id));
+}
+
 /// One publisher: paces to `rate / publishers`, sends and awaits each
 /// `OK`, reconnects after any error.
 async fn publisher(
@@ -186,6 +198,12 @@ async fn publisher(
                 mix(n, &owned, &authors, &recent, &mut replaceable);
             let (id, event) = sign_event(&owned[key], created_at, kind, &tags, &content);
             next += interval;
+            // A stall drops the missed sends instead of bursting them
+            // later: the soak measures steady load.
+            let now = Instant::now();
+            if next < now {
+                next = now;
+            }
             tokio::select! {
                 () = tokio::time::sleep_until(next.into()) => {}
                 _ = stop.changed() => return,
@@ -202,12 +220,7 @@ async fn publisher(
             match ok {
                 Ok(Some((accepted, message))) => {
                     counters.ok(accepted, &message);
-                    if accepted && kind == 1 {
-                        if recent.len() == recent.capacity() {
-                            recent.pop_front();
-                        }
-                        recent.push_back((key, id));
-                    }
+                    track_recent(&mut recent, accepted && kind == 1, key, id);
                 }
                 // OK timeout or dead socket: count and reconnect.
                 Ok(None) | Err(_) => {
@@ -269,6 +282,7 @@ async fn churn_once(
     index: usize,
     authors: Arc<Vec<String>>,
     counters: Arc<Counters>,
+    mut stop: watch::Receiver<bool>,
 ) {
     let filters = [
         json!({"kinds": [1], "limit": 100}),
@@ -302,12 +316,17 @@ async fn churn_once(
         }
         Err("closed before EOSE".to_owned())
     };
-    match tokio::time::timeout(CHURN_TIMEOUT, result).await {
-        Ok(Ok(())) => {
-            counters.churn_done.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(Err(_)) | Err(_) => {
-            counters.churn_failed.fetch_add(1, Ordering::Relaxed);
+    tokio::select! {
+        // A detached task must still close its socket at stop so the
+        // drain check can see zero connections.
+        _ = stop.changed() => {}
+        result = tokio::time::timeout(CHURN_TIMEOUT, result) => match result {
+            Ok(Ok(())) => {
+                counters.churn_done.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(_)) | Err(_) => {
+                counters.churn_failed.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -336,6 +355,7 @@ async fn churner(
             index,
             Arc::clone(&authors),
             Arc::clone(&counters),
+            stop.clone(),
         ));
         index = index.wrapping_add(1);
     }
@@ -363,6 +383,7 @@ async fn slow_spawner(
         }
         let url = url.clone();
         let counters = Arc::clone(&counters);
+        let mut held = stop.clone();
         tokio::spawn(async move {
             let Ok(mut ws) = connect(&url, false).await else {
                 return;
@@ -377,7 +398,11 @@ async fn slow_spawner(
             counters.slow_spawned.fetch_add(1, Ordering::Relaxed);
             // Keep the socket open and never read: incoming deliveries
             // back up in the kernel buffer and the relay's write queue.
-            tokio::time::sleep(SLOW_HOLD).await;
+            // Stop still closes it so the drain check sees zero conns.
+            tokio::select! {
+                () = tokio::time::sleep(SLOW_HOLD) => {}
+                _ = held.changed() => {}
+            }
             drop(ws);
         });
     }
@@ -402,25 +427,45 @@ async fn http_get(url: &url::Url) -> Option<String> {
     Some(text[pos + 4..].to_owned())
 }
 
-/// `nosfry_connections`, `nosfry_connections_rejected_total` and the
-/// summed `nosfry_rate_limited_total{…}` from the metrics body.
-fn parse_metrics(body: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+/// The relay-side gauges/counters a sample needs.
+struct RelayMetrics {
+    /// `nosfry_connections`.
+    conns: Option<u64>,
+    /// `nosfry_connections_rejected_total`.
+    rejected: Option<u64>,
+    /// Summed `nosfry_rate_limited_total{…}`.
+    limited: Option<u64>,
+    /// `nosfry_outbound_pending_bytes`.
+    outbound_pending: Option<u64>,
+}
+
+/// `nosfry_connections`, `nosfry_connections_rejected_total`, the
+/// summed `nosfry_rate_limited_total{…}` and
+/// `nosfry_outbound_pending_bytes` from the metrics body.
+fn parse_metrics(body: &str) -> RelayMetrics {
     // Zero-valued counters are omitted from the exposition, so a
     // fetched body starts both totals at 0.
-    let (mut conns, mut rejected, mut limited) = (None, Some(0), Some(0));
+    let mut m = RelayMetrics {
+        conns: None,
+        rejected: Some(0),
+        limited: Some(0),
+        outbound_pending: None,
+    };
     for line in body.lines() {
         let value = || line.rsplit(' ').next()?.parse::<u64>().ok();
         if line.starts_with("nosfry_connections ") {
-            conns = value();
+            m.conns = value();
         } else if line.starts_with("nosfry_connections_rejected_total ") {
-            rejected = value();
+            m.rejected = value();
         } else if line.starts_with("nosfry_rate_limited_total") {
             if let Some(n) = value() {
-                limited = limited.map(|total| total + n);
+                m.limited = m.limited.map(|total| total + n);
             }
+        } else if line.starts_with("nosfry_outbound_pending_bytes ") {
+            m.outbound_pending = value();
         }
     }
-    (conns, rejected, limited)
+    m
 }
 
 /// Size of `<db-dir>/data.mdb` in bytes, if present.
@@ -439,7 +484,7 @@ fn sample_line(
     metrics: Option<&str>,
     counters: &Counters,
 ) -> Value {
-    let (conns, rejected, limited) = metrics.map_or((None, None, None), parse_metrics);
+    let m = metrics.map(parse_metrics);
     let mut line = counters.snapshot();
     let obj = line.as_object_mut().expect("snapshot is an object");
     obj.insert("type".into(), json!("sample"));
@@ -463,16 +508,28 @@ fn sample_line(
         "db_bytes".into(),
         db_bytes(db_dir).map_or(Value::Null, |n| json!(n)),
     );
-    obj.insert("conns".into(), conns.map_or(Value::Null, |n| json!(n)));
+    obj.insert(
+        "conns".into(),
+        m.as_ref().map_or(Value::Null, |m| opt(m.conns)),
+    );
     obj.insert(
         "rejected_total".into(),
-        rejected.map_or(Value::Null, |n| json!(n)),
+        m.as_ref().map_or(Value::Null, |m| opt(m.rejected)),
     );
     obj.insert(
         "rate_limited_total".into(),
-        limited.map_or(Value::Null, |n| json!(n)),
+        m.as_ref().map_or(Value::Null, |m| opt(m.limited)),
+    );
+    obj.insert(
+        "outbound_pending".into(),
+        m.as_ref().map_or(Value::Null, |m| opt(m.outbound_pending)),
     );
     line
+}
+
+/// `Option<u64>` as a JSON number or null.
+fn opt(value: Option<u64>) -> Value {
+    value.map_or(Value::Null, |n| json!(n))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -572,9 +629,28 @@ pub(crate) async fn run(
         let _ = task.await;
     }
 
+    // Drain check: once every harness connection is closed the relay
+    // must report zero queued outbound bytes — a non-zero gauge means
+    // a closed connection still holds a charge.
+    let mut drained = None;
+    if let Some(u) = &metrics_url {
+        let until = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < until {
+            match http_get(u).await.as_deref().map(parse_metrics) {
+                Some(m) if m.conns == Some(0) => {
+                    drained = m.outbound_pending;
+                    break;
+                }
+                Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                None => break,
+            }
+        }
+    }
+
     let mut end = counters.snapshot();
     let obj = end.as_object_mut().expect("snapshot is an object");
     obj.insert("type".into(), json!("end"));
+    obj.insert("outbound_pending_after_close".into(), opt(drained));
     obj.insert("label".into(), json!(label));
     obj.insert("t".into(), json!(start.elapsed().as_secs()));
     let stats = pid.and_then(proc_stats);

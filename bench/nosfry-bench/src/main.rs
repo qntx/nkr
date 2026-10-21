@@ -498,12 +498,13 @@ async fn fanout(
                 continue;
             }
             let text = frame.as_str();
-            if text.starts_with("[\"OK\"") {
-                if text.contains(",true,") {
-                    accepted += 1;
-                } else {
-                    rejected += 1;
-                }
+            if !text.starts_with("[\"OK\"") {
+                continue;
+            }
+            if text.contains(",true,") {
+                accepted += 1;
+            } else {
+                rejected += 1;
             }
         }
         (accepted, rejected)
