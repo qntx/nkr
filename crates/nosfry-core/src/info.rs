@@ -6,6 +6,7 @@ use serde_json::json;
 
 use crate::limits::Limits;
 use crate::message::SUB_ID_MAX_CHARS;
+use crate::moderation::Moderation;
 
 /// `[relay.info]` — NIP-11 document fields.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -31,6 +32,26 @@ impl Default for Info {
             pubkey: String::new(),
             contact: String::new(),
             icon: String::new(),
+        }
+    }
+}
+
+impl Info {
+    /// The effective relay info: the NIP-86 moderation snapshot's
+    /// `name`/`description`/`icon` override the configured values
+    /// where set.
+    #[must_use]
+    pub fn with_overrides(&self, moderation: &Moderation) -> Self {
+        Self {
+            name: moderation.name.as_deref().unwrap_or(&self.name).to_owned(),
+            description: moderation
+                .description
+                .as_deref()
+                .unwrap_or(&self.description)
+                .to_owned(),
+            pubkey: self.pubkey.clone(),
+            contact: self.contact.clone(),
+            icon: moderation.icon.as_deref().unwrap_or(&self.icon).to_owned(),
         }
     }
 }

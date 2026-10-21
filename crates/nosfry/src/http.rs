@@ -254,25 +254,7 @@ pub(crate) fn nip11(
         nips.push(86);
     }
     nips.sort_unstable();
-    let info = nosfry_core::info::Info {
-        name: moderation
-            .name
-            .as_deref()
-            .unwrap_or(&relay.info.name)
-            .to_owned(),
-        description: moderation
-            .description
-            .as_deref()
-            .unwrap_or(&relay.info.description)
-            .to_owned(),
-        pubkey: relay.info.pubkey.clone(),
-        contact: relay.info.contact.clone(),
-        icon: moderation
-            .icon
-            .as_deref()
-            .unwrap_or(&relay.info.icon)
-            .to_owned(),
-    };
+    let info = relay.info.with_overrides(moderation);
     nosfry_core::info::document(&info, &nips, limits, relay.max_websocket_payload_size)
 }
 
