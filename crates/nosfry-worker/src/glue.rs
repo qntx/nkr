@@ -264,6 +264,33 @@ impl Socket for DoSocket {
     }
 }
 
+/// One hibernated socket's decoded attachment. A missing or
+/// undecodable attachment strands only that socket — it is closed
+/// 1011 `internal error` while the rest restore normally, instead of
+/// failing the whole object.
+fn socket_attachment(ws: &WebSocket) -> Option<Attachment> {
+    if let Ok(Some(attachment)) = ws.deserialize_attachment() {
+        Some(attachment)
+    } else {
+        drop(ws.close(Some(1011), Some("internal error")));
+        None
+    }
+}
+
+/// A fresh connection id in the JavaScript-safe range, regenerated
+/// until unused — a random id could collide with a live connection
+/// and overwrite it in `conns`.
+fn fresh_conn_id<E: Executor, S: Socket>(relay: &Relay<E, S>) -> Result<u64> {
+    loop {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).map_err(|e| Error::from(e.to_string()))?;
+        let conn = u64::from_ne_bytes(bytes) & JS_MAX;
+        if !relay.is_live(conn) {
+            return Ok(conn);
+        }
+    }
+}
+
 /// The hibernatable relay: one Durable Object named `relay` holding
 /// all live connections.
 #[durable_object]
@@ -563,11 +590,7 @@ impl DurableObject for RelayObject {
             let store = SqlStore::open(DoSql { storage }).map_err(|e| e.to_string())?;
             let mut sockets = Vec::new();
             for ws in state.get_websockets() {
-                let attachment: Attachment = ws
-                    .deserialize_attachment()
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "websocket missing its attachment".to_owned())?;
-                sockets.push((DoSocket(ws), attachment));
+                sockets.extend(socket_attachment(&ws).map(|a| (DoSocket(ws), a)));
             }
             Relay::open(store, config, sockets, policy.is_some()).map_err(|e| e.to_string())
         })();
