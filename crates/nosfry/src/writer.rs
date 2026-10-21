@@ -117,8 +117,10 @@ pub(crate) fn run(
 /// (or the store error) for the waiting HTTP handler.
 fn moderate(
     store: &Store,
-    op: nosfry_lmdb::ModOp,
-    reply: tokio::sync::oneshot::Sender<Result<nosfry_lmdb::Moderation, nosfry_lmdb::StoreError>>,
+    op: nosfry_core::moderation::ModOp,
+    reply: tokio::sync::oneshot::Sender<
+        Result<nosfry_core::moderation::Moderation, nosfry_lmdb::StoreError>,
+    >,
     metrics: &Metrics,
 ) {
     let result = store.moderate(op);

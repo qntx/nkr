@@ -15,7 +15,6 @@ categories.workspace   = true
 nosfry-core.workspace        = true
 nosfry-lmdb.workspace        = true
 axum.workspace               = true
-base64.workspace             = true
 clap.workspace               = true
 faster-hex.workspace         = true
 foldhash.workspace           = true
@@ -27,7 +26,6 @@ negentropy.workspace         = true
 rlimit.workspace             = true
 serde.workspace              = true
 serde_json.workspace         = true
-sha2.workspace               = true
 thiserror.workspace          = true
 tokio.workspace              = true
 tokio-util.workspace         = true
@@ -38,10 +36,12 @@ tracing-subscriber.workspace = true
 yawc.workspace               = true
 
 [dev-dependencies]
+base64.workspace     = true
 negentropy.workspace = true
 proptest.workspace   = true
 secp256k1.workspace  = true
 serde_json.workspace = true
+sha2.workspace       = true
 tempfile.workspace   = true
 
 [lints]

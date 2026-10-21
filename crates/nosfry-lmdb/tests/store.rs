@@ -1471,64 +1471,64 @@ fn moderation_ops_round_trip() {
     // Ban with a reason; the ban drops a later-added allow entry and
     // unban leaves an allow entry untouched.
     let mut m = store
-        .moderate(nosfry_lmdb::ModOp::BanPubkey {
+        .moderate(nosfry_core::moderation::ModOp::BanPubkey {
             pubkey: pk_a,
             reason: Some("spam".into()),
         })
         .unwrap();
     assert_eq!(m.banned_pubkeys[&pk_a].as_deref(), Some("spam"));
     m = store
-        .moderate(nosfry_lmdb::ModOp::AllowPubkey {
+        .moderate(nosfry_core::moderation::ModOp::AllowPubkey {
             pubkey: pk_a,
             reason: None,
         })
         .unwrap();
     assert!(m.allowed_pubkeys.contains_key(&pk_a) && m.banned_pubkeys.is_empty());
     m = store
-        .moderate(nosfry_lmdb::ModOp::UnbanPubkey { pubkey: pk_a })
+        .moderate(nosfry_core::moderation::ModOp::UnbanPubkey { pubkey: pk_a })
         .unwrap();
     assert!(
         m.allowed_pubkeys.contains_key(&pk_a),
         "unbanpubkey leaves an allow entry"
     );
     m = store
-        .moderate(nosfry_lmdb::ModOp::UnallowPubkey { pubkey: pk_a })
+        .moderate(nosfry_core::moderation::ModOp::UnallowPubkey { pubkey: pk_a })
         .unwrap();
     assert!(m.allowed_pubkeys.is_empty());
     store
-        .moderate(nosfry_lmdb::ModOp::BanPubkey {
+        .moderate(nosfry_core::moderation::ModOp::BanPubkey {
             pubkey: pk_b,
             reason: None,
         })
         .unwrap();
     m = store
-        .moderate(nosfry_lmdb::ModOp::UnbanPubkey { pubkey: pk_b })
+        .moderate(nosfry_core::moderation::ModOp::UnbanPubkey { pubkey: pk_b })
         .unwrap();
     assert!(m.banned_pubkeys.is_empty() && m.allowed_pubkeys.is_empty());
 
     // allowkind/disallowkind swap the single state byte.
     store
-        .moderate(nosfry_lmdb::ModOp::DisallowKind { kind: 4 })
+        .moderate(nosfry_core::moderation::ModOp::DisallowKind { kind: 4 })
         .unwrap();
     m = store
-        .moderate(nosfry_lmdb::ModOp::AllowKind { kind: 4 })
+        .moderate(nosfry_core::moderation::ModOp::AllowKind { kind: 4 })
         .unwrap();
     assert!(m.allowed_kinds.contains(&4) && !m.disallowed_kinds.contains(&4));
     m = store
-        .moderate(nosfry_lmdb::ModOp::DisallowKind { kind: 4 })
+        .moderate(nosfry_core::moderation::ModOp::DisallowKind { kind: 4 })
         .unwrap();
     assert!(m.disallowed_kinds.contains(&4) && !m.allowed_kinds.contains(&4));
 
     // IPs are stored canonical; both families round-trip.
     let v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
     store
-        .moderate(nosfry_lmdb::ModOp::BlockIp {
+        .moderate(nosfry_core::moderation::ModOp::BlockIp {
             ip: v6,
             reason: Some("abuse".into()),
         })
         .unwrap();
     m = store
-        .moderate(nosfry_lmdb::ModOp::BlockIp {
+        .moderate(nosfry_core::moderation::ModOp::BlockIp {
             ip: "127.0.0.1".parse().unwrap(),
             reason: None,
         })
@@ -1536,21 +1536,21 @@ fn moderation_ops_round_trip() {
     assert!(m.ip_blocked(&v6));
     assert!(m.blocked_ips[&"127.0.0.1".parse().unwrap()].is_none());
     m = store
-        .moderate(nosfry_lmdb::ModOp::UnblockIp { ip: v6 })
+        .moderate(nosfry_core::moderation::ModOp::UnblockIp { ip: v6 })
         .unwrap();
     assert!(!m.ip_blocked(&v6));
 
     // NIP-11 overrides, including the empty-string override.
     m = store
-        .moderate(nosfry_lmdb::ModOp::SetInfo {
-            field: nosfry_lmdb::InfoField::Name,
+        .moderate(nosfry_core::moderation::ModOp::SetInfo {
+            field: nosfry_core::moderation::InfoField::Name,
             value: "ops".into(),
         })
         .unwrap();
     assert_eq!(m.name.as_deref(), Some("ops"));
     m = store
-        .moderate(nosfry_lmdb::ModOp::SetInfo {
-            field: nosfry_lmdb::InfoField::Description,
+        .moderate(nosfry_core::moderation::ModOp::SetInfo {
+            field: nosfry_core::moderation::InfoField::Description,
             value: String::new(),
         })
         .unwrap();
@@ -1568,7 +1568,7 @@ fn banevent_deletes_the_stored_event_and_survives_reopen() {
         .unwrap();
 
     let mut m = store
-        .moderate(nosfry_lmdb::ModOp::BanEvent {
+        .moderate(nosfry_core::moderation::ModOp::BanEvent {
             id: note.id(),
             reason: Some("illegal".into()),
         })
@@ -1578,13 +1578,13 @@ fn banevent_deletes_the_stored_event_and_survives_reopen() {
     assert_eq!(m.blocked_reason(&note), Some("blocked: event banned"));
     assert_eq!(m.blocked_reason(&keep), None);
     m = store
-        .moderate(nosfry_lmdb::ModOp::UnbanEvent { id: note.id() })
+        .moderate(nosfry_core::moderation::ModOp::UnbanEvent { id: note.id() })
         .unwrap();
     assert!(m.banned_events.is_empty());
 
     // The ban (and every other `mod_*` row) persists across reopen.
     store
-        .moderate(nosfry_lmdb::ModOp::BanEvent {
+        .moderate(nosfry_core::moderation::ModOp::BanEvent {
             id: keep.id(),
             reason: None,
         })
@@ -1610,7 +1610,7 @@ fn blocked_reason_enforces_bans_and_allow_lists() {
 
     // Banned author; other authors unaffected.
     m = store
-        .moderate(nosfry_lmdb::ModOp::BanPubkey {
+        .moderate(nosfry_core::moderation::ModOp::BanPubkey {
             pubkey: pk_of(&a),
             reason: None,
         })
@@ -1623,10 +1623,10 @@ fn blocked_reason_enforces_bans_and_allow_lists() {
 
     // A non-empty allow list blocks everyone not on it.
     store
-        .moderate(nosfry_lmdb::ModOp::UnbanPubkey { pubkey: pk_of(&a) })
+        .moderate(nosfry_core::moderation::ModOp::UnbanPubkey { pubkey: pk_of(&a) })
         .unwrap();
     m = store
-        .moderate(nosfry_lmdb::ModOp::AllowPubkey {
+        .moderate(nosfry_core::moderation::ModOp::AllowPubkey {
             pubkey: pk_of(&b),
             reason: None,
         })
@@ -1640,19 +1640,19 @@ fn blocked_reason_enforces_bans_and_allow_lists() {
     // disallowed kind 4; a non-empty allowed-kinds list blocks kinds
     // not on it.
     store
-        .moderate(nosfry_lmdb::ModOp::UnallowPubkey { pubkey: pk_of(&b) })
+        .moderate(nosfry_core::moderation::ModOp::UnallowPubkey { pubkey: pk_of(&b) })
         .unwrap();
     m = store
-        .moderate(nosfry_lmdb::ModOp::DisallowKind { kind: 4 })
+        .moderate(nosfry_core::moderation::ModOp::DisallowKind { kind: 4 })
         .unwrap();
     assert_eq!(m.blocked_reason(&note_b), Some("blocked: kind not allowed"));
     assert_eq!(m.blocked_reason(&note_a), None);
     m = store
-        .moderate(nosfry_lmdb::ModOp::AllowKind { kind: 4 })
+        .moderate(nosfry_core::moderation::ModOp::AllowKind { kind: 4 })
         .unwrap();
     assert_eq!(m.blocked_reason(&note_b), None, "kind 4 was allowed");
     store
-        .moderate(nosfry_lmdb::ModOp::AllowKind { kind: 1 })
+        .moderate(nosfry_core::moderation::ModOp::AllowKind { kind: 1 })
         .unwrap();
     let note_c = event(&a, 7, 100, &json!([]), "c");
     m = store.moderation().unwrap();

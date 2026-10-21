@@ -4,9 +4,10 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use nosfry_core::auth::AuthConfig;
-use nosfry_core::event::EventLimits;
+use nosfry_core::event::{EventLimits, PublicKey};
 use nosfry_core::info::Info;
 use nosfry_core::limits::{Limits, RateLimits, ReqLimits};
+use nosfry_core::management::ManagementConfig;
 use nosfry_lmdb::StoreOptions;
 use serde::Deserialize;
 
@@ -98,19 +99,9 @@ pub struct Relay {
     /// NIP-42 authentication and restricted read kinds.
     pub auth: AuthConfig,
     /// NIP-86 management API.
-    pub management: Management,
+    pub management: ManagementConfig,
     /// NIP-11 relay information.
     pub info: Info,
-}
-
-/// `[relay.management]` — the NIP-86 relay management API.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct Management {
-    /// Admin pubkeys (lowercase 64-hex) authorized for `POST /` with
-    /// `application/nostr+json+rpc`. The endpoint exists only when
-    /// non-empty, and `u`-tag checks need `[relay] service_url`.
-    pub admins: Vec<String>,
 }
 
 /// `[relay.threads]` — worker thread counts.
@@ -195,7 +186,7 @@ impl Default for Relay {
             compression: Compression::default(),
             write_policy: WritePolicy::default(),
             auth: AuthConfig::default(),
-            management: Management::default(),
+            management: ManagementConfig::default(),
             info: Info::default(),
         }
     }
@@ -249,11 +240,10 @@ impl Config {
         } else {
             Some(nosfry_core::url::RelayUrl::parse(&self.relay.service_url)?)
         };
-        for admin in &self.relay.management.admins {
-            if nosfry_core::event::PublicKey::from_hex(admin).is_none() {
-                return Err(ServerError::Admins(admin.clone()));
-            }
-        }
+        self.relay
+            .management
+            .admin_keys()
+            .map_err(|e| ServerError::Admins(e.0))?;
         Ok(Limits {
             event: self.events,
             req: self.relay.limits,
@@ -264,6 +254,22 @@ impl Config {
                 self.relay.auth.restrict_read_to_involved,
             )),
         })
+    }
+
+    /// Parsed `[relay.management] admins` for a `Live` snapshot —
+    /// `load` already rejected malformed entries, so this cannot
+    /// fail on a loaded config.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Admins`] on a malformed entry.
+    pub(crate) fn admins(&self) -> Result<std::sync::Arc<[PublicKey]>, ServerError> {
+        Ok(self
+            .relay
+            .management
+            .admin_keys()
+            .map_err(|e| ServerError::Admins(e.0))?
+            .into())
     }
 
     /// `StoreOptions` assembled from `[db]`.

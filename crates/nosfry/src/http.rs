@@ -10,7 +10,7 @@ use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, get};
-use nosfry_lmdb::Moderation;
+use nosfry_core::moderation::Moderation;
 use tokio::sync::watch;
 use yawc::{IncomingUpgrade, Options};
 
