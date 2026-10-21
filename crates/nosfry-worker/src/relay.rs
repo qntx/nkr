@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use nosfry_core::auth::{AUTH_KIND, ReadGate};
@@ -188,6 +189,11 @@ pub struct Relay<E: Executor, S: Socket> {
     /// Total bytes the open negentropy sessions have reserved against
     /// `[relay] max_sync_memory_bytes` (`0` = unlimited).
     sync_reserved: usize,
+    /// The filters-JSON bytes each live subscription charges against
+    /// `[worker] max_subscription_bytes` (`0` = unlimited).
+    sub_bytes: HashMap<u64, HashMap<SubId, usize>>,
+    /// The total `sub_bytes` charges.
+    subs_bytes: usize,
 }
 
 impl<E: Executor, S: Socket> Relay<E, S> {
@@ -232,6 +238,8 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             policy,
             negs: HashMap::new(),
             sync_reserved: 0,
+            sub_bytes: HashMap::new(),
+            subs_bytes: 0,
         };
         for (socket, attachment) in sockets {
             if attachment.conn > JS_MAX {
@@ -381,11 +389,15 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     }
 
     /// Drop a connection: remove its subscriptions from the monitor
-    /// index, delete its `subs` rows, release its negentropy
-    /// reservations, and release its share of the address buckets.
+    /// index, delete its `subs` rows, release its subscription byte
+    /// charges and negentropy reservations, and release its share of
+    /// the address buckets.
     pub fn close(&mut self, conn: u64) {
         self.drop_conn_negs(conn);
         self.monitors.remove_connection(conn);
+        if let Some(subs) = self.sub_bytes.remove(&conn) {
+            self.subs_bytes -= subs.values().sum::<usize>();
+        }
         self.exec("DELETE FROM subs WHERE conn = ?1", &[int(conn)]);
         let Some(c) = self.conns.remove(&conn) else {
             return;
@@ -923,9 +935,11 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
     }
 
-    /// A `REQ`: stream the stored hits then `EOSE`, register the
-    /// monitor, and persist the subscription — only a subscription
-    /// that survived its `EOSE` reaches the `subs` table.
+    /// A `REQ`: refuse subscriptions that would cross the
+    /// `[worker] max_subscription_bytes` budget, stream the stored
+    /// hits then `EOSE`, register the monitor, and persist the
+    /// subscription — only a subscription that survived its `EOSE`
+    /// reaches the `subs` table.
     fn subscribe(
         &mut self,
         conn: u64,
@@ -934,6 +948,24 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         gate: ReadGate,
         now: u64,
     ) {
+        let filters_json = format!(
+            "[{}]",
+            filters
+                .iter()
+                .map(Filter::to_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if !self.sub_fits(conn, &sub.id, filters_json.len()) {
+            self.send(
+                conn,
+                &closed_frame(&sub.id, "blocked: subscription capacity exhausted"),
+            );
+            if let Some(c) = self.conns.get_mut(&conn) {
+                c.session.close_by_relay(&sub);
+            }
+            return;
+        }
         // EVENTs go out from the scan's sink, so a REQ never holds
         // more than one chunk of payloads.
         let conns = &self.conns;
@@ -962,14 +994,6 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             .get(&conn)
             .map_or(0, |c| c.session.authenticated().len());
         let authed = u64::try_from(authed).unwrap_or(u64::MAX);
-        let filters_json = format!(
-            "[{}]",
-            filters
-                .iter()
-                .map(Filter::to_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        );
         let persisted = self
             .store
             .exec()
@@ -986,6 +1010,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             )
             .is_ok();
         if persisted {
+            self.charge_sub(conn, &sub.id, filters_json.len());
             self.monitors.insert(conn, sub, filters, gate);
         } else {
             self.send(conn, &closed_frame(&sub.id, "error: internal error"));
@@ -1028,14 +1053,59 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
     }
 
-    /// A `CLOSE` (or a relay-side unsubscribe): drop the monitor and
-    /// the persisted row.
+    /// A `CLOSE` (or a relay-side unsubscribe): drop the monitor,
+    /// the persisted row, and the byte charge.
     fn unsubscribe(&mut self, conn: u64, sub_id: &SubId) {
         self.monitors.remove(conn, sub_id);
+        self.release_sub(conn, sub_id);
         self.exec(
             "DELETE FROM subs WHERE conn = ?1 AND sub_id = ?2",
             &[int(conn), Param::Text(sub_id.as_str())],
         );
+    }
+
+    /// Whether charging `bytes` to `(conn, id)` stays within
+    /// `[worker] max_subscription_bytes` (`0` = unlimited);
+    /// re-subscribing an id replaces its earlier charge.
+    fn sub_fits(&self, conn: u64, id: &SubId, bytes: usize) -> bool {
+        let budget = self.config.worker.max_subscription_bytes;
+        if budget == 0 {
+            return true;
+        }
+        let current = self
+            .sub_bytes
+            .get(&conn)
+            .and_then(|subs| subs.get(id))
+            .copied()
+            .unwrap_or(0);
+        self.subs_bytes - current + bytes <= budget
+    }
+
+    /// Charge `bytes` to `(conn, id)` — run [`Relay::sub_fits`]
+    /// first.
+    fn charge_sub(&mut self, conn: u64, id: &SubId, bytes: usize) {
+        if let Some(old) = self
+            .sub_bytes
+            .entry(conn)
+            .or_default()
+            .insert(id.clone(), bytes)
+        {
+            self.subs_bytes -= old;
+        }
+        self.subs_bytes += bytes;
+    }
+
+    /// Release `(conn, id)`'s charge, if any.
+    fn release_sub(&mut self, conn: u64, id: &SubId) {
+        let Some(subs) = self.sub_bytes.get_mut(&conn) else {
+            return;
+        };
+        if let Some(bytes) = subs.remove(id) {
+            self.subs_bytes -= bytes;
+        }
+        if subs.is_empty() {
+            self.sub_bytes.remove(&conn);
+        }
     }
 
     /// Decode a live connection's `subs` row and re-register it in
@@ -1043,7 +1113,13 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     /// generation and a REQ-time read gate (`authed` counts the
     /// pubkeys that had authenticated when the REQ arrived; pubkeys
     /// only append, so the prefix is exact). `None` on a corrupt row.
-    fn decode_sub(&mut self, row: &[Value]) -> Option<(SubKey, Arc<[Filter]>, ReadGate)> {
+    /// A free-standing function so `restore_subs` can call it inside
+    /// the row callback while the executor holds `self.store`.
+    fn decode_sub(
+        conns: &mut HashMap<u64, Conn<S>>,
+        limits: &Arc<Limits>,
+        row: &[Value],
+    ) -> Option<(SubKey, Arc<[Filter]>, ReadGate)> {
         let uint = |i: usize| match row.get(i) {
             Some(Value::Int(v)) if *v >= 0 => u64::try_from(*v).ok(),
             _ => None,
@@ -1059,54 +1135,106 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             parsed.push(Filter::from_raw(raw).ok()?);
         }
         let authed = uint(3)?;
-        let c = self.conns.get_mut(&conn)?;
+        let c = conns.get_mut(&conn)?;
         let key = c.session.resume_sub(sub_id);
         let keys = c.session.authenticated();
         let n = usize::try_from(authed)
             .unwrap_or(usize::MAX)
             .min(keys.len());
         let gate = ReadGate::new(
-            Arc::clone(&self.limits.auth),
+            Arc::clone(&limits.auth),
             keys.get(..n).unwrap_or(&[]).into(),
         );
         Some((key, parsed.into(), gate))
     }
 
-    /// Reload every `subs` row: live connections get their
-    /// subscription back, stale and corrupt rows are deleted. Only
-    /// executor failures abort the open.
+    /// One streamed `subs` row: resume the subscription and charge
+    /// its filters-JSON length against the budget, or answer the
+    /// row's primary key when it should be deleted — over-budget or
+    /// corrupt state is dropped, never a reason to brick the open.
+    fn restore_row(
+        row: &[Value],
+        conns: &mut HashMap<u64, Conn<S>>,
+        limits: &Arc<Limits>,
+        monitors: &mut Monitors<u64>,
+        sub_bytes: &mut HashMap<u64, HashMap<SubId, usize>>,
+        subs_bytes: &mut usize,
+        budget: usize,
+    ) -> Option<(u64, String)> {
+        let (conn, sub_id) = sub_pk(row)?;
+        let bytes = match row.get(2) {
+            Some(Value::Text(s)) => s.len(),
+            _ => usize::MAX,
+        };
+        let keep = (budget == 0 || bytes <= budget.saturating_sub(*subs_bytes))
+            .then(|| Self::decode_sub(conns, limits, row))
+            .flatten();
+        let Some((key, filters, gate)) = keep else {
+            return Some((conn, sub_id));
+        };
+        *subs_bytes += bytes;
+        sub_bytes
+            .entry(conn)
+            .or_default()
+            .insert(key.id.clone(), bytes);
+        monitors.insert(conn, key, filters, gate);
+        None
+    }
+
+    /// Reload the live connections' `subs` rows. One statement
+    /// deletes the rows of connections that are not live (a crash or
+    /// deploy strands them) before any row is read, then each
+    /// remaining row streams through decode into the monitor index —
+    /// the set never materializes, so a huge table cannot OOM the
+    /// wake into a crash loop. Rows charge
+    /// `[worker] max_subscription_bytes` the same as a REQ; rows
+    /// over the budget and corrupt rows are deleted. Only executor
+    /// failures abort the open.
     fn restore_subs(&mut self) -> Result<(), RelayError> {
-        let mut rows = Vec::new();
+        let live = format!(
+            "[{}]",
+            self.conns
+                .keys()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
         self.store
             .exec()
-            .query(
-                "SELECT conn, sub_id, filters, authed FROM subs",
-                &[],
-                &mut |row| {
-                    rows.push(row);
-                    core::ops::ControlFlow::Continue(())
-                },
+            .execute(
+                "DELETE FROM subs WHERE conn NOT IN (SELECT value FROM json_each(?1))",
+                &[Param::Text(&live)],
             )
             .map_err(|err| StoreError::Sql(Box::new(err)))?;
-        for row in rows {
-            // A row that cannot be decoded is corrupt state, not a
-            // reason to brick the object: delete it and move on. Only
-            // the executor failure above aborts the open.
-            let Some((conn, sub_id)) = sub_pk(&row) else {
-                continue;
-            };
-            let keep = self
-                .conns
-                .contains_key(&conn)
-                .then(|| self.decode_sub(&row))
-                .flatten();
-            match keep {
-                Some((key, filters, gate)) => self.monitors.insert(conn, key, filters, gate),
-                None => self.exec(
-                    "DELETE FROM subs WHERE conn = ?1 AND sub_id = ?2",
-                    &[int(conn), Param::Text(&sub_id)],
-                ),
-            }
+        let budget = self.config.worker.max_subscription_bytes;
+        let mut doomed = Vec::new();
+        {
+            // Row-at-a-time decode: the callback borrows the fields it
+            // touches so `self.store` can stay borrowed by the query.
+            let conns = &mut self.conns;
+            let limits = &self.limits;
+            let monitors = &mut self.monitors;
+            let sub_bytes = &mut self.sub_bytes;
+            let subs_bytes = &mut self.subs_bytes;
+            self.store
+                .exec()
+                .query(
+                    "SELECT conn, sub_id, filters, authed FROM subs",
+                    &[],
+                    &mut |row| {
+                        doomed.extend(Self::restore_row(
+                            &row, conns, limits, monitors, sub_bytes, subs_bytes, budget,
+                        ));
+                        ControlFlow::Continue(())
+                    },
+                )
+                .map_err(|err| StoreError::Sql(Box::new(err)))?;
+        }
+        for (conn, sub_id) in doomed {
+            self.exec(
+                "DELETE FROM subs WHERE conn = ?1 AND sub_id = ?2",
+                &[int(conn), Param::Text(&sub_id)],
+            );
         }
         Ok(())
     }
