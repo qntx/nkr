@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use negentropy::{Id, Negentropy, NegentropyStorageVector};
 use nosfry_core::event::EventId;
 use nosfry_core::hll::Hll;
 use nosfry_core::message::{
@@ -14,6 +13,7 @@ use nosfry_core::message::{
     neg_err_frame_with_limit, neg_msg_frame,
 };
 use nosfry_core::session::SubKey;
+use nosfry_core::sync::{self, NegentropyStorageVector};
 use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreError};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::watch;
@@ -30,16 +30,9 @@ const CHUNK_FRAMES: usize = 64;
 /// Accounted bytes per `Out::Frames` chunk.
 const CHUNK_BYTES: usize = 256 * 1024;
 
-/// Reconcile output cap per `NEG-MSG` (strfry `frameSizeLimit`).
-const NEG_FRAME_LIMIT: u64 = 500_000;
-
 /// A sync session without a `NEG-MSG` for this long is dropped with
 /// `closed: idle timeout`.
 const NEG_IDLE: Duration = Duration::from_secs(60);
-
-/// Bytes charged per stored record against the sync memory budget:
-/// the sealed vector's 40-byte `(created_at, id)` item.
-const SYNC_RECORD_BYTES: usize = 40;
 
 /// foldhash for the sync map (client-controlled sub ids), like the
 /// shard's maps.
@@ -407,7 +400,7 @@ fn finish_neg(
         });
         return;
     }
-    let reserved = records.len() * SYNC_RECORD_BYTES;
+    let reserved = records.len() * sync::SYNC_RECORD_BYTES;
     if !reserve_sync(tuning, reserved) {
         out.push(Out::Neg {
             sub: sub.clone(),
@@ -416,12 +409,18 @@ fn finish_neg(
         });
         return;
     }
-    let opened = build_storage(&records)
-        .map_err(|()| NegError::Internal)
+    let opened = sync::build_storage(&records)
+        .map_err(|err| {
+            tracing::error!(%err, "sync vector build failed");
+            NegError::Internal
+        })
         .and_then(|storage| {
-            reconcile(&storage, &msg)
+            sync::reconcile(&storage, &msg)
                 .map(|reply| (storage, reply))
-                .ok_or(NegError::Invalid)
+                .map_err(|err| {
+                    tracing::debug!(%err, "negentropy reconcile failed");
+                    NegError::Invalid
+                })
         });
     match opened {
         // NIP-77 answers every client message: `reconcile` always
@@ -468,34 +467,6 @@ fn push_neg_err(conn: ConnId, sub: &SubKey, out: &Outbound, err: NegError) {
     });
 }
 
-/// Seal `records` into a `NegentropyStorageVector`.
-fn build_storage(records: &[(u64, EventId)]) -> Result<NegentropyStorageVector, ()> {
-    let mut storage = NegentropyStorageVector::with_capacity(records.len());
-    for (created_at, id) in records {
-        storage
-            .insert(*created_at, Id::from_byte_array(id.0))
-            .map_err(|err| {
-                tracing::error!(%err, "sync vector insert failed");
-            })?;
-    }
-    storage.seal().map_err(|err| {
-        tracing::error!(%err, "sync vector seal failed");
-    })?;
-    Ok(storage)
-}
-
-/// One reconcile round on a sealed storage — a fresh `Negentropy`
-/// per message, like strfry. Wire errors are logged, never exposed.
-fn reconcile(storage: &NegentropyStorageVector, msg: &[u8]) -> Option<Vec<u8>> {
-    Negentropy::borrowed(storage, NEG_FRAME_LIMIT)
-        .and_then(|mut neg| neg.reconcile(msg))
-        .map_err(|err| {
-            tracing::debug!(%err, "negentropy reconcile failed");
-            err
-        })
-        .ok()
-}
-
 /// Reserve `bytes` on the shared sync-memory budget; `false` rolls
 /// the reservation back.
 fn reserve_sync(tuning: &Tuning, bytes: usize) -> bool {
@@ -520,9 +491,14 @@ fn neg_msg(
 ) {
     let key = (conn, sub.id.clone());
     let reply = match work.negs.get_mut(&key) {
-        Some(session) if session.generation == sub.generation => reconcile(&session.storage, msg)
-            .inspect(|_| session.last_active = Instant::now())
-            .ok_or(NegError::Invalid),
+        Some(session) if session.generation == sub.generation => {
+            sync::reconcile(&session.storage, msg)
+                .inspect(|_| session.last_active = Instant::now())
+                .map_err(|err| {
+                    tracing::debug!(%err, "negentropy reconcile failed");
+                    NegError::Invalid
+                })
+        }
         _ => Err(NegError::Unknown),
     };
     match reply {
