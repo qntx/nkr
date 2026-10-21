@@ -23,10 +23,11 @@ use std::sync::Arc;
 use nosfry_core::auth::ReadGate;
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
+use nosfry_core::hll::Hll;
 use nosfry_core::store::WriteOutcome;
 use nosfry_sql::rusqlite::Connection;
 use nosfry_sql::{Executor, SqlStore, Value};
-use nosfry_testkit::driver::{StoreDriver, build_case, check};
+use nosfry_testkit::driver::{Count, StoreDriver, build_case, check};
 use nosfry_testkit::spec::{event_spec_strategy, filter_spec_strategy};
 use proptest::prelude::*;
 
@@ -71,6 +72,24 @@ impl StoreDriver for SqlDriver {
             .iter()
             .map(|hit| hit.json.to_string())
             .collect()
+    }
+
+    fn count(
+        &mut self,
+        filters: Arc<[Filter]>,
+        gate: &ReadGate,
+        _snapshot: u64,
+        now: u64,
+    ) -> Count {
+        let result = self
+            .store
+            .count(&filters, gate, now, usize::MAX, Hll::for_filters(&filters))
+            .unwrap();
+        Count {
+            count: result.count,
+            approximate: result.approximate,
+            hll: result.hll,
+        }
     }
 
     fn expire(&mut self, now: u64) {

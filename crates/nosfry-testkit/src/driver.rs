@@ -6,12 +6,13 @@ use std::sync::Arc;
 use nosfry_core::auth::{AuthRules, ReadGate};
 use nosfry_core::event::{Event, PublicKey};
 use nosfry_core::filter::Filter;
-use nosfry_core::sign::keys;
+use nosfry_core::hll::Hll;
+use nosfry_core::sign::{keys, pubkey_hex};
 use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 use proptest::prelude::*;
 
-use crate::model::{Model, model_expire, model_scan, model_store};
+use crate::model::{Model, model_expire, model_scan, model_store, model_union};
 use crate::spec::{EventSpec, FilterSpec, build_event, filter_json};
 
 /// One event store under test. Implementations translate each call
@@ -35,8 +36,27 @@ pub trait StoreDriver {
         now: u64,
     ) -> Vec<String>;
 
+    /// The union `filters` match at `snapshot`/`now` under `gate`,
+    /// counted — a filter `limit` does not apply. `Hll::for_filters`
+    /// decides sketch eligibility; the driver runs its count
+    /// uncapped and to completion.
+    fn count(&mut self, filters: Arc<[Filter]>, gate: &ReadGate, snapshot: u64, now: u64) -> Count;
+
     /// Sweep events expired at `now`.
     fn expire(&mut self, now: u64);
+}
+
+/// The count [`StoreDriver::count`] reports, mirrored per store.
+#[derive(Debug)]
+pub struct Count {
+    /// Events counted (the exact union, or a partial count when
+    /// `approximate`).
+    pub count: u64,
+    /// `true` when the store's budget stopped the count early.
+    pub approximate: bool,
+    /// The HLL registers of counted authors, when the query was
+    /// eligible for a sketch.
+    pub hll: Option<[u8; 256]>,
 }
 
 /// A fully materialized differential case: the events to store, the
@@ -227,8 +247,90 @@ pub fn check(store: &mut impl StoreDriver, case: &Case) -> Result<Aftermath, Tes
     );
     prop_assert_eq!(got_swept, expected_swept);
 
+    count_checks(store, case, &stored, swept, &gate);
+
     Ok(Aftermath {
         model: stored,
         snapshot,
     })
+}
+
+/// The COUNT assertions of [`check`]: the union under an open and a
+/// restricted gate, plus the HLL sketch of an eligible filter set.
+///
+/// # Panics
+///
+/// Panics on any divergence — a failure fails the proptest case.
+fn count_checks(
+    store: &mut impl StoreDriver,
+    case: &Case,
+    stored: &Model,
+    swept: u64,
+    gate: &ReadGate,
+) {
+    // COUNT ignores `limit`: it must equal the deduplicated union a
+    // limit-less scan returns.
+    let unlimited: Arc<[Filter]> = Arc::from(
+        case.filter_specs
+            .iter()
+            .map(|s| {
+                let mut json = filter_json(s, &case.ids);
+                json.remove("limit");
+                Filter::parse(&serde_json::to_string(&json).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>(),
+    );
+    let union = model_union(
+        &stored.stored,
+        &unlimited,
+        swept,
+        &ReadGate::default(),
+        case.now2,
+    );
+    let counted = store.count(
+        Arc::clone(&unlimited),
+        &ReadGate::default(),
+        swept,
+        case.now2,
+    );
+    assert!(!counted.approximate, "uncapped count marked approximate");
+    assert_eq!(counted.count, union as u64, "count != model union");
+
+    let union_gated = model_union(&stored.stored, &unlimited, swept, gate, case.now2);
+    let counted_gated = store.count(unlimited, gate, swept, case.now2);
+    assert!(
+        !counted_gated.approximate,
+        "uncapped count marked approximate"
+    );
+    assert_eq!(
+        counted_gated.count, union_gated as u64,
+        "gated count != model union"
+    );
+
+    // An HLL-eligible COUNT (one filter, one tag condition, one
+    // value) returns exactly the sketch the model computes over the
+    // union's authors.
+    let eligible: Arc<[Filter]> = Arc::from(vec![
+        Filter::parse(&format!("{{\"#p\":[\"{}\"]}}", pubkey_hex(0))).unwrap(),
+    ]);
+    let mut sketch = Hll::for_filters(&eligible)
+        .unwrap_or_else(|| panic!("single tag-value filter set is HLL-eligible"));
+    let mut hits = 0u64;
+    for (seq, ev) in &stored.stored {
+        if *seq <= swept
+            && ev.expiration().is_none_or(|exp| exp > case.now2)
+            && eligible[0].matches(ev.packed())
+        {
+            sketch.add(&ev.pubkey());
+            hits += 1;
+        }
+    }
+    let sketched = store.count(eligible, &ReadGate::default(), swept, case.now2);
+    assert!(!sketched.approximate, "uncapped count marked approximate");
+    assert_eq!(sketched.count, hits, "eligible count != model union");
+    assert_eq!(
+        sketched.hll,
+        Some(*sketch.registers()),
+        "hll registers != model sketch"
+    );
 }
