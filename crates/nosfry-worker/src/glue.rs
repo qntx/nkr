@@ -338,9 +338,7 @@ impl RelayObject {
             if !relay.admits(ip) {
                 return Response::error("too many connections", 503);
             }
-            let mut bytes = [0u8; 8];
-            getrandom::fill(&mut bytes).map_err(|e| Error::from(e.to_string()))?;
-            let conn = u64::from_ne_bytes(bytes) & JS_MAX;
+            let conn = fresh_conn_id(relay)?;
             let mut challenge_bytes = [0u8; 32];
             getrandom::fill(&mut challenge_bytes).map_err(|e| Error::from(e.to_string()))?;
             let challenge = faster_hex::hex_string(&challenge_bytes);
