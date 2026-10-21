@@ -1,0 +1,23 @@
+[package]
+name                   = "nosfry-testkit"
+description            = "Shared reference model and differential drivers for the nosfry event stores"
+publish                = false
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+readme.workspace       = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+nosfry-core          = { workspace = true, features = ["test-util"] }
+proptest.workspace   = true
+serde_json.workspace = true
+
+[dev-dependencies]
+nosfry-lmdb.workspace = true
+tempfile.workspace    = true
+
+[lints]
+workspace = true

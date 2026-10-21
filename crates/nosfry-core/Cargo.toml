@@ -21,6 +21,11 @@ thiserror.workspace  = true
 foldhash.workspace   = true
 slab.workspace       = true
 
+[features]
+# Deterministic event signers for tests and benches only; never
+# enable in production builds.
+test-util = []
+
 [dev-dependencies]
 proptest.workspace  = true
 criterion.workspace = true

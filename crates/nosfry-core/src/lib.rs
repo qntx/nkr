@@ -27,5 +27,7 @@ pub mod message;
 pub mod monitor;
 pub mod packed;
 pub mod session;
+#[cfg(feature = "test-util")]
+pub mod sign;
 pub mod store;
 pub mod url;

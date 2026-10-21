@@ -1,32 +1,56 @@
-//! Shared test helpers: deterministic event signer.
+//! Deterministic event signers.
+//!
+//! A fixed key pool and a canonical JSON builder that parses and
+//! verifies every event it makes. Test and tooling support — the
+//! stores and the differential suite share these helpers.
 
 #![allow(
-    dead_code,
     clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
     clippy::indexing_slicing,
-    missing_docs,
-    unreachable_pub,
-    reason = "test helpers may panic and are only partially used per binary"
+    reason = "deterministic test signers: a failure is a caller bug"
 )]
 
 use std::sync::Arc;
 
-use nosfry_core::event::{Event, EventLimits, UnverifiedEvent};
 use secp256k1::{Keypair, SecretKey, schnorr};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::event::{Event, EventLimits, UnverifiedEvent};
+
 /// A fixed secret key derived from a small integer.
+///
+/// # Panics
+///
+/// Panics when the byte string is not a valid secret key; every
+/// nonzero `n` produces one, so this is unreachable.
+#[must_use]
 pub fn key(n: u8) -> Keypair {
     let mut bytes = [0u8; 32];
     bytes[31] = n.max(1);
     Keypair::from_secret_key(&SecretKey::from_secret_bytes(bytes).unwrap())
 }
 
+/// The shared pool of signers (small, so filters overlap).
+#[must_use]
+pub fn keys() -> Vec<Keypair> {
+    (1..=4u8).map(key).collect()
+}
+
+/// The hex of pool signer `i`'s public key.
+#[must_use]
+pub fn pubkey_hex(i: usize) -> String {
+    format!("{}", keys()[i].x_only_public_key().0)
+}
+
 /// Build a signed, verified event. `tags` is a JSON value like
 /// `json!([["t","abc"]])`.
+///
+/// # Panics
+///
+/// Panics when `tags` is not a tags array or the event fails to
+/// verify — both are caller bugs in test code.
+#[must_use]
 pub fn event(
     keypair: &Keypair,
     kind: u16,
