@@ -5,7 +5,8 @@
 #   file <out>/soak-<label>.jsonl (default "soak").
 # Env: DURATION (default 1800 s), SAMPLE (default 60 s),
 #      PUBLISHERS 8, RATE 200 events/s total, SUBSCRIBERS 200,
-#      CHURN_RATE 10 conns/s, SLOW_EVERY 60 s.
+#      CHURN_RATE 10 conns/s, SLOW_EVERY 60 s, NEG_EVERY 10 s,
+#      VANISH_EVERY 60 s.
 # The relay is pinned to cores 0-3 and the harness to cores 4-9, like
 # every other bench script on this box.
 set -euo pipefail
@@ -21,6 +22,8 @@ RATE="${RATE:-200}"
 SUBSCRIBERS="${SUBSCRIBERS:-200}"
 CHURN_RATE="${CHURN_RATE:-10}"
 SLOW_EVERY="${SLOW_EVERY:-60}"
+NEG_EVERY="${NEG_EVERY:-10}"
+VANISH_EVERY="${VANISH_EVERY:-60}"
 PORT=17777
 DIR="$BENCH/work/soak-$LABEL"
 
@@ -88,6 +91,8 @@ taskset -c 4-9 "$HARNESS" soak \
     --subscribers "$SUBSCRIBERS" \
     --churn-rate "$CHURN_RATE" \
     --slow-every-secs "$SLOW_EVERY" \
+    --neg-every-secs "$NEG_EVERY" \
+    --vanish-every-secs "$VANISH_EVERY" \
     --label "$LABEL" \
     > "$OUT/soak-$LABEL.jsonl" \
     2> "$DIR/harness.log" || true

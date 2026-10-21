@@ -14,11 +14,17 @@ Criteria (fixed before any run was analyzed):
 - connections: the relay gauge never exceeds publishers + subscribers + 50
   and ends within publishers + subscribers + 20 (slow consumers and churn
   are reaped);
-- errors: zero harness errors, zero failed churn queries, zero
-  subscriber reconnects, every OK accepted, relay exit status 0.
+- errors: zero harness errors, zero failed churn queries, COUNTs, sync
+  sessions and vanish rounds, zero subscriber reconnects, every OK
+  accepted, relay exit status 0.
 - outbound: once every harness connection is closed, the relay's
   `nosfry_outbound_pending_bytes` gauge reads 0 (no queued bytes stay
   charged to closed connections; added 2026-10-21 before the definitive run).
+- sync: once every harness connection is closed, `nosfry_sync_memory_bytes`
+  reads 0 (no negentropy reservation outlives its connection; added
+  2026-10-21 before the definitive run).
+- coverage: churn queries, COUNTs, sync sessions and vanish rounds all
+  completed at least once (the run exercised every workload).
 """
 
 import argparse
@@ -115,6 +121,9 @@ def main():
     failures = {
         "errors": counts.get("errors", 0),
         "churn_failed": counts.get("churn_failed", 0),
+        "count_failed": counts.get("count_failed", 0),
+        "neg_failed": counts.get("neg_failed", 0),
+        "vanish_failed": counts.get("vanish_failed", 0),
         "sub_reconnects": counts.get("sub_reconnects", 0),
     }
     drained = end.get("outbound_pending_after_close") if end else None
@@ -125,6 +134,16 @@ def main():
         f"{drained if end else 'run not finished'} bytes, "
         f"last sample {post[-1].get('outbound_pending')} bytes",
     ))
+    sync_drained = end.get("sync_memory_after_close") if end else None
+    checks.append((
+        "sync",
+        sync_drained == 0,
+        f"sync memory after all connections closed: "
+        f"{sync_drained if end else 'run not finished'} bytes, "
+        f"last sample {post[-1].get('sync_memory')} bytes",
+    ))
+    coverage = {k: counts.get(k, 0) for k in ("churn_done", "count_done", "neg_done", "vanish_done")}
+    checks.append(("coverage", all(coverage.values()), f"{coverage}"))
     checks.append((
         "errors",
         not any(failures.values()) and not rejected and exit_status == 0,
@@ -135,6 +154,9 @@ def main():
           f"{args.warmup_secs:.0f} s warm-up")
     print(f"load: {sum(ok.values())} OKs, {counts.get('deliveries', 0)} deliveries, "
           f"{counts.get('churn_done', 0)} churn queries, "
+          f"{counts.get('count_done', 0)} COUNTs, "
+          f"{counts.get('neg_done', 0)} syncs, "
+          f"{counts.get('vanish_done', 0)} vanish rounds, "
           f"{counts.get('slow_spawned', 0)} slow consumers")
     for name, passed, detail in checks:
         print(f"{'PASS' if passed else 'FAIL'} {name}: {detail}")
