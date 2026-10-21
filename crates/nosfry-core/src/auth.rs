@@ -8,6 +8,8 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
+
 use crate::event::PublicKey;
 use crate::filter::Filter;
 use crate::kind::Kind;
@@ -20,6 +22,28 @@ pub const AUTH_KIND: Kind = Kind(22242);
 /// Maximum distinct pubkeys a connection may authenticate (NIP-42
 /// treats every authenticated pubkey as valid for the connection).
 pub const MAX_AUTHED_PUBKEYS: usize = 8;
+
+/// `[relay.auth]` — NIP-42 restricted read kinds (strfry
+/// `relay.auth.*`; the URL is the relay's `service_url`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AuthConfig {
+    /// Kinds served only to authenticated readers.
+    pub restricted_read_kinds: Vec<u16>,
+    /// Restricted kinds are served only to authenticated pubkeys
+    /// involved in the event (author or `p` tag); `false` serves them
+    /// to any authenticated reader.
+    pub restrict_read_to_involved: bool,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            restricted_read_kinds: vec![4, 1059],
+            restrict_read_to_involved: true,
+        }
+    }
+}
 
 /// Authentication configuration: the relay's own service URL and the
 /// read-side restrictions.

@@ -11,7 +11,6 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, get};
 use nosfry_lmdb::Moderation;
-use serde_json::json;
 use tokio::sync::watch;
 use yawc::{IncomingUpgrade, Options};
 
@@ -232,10 +231,14 @@ fn client_ip(config: &Config, headers: &header::HeaderMap, peer: IpAddr) -> IpAd
 }
 
 /// The NIP-11 relay information document, serialized once at startup
-/// (it is static for the process lifetime). `description`, `pubkey`,
-/// `contact`, and `icon` are optional and omitted when empty; `name`
-/// stays unconditionally.
-pub(crate) fn nip11(config: &Config, moderation: &Moderation) -> String {
+/// (it is static for the process lifetime). The NIP list follows the
+/// configured features; the NIP-86 moderation snapshot overrides
+/// `name`/`description`/`icon` through an effective [`Info`].
+pub(crate) fn nip11(
+    config: &Config,
+    limits: &nosfry_core::limits::Limits,
+    moderation: &Moderation,
+) -> String {
     let relay = &config.relay;
     let mut nips = vec![1, 9, 11, 40, 62, 70];
     if relay.limits.max_filter_limit_count > 0 {
@@ -251,47 +254,26 @@ pub(crate) fn nip11(config: &Config, moderation: &Moderation) -> String {
         nips.push(86);
     }
     nips.sort_unstable();
-    let mut doc = json!({
-        "name": moderation.name.as_deref().unwrap_or(&relay.info.name),
-        "supported_nips": nips,
-        "software": "https://github.com/qntx/nosfry",
-        "version": env!("CARGO_PKG_VERSION"),
-        "limitation": {
-            "max_message_length": relay.max_websocket_payload_size,
-            "max_subscriptions": relay.limits.max_subs_per_connection,
-            "max_limit": relay.limits.max_filter_limit,
-            "default_limit": relay.limits.max_filter_limit,
-            "max_subid_length": nosfry_core::message::SUB_ID_MAX_CHARS,
-            "max_event_tags": config.events.max_num_tags,
-            "created_at_lower_limit": config.events.reject_events_older_than_seconds,
-            "created_at_upper_limit": config.events.reject_events_newer_than_seconds,
-            "auth_required": false,
-            "restricted_writes": false,
-            "payment_required": false,
-        },
-    });
-    if let Some(map) = doc.as_object_mut() {
-        for (key, value) in [
-            (
-                "description",
-                moderation
-                    .description
-                    .as_deref()
-                    .unwrap_or(&relay.info.description),
-            ),
-            ("pubkey", relay.info.pubkey.as_str()),
-            ("contact", relay.info.contact.as_str()),
-            (
-                "icon",
-                moderation.icon.as_deref().unwrap_or(&relay.info.icon),
-            ),
-        ] {
-            if !value.is_empty() {
-                map.insert(key.to_owned(), json!(value));
-            }
-        }
-    }
-    doc.to_string()
+    let info = nosfry_core::info::Info {
+        name: moderation
+            .name
+            .as_deref()
+            .unwrap_or(&relay.info.name)
+            .to_owned(),
+        description: moderation
+            .description
+            .as_deref()
+            .unwrap_or(&relay.info.description)
+            .to_owned(),
+        pubkey: relay.info.pubkey.clone(),
+        contact: relay.info.contact.clone(),
+        icon: moderation
+            .icon
+            .as_deref()
+            .unwrap_or(&relay.info.icon)
+            .to_owned(),
+    };
+    nosfry_core::info::document(&info, &nips, limits, relay.max_websocket_payload_size)
 }
 
 #[cfg(test)]
