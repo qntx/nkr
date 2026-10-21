@@ -7,11 +7,12 @@ use nosfry_core::auth::ReadGate;
 use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, UnverifiedEvent, supersedes};
 use nosfry_core::filter::Filter;
+use nosfry_core::hll::Hll;
 use nosfry_core::packed::PackedRef;
 use nosfry_core::store::WriteOutcome;
 
 use crate::exec::{Executor, Param, Value};
-use crate::{Scan, StoreError};
+use crate::{Count, Scan, StoreError};
 
 /// The on-disk schema version `meta.format` must hold.
 pub const FORMAT_VERSION: i64 = 1;
@@ -198,6 +199,28 @@ impl<E: Executor> SqlStore<E> {
         max_rows: usize,
     ) -> Result<Scan, StoreError> {
         crate::scan::scan(&self.exec, filters, gate, now, max_limit, max_rows)
+    }
+
+    /// The number of stored events `filters` match under `gate` —
+    /// the union a `query` without limits would return, counted, at
+    /// NIP-40 cutoff `now` (`0` disables it). Rows read count toward
+    /// `max_rows`; reaching it answers `approximate` with a partial
+    /// count, never an over-count. `hll` is the sketch to feed with
+    /// counted authors (from `Hll::for_filters`); see [`Count`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure,
+    /// [`StoreError::Corrupt`] on a broken index invariant.
+    pub fn count(
+        &self,
+        filters: &[Filter],
+        gate: &ReadGate,
+        now: u64,
+        max_rows: usize,
+        hll: Option<Hll>,
+    ) -> Result<Count, StoreError> {
+        crate::scan::count(&self.exec, filters, gate, now, max_rows, hll)
     }
 
     /// Apply one event inside the write transaction: ephemeral and
