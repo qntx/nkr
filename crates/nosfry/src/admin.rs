@@ -10,8 +10,9 @@ use std::time::Duration;
 use nosfry_core::auth::ReadGate;
 use nosfry_core::event::{Event, EventLimits, UnverifiedEvent};
 use nosfry_core::filter::{Filter, FilterError};
+use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
-use nosfry_lmdb::{Progress, Scan, Store, StoreError, WriteOutcome};
+use nosfry_lmdb::{Progress, Scan, Store, StoreError};
 
 /// Events per write transaction on import (strfry's import batch).
 const IMPORT_BATCH: usize = 10_000;

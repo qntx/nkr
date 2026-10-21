@@ -52,6 +52,7 @@ use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, UnverifiedEvent, supersedes};
 use nosfry_core::packed::PackedRef;
+use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 
 mod count;
@@ -85,28 +86,6 @@ impl Default for StoreOptions {
             no_read_ahead: false,
         }
     }
-}
-
-/// Outcome of writing one event, in arrival order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteOutcome {
-    /// Stored under a fresh sequence number.
-    Stored {
-        /// The assigned sequence number.
-        seq: u64,
-    },
-    /// The id was already stored.
-    Duplicate,
-    /// An equal-or-better replaceable/addressable version is stored.
-    Superseded,
-    /// Ephemeral kind; nothing written.
-    Ephemeral,
-    /// A stored same-author kind-5 event deleted (or blocks) this event.
-    Deleted,
-    /// The author's NIP-62 request to vanish covers this event
-    /// (`created_at <= T`), or it is a kind-1059 gift wrap `p`-tagged
-    /// to a vanished pubkey.
-    Vanished,
 }
 
 /// The result of one [`Store::write`] transaction.
