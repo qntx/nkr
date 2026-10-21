@@ -30,7 +30,7 @@ use nosfry_core::sign::{event, keys};
 use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 use nosfry_lmdb::{CountResult, CountScan, Progress, Scan, Store, StoreOptions};
-use nosfry_testkit::driver::{Count, StoreDriver, build_case, check};
+use nosfry_testkit::driver::{Count, StoreDriver, StoreRecords, build_case, check};
 use nosfry_testkit::spec::{SERVICE_URL, event_spec_strategy, filter_spec_strategy};
 use proptest::prelude::*;
 use serde_json::json;
@@ -108,6 +108,35 @@ impl StoreDriver for LmdbDriver<'_> {
         now: u64,
     ) -> Vec<String> {
         store_scan_gated(self.store, filters, gate.clone(), snapshot, max_limit, now)
+    }
+
+    fn records(
+        &mut self,
+        filters: Arc<[Filter]>,
+        gate: &ReadGate,
+        snapshot: u64,
+        max_limit: u64,
+        now: u64,
+    ) -> StoreRecords {
+        let mut scan = Scan::new(filters, gate.clone(), snapshot, max_limit, now);
+        let out = RefCell::new(Vec::new());
+        let mut guard = 0usize;
+        loop {
+            guard += 1;
+            assert!(guard < 10_000, "records scan did not terminate");
+            let progress = scan
+                .step_records(self.store, Duration::ZERO, &mut |created_at, id| {
+                    out.borrow_mut().push((created_at, id));
+                })
+                .unwrap();
+            if progress == Progress::Done {
+                break;
+            }
+        }
+        StoreRecords {
+            records: out.into_inner(),
+            budget_exhausted: false,
+        }
     }
 
     fn count(&mut self, filters: Arc<[Filter]>, gate: &ReadGate, snapshot: u64, now: u64) -> Count {

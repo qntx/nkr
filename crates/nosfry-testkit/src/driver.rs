@@ -13,7 +13,7 @@ use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 use proptest::prelude::*;
 
-use crate::model::{Model, model_expire, model_scan, model_store, model_union};
+use crate::model::{Model, model_expire, model_records, model_scan, model_store, model_union};
 use crate::spec::{EventSpec, FilterSpec, SERVICE_URL, build_event, filter_json};
 
 /// One event store under test. Implementations translate each call
@@ -37,6 +37,18 @@ pub trait StoreDriver {
         now: u64,
     ) -> Vec<String>;
 
+    /// The `(created_at, id)` records `filters` emit under `gate`,
+    /// bounded by `snapshot` and `max_limit`, at `now` — the NIP-77
+    /// record view of [`StoreDriver::scan`], uncapped rows.
+    fn records(
+        &mut self,
+        filters: Arc<[Filter]>,
+        gate: &ReadGate,
+        snapshot: u64,
+        max_limit: u64,
+        now: u64,
+    ) -> StoreRecords;
+
     /// The union `filters` match at `snapshot`/`now` under `gate`,
     /// counted — a filter `limit` does not apply. `Hll::for_filters`
     /// decides sketch eligibility; the driver runs its count
@@ -52,6 +64,15 @@ pub trait StoreDriver {
 
     /// Apply one NIP-86 `op`, returning the rebuilt snapshot.
     fn moderate(&mut self, op: ModOp) -> Moderation;
+}
+
+/// The records [`StoreDriver::records`] reports, mirrored per store.
+#[derive(Debug)]
+pub struct StoreRecords {
+    /// Matching `(created_at, id)` rows, per filter newest-first.
+    pub records: Vec<(u64, EventId)>,
+    /// The store's row budget stopped the scan early.
+    pub budget_exhausted: bool,
 }
 
 /// The count [`StoreDriver::count`] reports, mirrored per store.
@@ -237,6 +258,10 @@ pub fn check(store: &mut impl StoreDriver, case: &Case) -> Result<Aftermath, Tes
     );
     prop_assert_eq!(got_gated, expected_gated);
 
+    // The record view of the same scan must equal the model's
+    // records — under the open and the restricted gate.
+    records_checks(store, case, &stored, &filters, snapshot, &gate)?;
+
     // After `expire`, a scan must still match the swept model.
     store.expire(case.now);
     model_expire(&mut stored, case.now);
@@ -264,6 +289,39 @@ pub fn check(store: &mut impl StoreDriver, case: &Case) -> Result<Aftermath, Tes
         model: stored,
         snapshot,
     })
+}
+
+/// The `records` assertions of [`check`]: the record view under the
+/// open and the restricted gate equals the model's records, and the
+/// uncapped scan never reports an exhausted row budget.
+///
+/// # Errors
+///
+/// Fails the proptest case on any divergence.
+fn records_checks(
+    store: &mut impl StoreDriver,
+    case: &Case,
+    stored: &Model,
+    filters: &Arc<[Filter]>,
+    snapshot: u64,
+    gate: &ReadGate,
+) -> Result<(), TestCaseError> {
+    for g in [ReadGate::default(), gate.clone()] {
+        let recs = store.records(Arc::clone(filters), &g, snapshot, case.max_limit, case.now);
+        prop_assert!(!recs.budget_exhausted, "uncapped records scan exhausted");
+        prop_assert_eq!(
+            recs.records,
+            model_records(
+                &stored.stored,
+                filters,
+                snapshot,
+                &g,
+                case.max_limit,
+                case.now
+            )
+        );
+    }
+    Ok(())
 }
 
 /// The COUNT assertions of [`check`]: the union under an open and a

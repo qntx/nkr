@@ -227,9 +227,38 @@ pub fn model_expire(m: &mut Model, now: u64) {
     }
 }
 
-/// Naive scan: per filter, match, sort newest first, truncate, dedup.
+/// The per-filter match list [`model_scan`] and [`model_records`]
+/// share: match, sort newest first, truncate to the effective limit.
 /// Events with `expiration <= now` are hidden and never counted, and
 /// `gate` filters every candidate like the real scans do.
+fn model_matched<S: std::hash::BuildHasher>(
+    stored: &HashMap<u64, Arc<Event>, S>,
+    filter: &Filter,
+    snapshot: u64,
+    gate: &ReadGate,
+    max_limit: u64,
+    now: u64,
+) -> Vec<(u64, EventId, u64)> {
+    let limit = filter.effective_limit(max_limit);
+    if filter.is_impossible() || limit == 0 {
+        return Vec::new();
+    }
+    let mut matched: Vec<(u64, EventId, u64)> = stored
+        .iter()
+        .filter(|(seq, ev)| {
+            **seq <= snapshot
+                && ev.expiration().is_none_or(|exp| exp > now)
+                && gate.allows(ev.packed())
+                && filter.matches(ev.packed())
+        })
+        .map(|(seq, ev)| (ev.created_at(), ev.id(), *seq))
+        .collect();
+    matched.sort_by(|a, b| cmp_newest_first((a.0, &a.1), (b.0, &b.1)));
+    matched.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    matched
+}
+
+/// Naive scan: per filter, match, sort newest first, truncate, dedup.
 #[must_use]
 pub fn model_scan<S: std::hash::BuildHasher>(
     stored: &HashMap<u64, Arc<Event>, S>,
@@ -242,23 +271,7 @@ pub fn model_scan<S: std::hash::BuildHasher>(
     let mut emitted = HashSet::new();
     let mut out = Vec::new();
     for filter in filters {
-        let limit = filter.effective_limit(max_limit);
-        if filter.is_impossible() || limit == 0 {
-            continue;
-        }
-        let mut matched: Vec<(u64, EventId, u64)> = stored
-            .iter()
-            .filter(|(seq, ev)| {
-                **seq <= snapshot
-                    && ev.expiration().is_none_or(|exp| exp > now)
-                    && gate.allows(ev.packed())
-                    && filter.matches(ev.packed())
-            })
-            .map(|(seq, ev)| (ev.created_at(), ev.id(), *seq))
-            .collect();
-        matched.sort_by(|a, b| cmp_newest_first((a.0, &a.1), (b.0, &b.1)));
-        matched.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-        for (_, _, seq) in matched {
+        for (_, _, seq) in model_matched(stored, filter, snapshot, gate, max_limit, now) {
             // Already-emitted seqs consume the limit but are not sent twice.
             if !emitted.insert(seq) {
                 continue;
@@ -268,6 +281,29 @@ pub fn model_scan<S: std::hash::BuildHasher>(
                     .get(&seq)
                     .map_or_else(String::new, |e| e.json().to_owned()),
             );
+        }
+    }
+    out
+}
+
+/// [`model_scan`] without the payload: the `(created_at, id)` of each
+/// emitted event in the same order — the NIP-77 record answer.
+#[must_use]
+pub fn model_records<S: std::hash::BuildHasher>(
+    stored: &HashMap<u64, Arc<Event>, S>,
+    filters: &[Filter],
+    snapshot: u64,
+    gate: &ReadGate,
+    max_limit: u64,
+    now: u64,
+) -> Vec<(u64, EventId)> {
+    let mut emitted = HashSet::new();
+    let mut out = Vec::new();
+    for filter in filters {
+        for (created_at, id, seq) in model_matched(stored, filter, snapshot, gate, max_limit, now) {
+            if emitted.insert(seq) {
+                out.push((created_at, id));
+            }
         }
     }
     out
