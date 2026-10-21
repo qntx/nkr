@@ -53,6 +53,16 @@ pub struct Hit {
     pub json: Box<str>,
 }
 
+/// The `(created_at, id)` records one `records` call found.
+#[derive(Debug)]
+pub struct Records {
+    /// Matching `(created_at, id)` rows, per filter newest-first.
+    pub records: Vec<(u64, EventId)>,
+    /// The `max_rows` budget stopped the scan early; `records` is
+    /// what complete `created_at` groups yielded before exhaustion.
+    pub budget_exhausted: bool,
+}
+
 /// What [`SqlStore::count`] reports, mirroring the LMDB
 /// `CountResult`.
 ///
@@ -436,14 +446,14 @@ fn flush_group(
     limit: u64,
     taken: &mut u64,
     emitted: &mut HashSet<u64>,
-    out: &mut Vec<u64>,
+    out: &mut Vec<Match>,
 ) {
     group.sort_by_key(|m| m.1);
     let remaining = usize::try_from(limit.saturating_sub(*taken)).unwrap_or(usize::MAX);
     for m in group.drain(..).take(remaining) {
         *taken += 1;
         if emitted.insert(m.2) {
-            out.push(m.2);
+            out.push(m);
         }
     }
 }
@@ -465,7 +475,7 @@ fn scan_ids<E: Executor>(
     seen: &mut usize,
     max_rows: usize,
     budget: &mut bool,
-) -> Result<Vec<u64>, StoreError> {
+) -> Result<Vec<Match>, StoreError> {
     let list = format!(
         "[{}]",
         ids.iter()
@@ -511,7 +521,7 @@ fn scan_ids<E: Executor>(
     collected.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
     Ok(collected
         .into_iter()
-        .filter_map(|(_, _, seq)| emitted.insert(seq).then_some(seq))
+        .filter(|m| emitted.insert(m.2))
         .collect())
 }
 
@@ -537,7 +547,7 @@ fn scan_ranges<E: Executor>(
     seen: &mut usize,
     max_rows: usize,
     budget: &mut bool,
-) -> Result<Vec<u64>, StoreError> {
+) -> Result<Vec<Match>, StoreError> {
     let mut heap = BinaryHeap::new();
     for (i, cursor) in cursors.iter_mut().enumerate() {
         if let Some(row) = cursor.next(exec, since, until, seen, max_rows, budget)? {
@@ -619,22 +629,21 @@ fn fetch_jsons<E: Executor>(exec: &E, seqs: Vec<u64>) -> Result<Vec<Hit>, StoreE
         .collect())
 }
 
-/// Run the whole filter set: per-filter modes, shared dedup, one
-/// payload fetch per filter.
-pub(crate) fn scan<E: Executor>(
+/// Run the whole filter set once: per-filter modes, shared dedup.
+/// The matches carry their records so callers either fetch payloads
+/// ([`scan`]) or return the `(created_at, id)` rows ([`records`]).
+fn scan_matches<E: Executor>(
     exec: &E,
     filters: &[Filter],
     gate: &ReadGate,
     now: u64,
     max_limit: u64,
     max_rows: usize,
-) -> Result<Scan, StoreError> {
-    let mut scan = Scan {
-        hits: Vec::new(),
-        budget_exhausted: false,
-    };
+) -> Result<(Vec<Match>, bool), StoreError> {
+    let mut matches = Vec::new();
     let mut emitted = HashSet::new();
     let mut seen = 0usize;
+    let mut budget_exhausted = false;
     for filter in filters {
         let limit = filter.effective_limit(max_limit);
         if filter.is_impossible() || limit == 0 {
@@ -642,7 +651,7 @@ pub(crate) fn scan<E: Executor>(
         }
         let since = filter.since().unwrap_or(0);
         let until = filter.until().unwrap_or(u64::MAX);
-        let seqs = match plan(filter, limit) {
+        let found = match plan(filter, limit) {
             Mode::Ids(ids) => scan_ids(
                 exec,
                 filter,
@@ -653,7 +662,7 @@ pub(crate) fn scan<E: Executor>(
                 &mut emitted,
                 &mut seen,
                 max_rows,
-                &mut scan.budget_exhausted,
+                &mut budget_exhausted,
             )?,
             Mode::Ranges(mut cursors) => scan_ranges(
                 exec,
@@ -667,15 +676,49 @@ pub(crate) fn scan<E: Executor>(
                 &mut emitted,
                 &mut seen,
                 max_rows,
-                &mut scan.budget_exhausted,
+                &mut budget_exhausted,
             )?,
         };
-        scan.hits.extend(fetch_jsons(exec, seqs)?);
-        if scan.budget_exhausted {
+        matches.extend(found);
+        if budget_exhausted {
             break;
         }
     }
-    Ok(scan)
+    Ok((matches, budget_exhausted))
+}
+
+/// [`scan_matches`] plus the payload fetch.
+pub(crate) fn scan<E: Executor>(
+    exec: &E,
+    filters: &[Filter],
+    gate: &ReadGate,
+    now: u64,
+    max_limit: u64,
+    max_rows: usize,
+) -> Result<Scan, StoreError> {
+    let (matches, budget_exhausted) = scan_matches(exec, filters, gate, now, max_limit, max_rows)?;
+    let seqs = matches.iter().map(|m| m.2).collect();
+    Ok(Scan {
+        hits: fetch_jsons(exec, seqs)?,
+        budget_exhausted,
+    })
+}
+
+/// [`scan_matches`] alone: the records a `NEG-OPEN` syncs, without
+/// touching the payloads.
+pub(crate) fn records<E: Executor>(
+    exec: &E,
+    filters: &[Filter],
+    gate: &ReadGate,
+    now: u64,
+    max_limit: u64,
+    max_rows: usize,
+) -> Result<Records, StoreError> {
+    let (matches, budget_exhausted) = scan_matches(exec, filters, gate, now, max_limit, max_rows)?;
+    Ok(Records {
+        records: matches.into_iter().map(|m| (m.0, m.1)).collect(),
+        budget_exhausted,
+    })
 }
 
 /// COUNT's per-candidate checks — the LMDB `CountScan::examine`:
