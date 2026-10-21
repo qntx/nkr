@@ -1045,3 +1045,63 @@ async fn negentropy_converges_and_closes() {
         "{frame}"
     );
 }
+
+/// The write-policy fixture — `policy/policy.py` on native, the
+/// `nosfry-policy` service worker on Workers — keys verdicts on the
+/// event's `content`: `policy:reject` → reject `blocked: test
+/// policy`, `policy:reject-empty` → a bare reject (the NIP-01
+/// default message), `policy:shadow` → `shadowReject "shadowed"`,
+/// anything else → accept.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn write_policy_verdicts() {
+    let k = key();
+    let filter = format!("{{\"authors\":[\"{}\"]}}", pubkey(&k));
+    let mut ws = connect().await;
+    // A watcher subscribed before any publish verifies live delivery.
+    let mut watcher = connect().await;
+    let _ = req(&mut watcher, "watch", &filter).await;
+
+    // reject carries the policy's own message.
+    let ev = sign::event(&k, 1, now(), &json!([]), "policy:reject");
+    let (ok, msg) = publish(&mut ws, &ev).await;
+    assert!(!ok && msg == "blocked: test policy", "{ok} {msg}");
+
+    // An empty msg falls back to the NIP-01 default.
+    let ev = sign::event(&k, 1, now(), &json!([]), "policy:reject-empty");
+    let (ok, msg) = publish(&mut ws, &ev).await;
+    assert!(
+        !ok && msg == "blocked: rejected by write policy",
+        "{ok} {msg}"
+    );
+
+    // shadowReject acknowledges yet stores and broadcasts nothing.
+    let shadow = sign::event(&k, 1, now(), &json!([]), "policy:shadow");
+    let (ok, msg) = publish(&mut ws, &shadow).await;
+    assert!(ok && msg == "shadowed", "{ok} {msg}");
+
+    // An accepted event proves the watcher is live.
+    let accepted = sign::event(&k, 1, now(), &json!([]), "policy:accepted");
+    let (ok, msg) = publish(&mut ws, &accepted).await;
+    assert!(ok && msg.is_empty(), "{ok} {msg}");
+
+    // The watcher got the accepted event live — and never saw the
+    // shadowed one before it.
+    let frames = collect_until(&mut watcher, |v| {
+        v[0] == "EVENT" && v[2]["id"].as_str() == Some(&accepted.id().to_string())
+    })
+    .await;
+    for frame in &frames {
+        assert_ne!(
+            frame[2]["id"].as_str(),
+            Some(&shadow.id().to_string()[..]),
+            "shadowed event was broadcast: {frame}"
+        );
+    }
+
+    // The stored set holds only the accepted event.
+    let frames = req(&mut ws, "s", &filter).await;
+    let got = events(&frames);
+    assert_eq!(got.len(), 1, "{frames:?}");
+    assert_eq!(got[0]["content"], "policy:accepted");
+}
