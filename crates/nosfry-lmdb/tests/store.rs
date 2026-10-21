@@ -26,7 +26,8 @@ use std::time::Duration;
 use common::{event, key};
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
-use nosfry_lmdb::{FORMAT_VERSION, Progress, Scan, Store, StoreError, StoreOptions, WriteOutcome};
+use nosfry_core::store::WriteOutcome;
+use nosfry_lmdb::{FORMAT_VERSION, Progress, Scan, Store, StoreError, StoreOptions};
 use serde_json::json;
 
 fn store() -> (tempfile::TempDir, Store) {

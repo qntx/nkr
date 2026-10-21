@@ -28,7 +28,8 @@ use common::{event, key};
 use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, cmp_newest_first, supersedes};
 use nosfry_core::filter::Filter;
-use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreOptions, WriteOutcome};
+use nosfry_core::store::WriteOutcome;
+use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreOptions};
 use proptest::prelude::*;
 use serde_json::json;
 

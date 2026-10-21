@@ -5,7 +5,8 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nosfry_core::message::{RelayVerb, ok_frame};
-use nosfry_lmdb::{Store, WriteOutcome};
+use nosfry_core::store::WriteOutcome;
+use nosfry_lmdb::Store;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 
@@ -36,19 +37,6 @@ fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// Map one write outcome to the `OK` reply's `(accepted, message)` —
-/// exhaustive so a new [`WriteOutcome`] variant cannot slip in
-/// silently.
-const fn ok_reply(outcome: WriteOutcome) -> (bool, &'static str) {
-    match outcome {
-        WriteOutcome::Stored { .. } | WriteOutcome::Ephemeral => (true, ""),
-        WriteOutcome::Duplicate => (true, "duplicate: have this event"),
-        WriteOutcome::Superseded => (false, "duplicate: have a newer version"),
-        WriteOutcome::Deleted => (false, "blocked: deleted by its author"),
-        WriteOutcome::Vanished => (false, "blocked: request to vanish"),
-    }
 }
 
 /// Writer thread main loop: block for the first message, drain up to
@@ -295,7 +283,7 @@ fn collect_batch(
         .into_iter()
         .zip(written.outcomes.into_iter().zip(events))
     {
-        let (accepted, message) = ok_reply(outcome);
+        let (accepted, message) = outcome.ok_reply();
         replies.push((req.out, ok_frame(&event.id(), accepted, message)));
         if let WriteOutcome::Stored { seq } = outcome
             && !written.deleted.contains(&seq)

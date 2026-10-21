@@ -180,6 +180,10 @@ down`; CLOSE is never charged.
 
 ### Changed
 
+- `WriteOutcome` moved from `nosfry-lmdb` to `nosfry_core::store`,
+  with the `OK` reply mapping as `WriteOutcome::ok_reply`, so every
+  event store shares one outcome type.
+
 - `service_url` moved from `[relay.auth]` to `[relay]` (the URL is
   also the NIP-62 vanish target, independent of AUTH); the error is
   `ServerError::ServiceUrl`. `nosfry_core`'s `AuthRules::new` takes a
