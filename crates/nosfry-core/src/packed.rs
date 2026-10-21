@@ -141,19 +141,19 @@ impl<'a> PackedRef<'a> {
 
     /// The raw record bytes.
     #[must_use]
-    pub const fn as_bytes(&self) -> &'a [u8] {
+    pub const fn as_bytes(self) -> &'a [u8] {
         self.0
     }
 
     /// Event id.
     #[must_use]
-    pub fn id(&self) -> EventId {
+    pub fn id(self) -> EventId {
         EventId(self.0.first_chunk::<32>().copied().unwrap_or_default())
     }
 
     /// Author public key.
     #[must_use]
-    pub fn pubkey(&self) -> PublicKey {
+    pub fn pubkey(self) -> PublicKey {
         PublicKey(
             self.0
                 .get(32..64)
@@ -165,13 +165,13 @@ impl<'a> PackedRef<'a> {
 
     /// `created_at` seconds.
     #[must_use]
-    pub fn created_at(&self) -> u64 {
+    pub fn created_at(self) -> u64 {
         self.u64_at(64)
     }
 
     /// Event kind.
     #[must_use]
-    pub fn kind(&self) -> Kind {
+    pub fn kind(self) -> Kind {
         Kind(
             self.0
                 .get(72..74)
@@ -183,12 +183,12 @@ impl<'a> PackedRef<'a> {
 
     /// NIP-40 `expiration` unix time, `0` when absent.
     #[must_use]
-    pub fn expiration(&self) -> u64 {
+    pub fn expiration(self) -> u64 {
         self.u64_at(74)
     }
 
     /// Iterate the packed tag index entries `(name, encoded value)`.
-    pub fn tags(&self) -> impl Iterator<Item = (u8, &'a [u8])> {
+    pub fn tags(self) -> impl Iterator<Item = (u8, &'a [u8])> {
         let mut pos = HEADER_LEN;
         core::iter::from_fn(move || {
             let name = *self.0.get(pos)?;
@@ -201,13 +201,13 @@ impl<'a> PackedRef<'a> {
 
     /// The first packed `d` value, or empty.
     #[must_use]
-    pub fn d_tag(&self) -> &'a [u8] {
+    pub fn d_tag(self) -> &'a [u8] {
         self.tags()
             .find(|(name, _)| *name == b'd')
             .map_or(&[][..], |(_, value)| value)
     }
 
-    fn u64_at(&self, pos: usize) -> u64 {
+    fn u64_at(self, pos: usize) -> u64 {
         self.0
             .get(pos..pos + 8)
             .and_then(|s| <&[u8; 8]>::try_from(s).ok())
