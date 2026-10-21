@@ -12,9 +12,6 @@
     reason = "bench fixtures may panic; deps cover every bench binary"
 )]
 
-#[path = "../tests/common/mod.rs"]
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -22,6 +19,7 @@ use std::time::Duration;
 use criterion::{Criterion, criterion_group, criterion_main};
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
+use nosfry_core::sign as common;
 use nosfry_lmdb::{Progress, Scan, Store, StoreOptions};
 use serde_json::json;
 
