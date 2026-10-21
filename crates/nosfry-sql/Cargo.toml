@@ -1,0 +1,34 @@
+[package]
+name                   = "nosfry-sql"
+description            = "SQL event store for the nosfry Nostr relay's Workers edition"
+publish                = false
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+readme.workspace       = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+nosfry-core.workspace = true
+faster-hex.workspace  = true
+thiserror.workspace   = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { workspace = true, optional = true, features = ["bundled", "limits"] }
+
+[dev-dependencies]
+nosfry-core          = { workspace = true, features = ["test-util"] }
+rusqlite             = { workspace = true, features = ["bundled"] }
+serde_json.workspace = true
+
+[features]
+rusqlite = ["dep:rusqlite"]
+
+[[test]]
+name              = "store"
+required-features = ["rusqlite"]
+
+[lints]
+workspace = true

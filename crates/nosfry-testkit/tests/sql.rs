@@ -1,0 +1,98 @@
+//! Differential test: `SqlStore::query` output vs the shared
+//! in-memory model — the same suite `nosfry-lmdb` runs.
+
+#![allow(
+    unused_crate_dependencies,
+    reason = "each test binary uses a subset of the workspace dependencies"
+)]
+#![allow(
+    clippy::tests_outside_test_module,
+    reason = "each file is a single integration test"
+)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests may panic on failure"
+)]
+
+use std::ops::ControlFlow;
+use std::sync::Arc;
+
+use nosfry_core::auth::ReadGate;
+use nosfry_core::event::Event;
+use nosfry_core::filter::Filter;
+use nosfry_core::store::WriteOutcome;
+use nosfry_sql::rusqlite::Connection;
+use nosfry_sql::{Executor, SqlStore, Value};
+use nosfry_testkit::driver::{StoreDriver, build_case, check};
+use nosfry_testkit::spec::{event_spec_strategy, filter_spec_strategy};
+use proptest::prelude::*;
+
+/// The SQL store driven through the shared suite.
+struct SqlDriver {
+    store: SqlStore<Connection>,
+}
+
+impl StoreDriver for SqlDriver {
+    fn write(&mut self, events: &[Arc<Event>]) -> Vec<WriteOutcome> {
+        self.store.write(events).unwrap()
+    }
+
+    fn snapshot(&mut self) -> u64 {
+        // The SQL store has no snapshot concept; scans just see
+        // current state, so `MAX(seq)` is the driver's bound.
+        let mut max = 0u64;
+        self.store
+            .exec()
+            .query("SELECT MAX(seq) FROM events", &[], &mut |row| {
+                if let Some(&Value::Int(v)) = row.first() {
+                    max = u64::try_from(v).unwrap();
+                }
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        max
+    }
+
+    fn scan(
+        &mut self,
+        filters: Arc<[Filter]>,
+        gate: &ReadGate,
+        _snapshot: u64,
+        max_limit: u64,
+        now: u64,
+    ) -> Vec<String> {
+        self.store
+            .query(&filters, gate, now, max_limit, usize::MAX)
+            .unwrap()
+            .hits
+            .iter()
+            .map(|hit| hit.json.to_string())
+            .collect()
+    }
+
+    fn expire(&mut self, now: u64) {
+        self.store.expire(now, usize::MAX).unwrap();
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn scan_matches_model(
+        specs in proptest::collection::vec(event_spec_strategy(), 1..40),
+        batches in proptest::collection::vec(1usize..20, 1..5),
+        filter_specs in proptest::collection::vec(filter_spec_strategy(), 1..4),
+        max_limit in prop_oneof![Just(3u64), Just(7u64), Just(500u64)],
+        now in 0u64..600,
+        now2 in 0u64..600,
+    ) {
+        let store = SqlStore::open(Connection::open_in_memory().unwrap()).unwrap();
+        let case = build_case(&specs, batches, filter_specs, max_limit, now, now2);
+        let mut driver = SqlDriver { store };
+        check(&mut driver, &case)?;
+    }
+}

@@ -17,6 +17,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 nosfry-lmdb.workspace = true
+nosfry-sql            = { workspace = true, features = ["rusqlite"] }
 tempfile.workspace    = true
 
 [lints]
