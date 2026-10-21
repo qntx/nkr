@@ -26,12 +26,16 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
     (driven by `linux/run-soak.sh`): paced publishers writing a
     deterministic kind mix and awaiting every `OK`, long-lived
     subscribers counting deliveries, short-lived connections churning
-    historical REQs, and periodically spawned `REQ {}` consumers that
-    never read. Every `--sample-secs` it prints one cumulative JSON
-    line with relay RSS, `data.mdb` size, connection, rate-limit and
-    `nosfry_outbound_pending_bytes` metrics, and the workload
-    counters; a final `end` line (with `outbound_pending_after_close`,
-    the gauge value once every harness connection is closed) and a
+    historical REQs and COUNTs, periodically spawned `REQ {}`
+    consumers that never read, negentropy sessions ending by
+    `NEG-CLOSE`, disconnect and the idle reaper, and vanish rounds
+    that publish then ask the relay to delete them. Every
+    `--sample-secs` it prints one cumulative JSON line with relay
+    RSS, `data.mdb` size, connection, rate-limit,
+    `nosfry_outbound_pending_bytes` and `nosfry_sync_memory_bytes`
+    metrics, and the workload counters; a final `end` line (with
+    `outbound_pending_after_close` and `sync_memory_after_close`,
+    the gauge values once every harness connection is closed) and a
     `relay_exit` line close the JSONL.
 - **aggregate.py**: `python3 bench/aggregate.py <results-dir>` prints the
   median and [min, max] of every metric across repeated runs.
@@ -109,9 +113,11 @@ DURATION=1800 SAMPLE=30 /bench/run-soak.sh <name> [label]
 `run-soak.sh` writes `/bench/results/soak-<label>.jsonl` and the
 relay's log lives at `/bench/work/soak-<label>/relay.log`. Defaults:
 8 publishers at 200 events/s total, 200 subscribers, 10 churn
-connections/s, one slow consumer per minute; `DURATION` and `SAMPLE`
+connections/s, one slow consumer per minute, one negentropy session
+per 10 s, one vanish round per minute; `DURATION` and `SAMPLE`
 (seconds between samples) plus every workload knob
-(`PUBLISHERS`, `RATE`, `SUBSCRIBERS`, `CHURN_RATE`, `SLOW_EVERY`)
+(`PUBLISHERS`, `RATE`, `SUBSCRIBERS`, `CHURN_RATE`, `SLOW_EVERY`,
+`NEG_EVERY`, `VANISH_EVERY`)
 are environment-overridable.
 
 Each `<name>` is a binary in `/bench/bin`; strfry always runs alongside.

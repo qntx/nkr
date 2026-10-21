@@ -2,9 +2,11 @@
 //!
 //! Publishers write a deterministic kind mix and await every `OK`;
 //! long-lived subscribers count deliveries; short-lived connections
-//! churn through historical REQs; slow consumers hold a `REQ {}` they
-//! never read. One JSON line per sample plus a final `end` line —
-//! verdicts are left to whoever analyzes the JSONL.
+//! churn through historical REQs and COUNTs; slow consumers hold a
+//! `REQ {}` they never read; negentropy sessions end by `NEG-CLOSE`,
+//! disconnect and the idle reaper; vanish rounds publish then ask the
+//! relay to delete them. One JSON line per sample plus a final `end`
+//! line — verdicts are left to whoever analyzes the JSONL.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -13,12 +15,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
+use negentropy::{Negentropy, NegentropyStorageVector};
+use secp256k1::Keypair;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use yawc::{Frame, OpCode, TcpWebSocket};
 
-use crate::{Author, author, connect, proc_stats, sign_event, unix_now};
+use crate::{Author, author, connect, hex, proc_stats, sign_event, unix_now};
 
 const AUTHORS: usize = 64;
 const WORDS: [&str; 8] = [
@@ -32,6 +37,17 @@ const CHURN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Slow consumers are dropped after this, whether or not the relay
 /// already closed them.
 const SLOW_HOLD: Duration = Duration::from_secs(15 * 60);
+/// A completed or abandoned negentropy session's bound.
+const NEG_TIMEOUT: Duration = Duration::from_secs(30);
+/// The idle variant's bound: the relay reaps at 60 s plus slack.
+const NEG_IDLE_WAIT: Duration = Duration::from_secs(80);
+/// Kind-1 events published before each vanish request.
+const VANISH_EVENTS: u64 = 20;
+/// Poll cadence and deadline while the vanish sweep drains.
+const VANISH_POLL: Duration = Duration::from_millis(500);
+const VANISH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Whole-round bound: 21 awaited `OK`s plus the poll window.
+const VANISH_ROUND: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct Counters {
@@ -41,6 +57,12 @@ struct Counters {
     sub_reconnects: AtomicU64,
     churn_done: AtomicU64,
     churn_failed: AtomicU64,
+    count_done: AtomicU64,
+    count_failed: AtomicU64,
+    neg_done: AtomicU64,
+    neg_failed: AtomicU64,
+    vanish_done: AtomicU64,
+    vanish_failed: AtomicU64,
     slow_spawned: AtomicU64,
     errors: AtomicU64,
 }
@@ -63,6 +85,12 @@ impl Counters {
             "sub_reconnects": self.sub_reconnects.load(Ordering::Relaxed),
             "churn_done": self.churn_done.load(Ordering::Relaxed),
             "churn_failed": self.churn_failed.load(Ordering::Relaxed),
+            "count_done": self.count_done.load(Ordering::Relaxed),
+            "count_failed": self.count_failed.load(Ordering::Relaxed),
+            "neg_done": self.neg_done.load(Ordering::Relaxed),
+            "neg_failed": self.neg_failed.load(Ordering::Relaxed),
+            "vanish_done": self.vanish_done.load(Ordering::Relaxed),
+            "vanish_failed": self.vanish_failed.load(Ordering::Relaxed),
             "slow_spawned": self.slow_spawned.load(Ordering::Relaxed),
             "errors": self.errors.load(Ordering::Relaxed),
         })
@@ -135,16 +163,23 @@ fn mix(
     }
 }
 
-/// Await the `OK` for `id`, skipping other frames; `None` when the
-/// socket dies first.
-async fn read_ok(ws: &mut TcpWebSocket, id: &str) -> Option<(bool, String)> {
+/// Next text frame parsed as JSON; `None` when the socket dies.
+async fn recv_json(ws: &mut TcpWebSocket) -> Option<Value> {
     while let Some(frame) = ws.next().await {
         if frame.opcode() != OpCode::Text {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(frame.as_str()) else {
-            continue;
-        };
+        if let Ok(v) = serde_json::from_str::<Value>(frame.as_str()) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Await the `OK` for `id`, skipping other frames; `None` when the
+/// socket dies first.
+async fn read_ok(ws: &mut TcpWebSocket, id: &str) -> Option<(bool, String)> {
+    while let Some(v) = recv_json(ws).await {
         if v.get(0).and_then(Value::as_str) == Some("OK")
             && v.get(1).and_then(Value::as_str) == Some(id)
         {
@@ -296,13 +331,7 @@ async fn churn_once(
         ws.send(Frame::text(json!(["REQ", "churn", filter]).to_string()))
             .await
             .map_err(|e| e.to_string())?;
-        while let Some(frame) = ws.next().await {
-            if frame.opcode() != OpCode::Text {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(frame.as_str()) else {
-                continue;
-            };
+        while let Some(v) = recv_json(&mut ws).await {
             match v.get(0).and_then(Value::as_str) {
                 Some("EOSE") => {
                     ws.send(Frame::text(json!(["CLOSE", "churn"]).to_string()))
@@ -310,7 +339,7 @@ async fn churn_once(
                         .ok();
                     return Ok(());
                 }
-                Some("CLOSED") | Some("NOTICE") => return Err(frame.as_str().to_owned()),
+                Some("CLOSED") | Some("NOTICE") => return Err(v.to_string()),
                 _ => {}
             }
         }
@@ -326,6 +355,58 @@ async fn churn_once(
             }
             Ok(Err(_)) | Err(_) => {
                 counters.churn_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// One churn COUNT: like [`churn_once`] but a `COUNT` query — the
+/// answer is `["COUNT","churn",{…}]`, then the socket just drops.
+async fn count_once(
+    url: url::Url,
+    index: usize,
+    authors: Arc<Vec<String>>,
+    counters: Arc<Counters>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let filters = [
+        json!({"authors": [authors[index % AUTHORS]], "kinds": [1]}),
+        json!({"#t": [WORDS[index % WORDS.len()]]}),
+        json!({"#p": [authors[index % AUTHORS]]}),
+    ];
+    let filter = &filters[index % filters.len()];
+    let result = async {
+        let mut ws = connect(&url, false).await?;
+        ws.send(Frame::text(json!(["COUNT", "churn", filter]).to_string()))
+            .await
+            .map_err(|e| e.to_string())?;
+        while let Some(v) = recv_json(&mut ws).await {
+            match v.get(0).and_then(Value::as_str) {
+                Some("COUNT")
+                    if v.get(1).and_then(Value::as_str) == Some("churn")
+                        && v.get(2)
+                            .and_then(|o| o.get("count"))
+                            .and_then(Value::as_u64)
+                            .is_some() =>
+                {
+                    return Ok(());
+                }
+                Some("CLOSED") | Some("NOTICE") => return Err(v.to_string()),
+                _ => {}
+            }
+        }
+        Err("closed before COUNT".to_owned())
+    };
+    tokio::select! {
+        // A detached task must still close its socket at stop so the
+        // drain check can see zero connections.
+        _ = stop.changed() => {}
+        result = tokio::time::timeout(CHURN_TIMEOUT, result) => match result {
+            Ok(Ok(())) => {
+                counters.count_done.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(_)) | Err(_) => {
+                counters.count_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -350,13 +431,24 @@ async fn churner(
         if *stop.borrow() {
             return;
         }
-        tokio::spawn(churn_once(
-            url.clone(),
-            index,
-            Arc::clone(&authors),
-            Arc::clone(&counters),
-            stop.clone(),
-        ));
+        // Every fifth churn query is a COUNT instead of a REQ.
+        if index % 5 == 4 {
+            tokio::spawn(count_once(
+                url.clone(),
+                index,
+                Arc::clone(&authors),
+                Arc::clone(&counters),
+                stop.clone(),
+            ));
+        } else {
+            tokio::spawn(churn_once(
+                url.clone(),
+                index,
+                Arc::clone(&authors),
+                Arc::clone(&counters),
+                stop.clone(),
+            ));
+        }
         index = index.wrapping_add(1);
     }
 }
@@ -408,6 +500,324 @@ async fn slow_spawner(
     }
 }
 
+/// `["NEG-OPEN",sub,filter,"<hex>"]`.
+fn neg_open_wire(sub: &str, filter: &str, msg: &[u8]) -> String {
+    format!("[\"NEG-OPEN\",\"{sub}\",{filter},\"{}\"]", hex(msg))
+}
+
+/// `["NEG-MSG",sub,"<hex>"]`.
+fn neg_msg_wire(sub: &str, msg: &[u8]) -> String {
+    format!("[\"NEG-MSG\",\"{sub}\",\"{}\"]", hex(msg))
+}
+
+/// Hex-decode a wire payload.
+fn unhex(text: &str) -> Result<Vec<u8>, String> {
+    if !text.len().is_multiple_of(2) {
+        return Err("odd hex".to_owned());
+    }
+    (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Read until a `NEG-MSG` or `NEG-ERR` for `sub` and return it.
+async fn neg_recv(ws: &mut TcpWebSocket, sub: &str) -> Result<Value, String> {
+    while let Some(v) = recv_json(ws).await {
+        if v.get(1).and_then(Value::as_str) != Some(sub) {
+            match v.get(0).and_then(Value::as_str) {
+                Some("CLOSED") | Some("NOTICE") => return Err(v.to_string()),
+                _ => continue,
+            }
+        }
+        if matches!(
+            v.get(0).and_then(Value::as_str),
+            Some("NEG-MSG" | "NEG-ERR")
+        ) {
+            return Ok(v);
+        }
+    }
+    Err("connection closed".to_owned())
+}
+
+/// The message of a `NEG-ERR` frame as an error.
+fn neg_err(v: &Value) -> String {
+    v.get(2)
+        .and_then(Value::as_str)
+        .unwrap_or("NEG-ERR")
+        .to_owned()
+}
+
+/// Reconcile until the client is done, then `NEG-CLOSE`.
+async fn neg_complete(
+    ws: &mut TcpWebSocket,
+    neg: &mut Negentropy<'_, NegentropyStorageVector>,
+    sub: &str,
+) -> Result<(), String> {
+    let (mut have, mut need) = (Vec::new(), Vec::new());
+    loop {
+        let v = neg_recv(ws, sub).await?;
+        if v.get(0).and_then(Value::as_str) == Some("NEG-ERR") {
+            return Err(neg_err(&v));
+        }
+        let payload = unhex(v.get(2).and_then(Value::as_str).ok_or("no payload")?)?;
+        let next = neg
+            .reconcile_with_ids(&payload, &mut have, &mut need)
+            .map_err(|e| e.to_string())?;
+        match next {
+            Some(msg) => {
+                ws.send(Frame::text(neg_msg_wire(sub, &msg)))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            None => break,
+        }
+    }
+    ws.send(Frame::text(format!("[\"NEG-CLOSE\",\"{sub}\"]")))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// After the first reply, keep reading silently — the reaper must end
+/// the session with `closed: idle timeout`. Reading the socket also
+/// answers the relay's pings.
+async fn neg_idle(ws: &mut TcpWebSocket, sub: &str) -> Result<(), String> {
+    loop {
+        let v = neg_recv(ws, sub).await?;
+        match v.get(0).and_then(Value::as_str) {
+            Some("NEG-ERR") if v.get(2).and_then(Value::as_str) == Some("closed: idle timeout") => {
+                return Ok(());
+            }
+            Some("NEG-ERR") => return Err(neg_err(&v)),
+            _ => {}
+        }
+    }
+}
+
+/// One negentropy session; `index % 3` picks how it ends — a clean
+/// `NEG-CLOSE`, a disconnect, or the 60 s idle reap — covering the
+/// three ways the relay frees a session's sync memory.
+async fn neg_once(
+    url: url::Url,
+    index: usize,
+    authors: Arc<Vec<String>>,
+    counters: Arc<Counters>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let variant = index % 3;
+    let result = async {
+        let mut ws = connect(&url, false).await?;
+        let mut storage = NegentropyStorageVector::new();
+        storage.seal().map_err(|e| e.to_string())?;
+        let mut neg = Negentropy::borrowed(&storage, 500_000).map_err(|e| e.to_string())?;
+        let init = neg.initiate().map_err(|e| e.to_string())?;
+        let filter = json!({"authors": [authors[index % AUTHORS]], "kinds": [1]});
+        ws.send(Frame::text(neg_open_wire(
+            "neg",
+            &filter.to_string(),
+            &init,
+        )))
+        .await
+        .map_err(|e| e.to_string())?;
+        match variant {
+            0 => neg_complete(&mut ws, &mut neg, "neg").await,
+            _ => {
+                // Variants 1 and 2 stop replying after the first
+                // NEG-MSG: the socket drops, or waits for the reaper.
+                let v = neg_recv(&mut ws, "neg").await?;
+                if v.get(0).and_then(Value::as_str) == Some("NEG-ERR") {
+                    return Err(neg_err(&v));
+                }
+                if variant == 1 {
+                    Ok(())
+                } else {
+                    neg_idle(&mut ws, "neg").await
+                }
+            }
+        }
+    };
+    let bound = if variant == 2 {
+        NEG_IDLE_WAIT
+    } else {
+        NEG_TIMEOUT
+    };
+    tokio::select! {
+        // A detached task must still close its socket at stop so the
+        // drain check can see zero connections.
+        _ = stop.changed() => {}
+        result = tokio::time::timeout(bound, result) => match result {
+            Ok(Ok(())) => {
+                counters.neg_done.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(_)) | Err(_) => {
+                counters.neg_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Spawns one detached negentropy session every `every`.
+async fn neg_spawner(
+    url: url::Url,
+    every: Duration,
+    authors: Arc<Vec<String>>,
+    counters: Arc<Counters>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut index = 0usize;
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = stop.changed() => return,
+        }
+        if *stop.borrow() {
+            return;
+        }
+        tokio::spawn(neg_once(
+            url.clone(),
+            index,
+            Arc::clone(&authors),
+            Arc::clone(&counters),
+            stop.clone(),
+        ));
+        index = index.wrapping_add(1);
+    }
+}
+
+/// A fresh random key: SHA-256 over the round and the clock —
+/// uniqueness per round is all a vanish needs.
+fn random_author(round: u64) -> Author {
+    let mut seed = Sha256::digest(format!("soak-vanish:{round}:{}", unix_now()).as_bytes());
+    loop {
+        let secret: [u8; 32] = seed.into();
+        match Keypair::from_secret_bytes(secret) {
+            Ok(keypair) => {
+                let pk_hex = hex(&keypair.x_only_public_key().0.to_byte_array());
+                return Author { keypair, pk_hex };
+            }
+            Err(_) => seed = Sha256::digest(secret),
+        }
+    }
+}
+
+/// One vanish round: a fresh key publishes `VANISH_EVENTS` kind-1s,
+/// then a request to vanish, then polls a `REQ` until the sweep
+/// leaves only that request.
+async fn vanish_once(
+    url: url::Url,
+    round: u64,
+    counters: Arc<Counters>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let result = async {
+        let mut ws = connect(&url, false).await?;
+        let author = random_author(round);
+        for n in 0..VANISH_EVENTS {
+            let (id, event) = sign_event(
+                &author,
+                unix_now(),
+                1,
+                &json!([]),
+                &format!("vanish {round}:{n}"),
+            );
+            ws.send(Frame::text(format!("[\"EVENT\",{event}]")))
+                .await
+                .map_err(|e| e.to_string())?;
+            let (accepted, message) = read_ok(&mut ws, &id).await.ok_or("socket died")?;
+            counters.ok(accepted, &message);
+            if !accepted {
+                return Err(message);
+            }
+        }
+        let (id, event) = sign_event(
+            &author,
+            unix_now(),
+            62,
+            &json!([["relay", "ALL_RELAYS"]]),
+            "",
+        );
+        ws.send(Frame::text(format!("[\"EVENT\",{event}]")))
+            .await
+            .map_err(|e| e.to_string())?;
+        let (accepted, message) = read_ok(&mut ws, &id).await.ok_or("socket died")?;
+        counters.ok(accepted, &message);
+        if !accepted {
+            return Err(message);
+        }
+        // The request itself is retained; the sweep is asynchronous.
+        let deadline = Instant::now() + VANISH_TIMEOUT;
+        loop {
+            let kinds = req_kinds(&mut ws, json!({"authors": [author.pk_hex]})).await?;
+            if kinds == [Some(62)] {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!("{} events still served", kinds.len()));
+            }
+            tokio::time::sleep(VANISH_POLL).await;
+        }
+    };
+    tokio::select! {
+        _ = stop.changed() => {}
+        result = tokio::time::timeout(VANISH_ROUND, result) => match result {
+            Ok(Ok(())) => {
+                counters.vanish_done.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(Err(_)) | Err(_) => {
+                counters.vanish_failed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// `REQ` for `filter`; returns each served event's kind at EOSE.
+async fn req_kinds(ws: &mut TcpWebSocket, filter: Value) -> Result<Vec<Option<u64>>, String> {
+    ws.send(Frame::text(json!(["REQ", "v", filter]).to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut kinds = Vec::new();
+    while let Some(v) = recv_json(ws).await {
+        match v.get(0).and_then(Value::as_str) {
+            Some("EVENT") => {
+                kinds.push(v.get(2).and_then(|e| e.get("kind")).and_then(Value::as_u64));
+            }
+            Some("EOSE") => return Ok(kinds),
+            Some("CLOSED") | Some("NOTICE") => return Err(v.to_string()),
+            _ => {}
+        }
+    }
+    Err("socket died".to_owned())
+}
+
+/// Spawns one detached vanish round every `every`.
+async fn vanish_spawner(
+    url: url::Url,
+    every: Duration,
+    counters: Arc<Counters>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let mut round = 0u64;
+    let mut ticker = tokio::time::interval(every);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = stop.changed() => return,
+        }
+        if *stop.borrow() {
+            return;
+        }
+        tokio::spawn(vanish_once(
+            url.clone(),
+            round,
+            Arc::clone(&counters),
+            stop.clone(),
+        ));
+        round = round.wrapping_add(1);
+    }
+}
+
 /// `GET <url>` over a plain TcpStream; returns the body.
 async fn http_get(url: &url::Url) -> Option<String> {
     let host = url.host_str()?;
@@ -437,11 +847,14 @@ struct RelayMetrics {
     limited: Option<u64>,
     /// `nosfry_outbound_pending_bytes`.
     outbound_pending: Option<u64>,
+    /// `nosfry_sync_memory_bytes`.
+    sync_memory: Option<u64>,
 }
 
 /// `nosfry_connections`, `nosfry_connections_rejected_total`, the
-/// summed `nosfry_rate_limited_total{…}` and
-/// `nosfry_outbound_pending_bytes` from the metrics body.
+/// summed `nosfry_rate_limited_total{…}`,
+/// `nosfry_outbound_pending_bytes` and `nosfry_sync_memory_bytes`
+/// from the metrics body.
 fn parse_metrics(body: &str) -> RelayMetrics {
     // Zero-valued counters are omitted from the exposition, so a
     // fetched body starts both totals at 0.
@@ -450,6 +863,7 @@ fn parse_metrics(body: &str) -> RelayMetrics {
         rejected: Some(0),
         limited: Some(0),
         outbound_pending: None,
+        sync_memory: None,
     };
     for line in body.lines() {
         let value = || line.rsplit(' ').next()?.parse::<u64>().ok();
@@ -463,6 +877,8 @@ fn parse_metrics(body: &str) -> RelayMetrics {
             }
         } else if line.starts_with("nosfry_outbound_pending_bytes ") {
             m.outbound_pending = value();
+        } else if line.starts_with("nosfry_sync_memory_bytes ") {
+            m.sync_memory = value();
         }
     }
     m
@@ -524,6 +940,10 @@ fn sample_line(
         "outbound_pending".into(),
         m.as_ref().map_or(Value::Null, |m| opt(m.outbound_pending)),
     );
+    obj.insert(
+        "sync_memory".into(),
+        m.as_ref().map_or(Value::Null, |m| opt(m.sync_memory)),
+    );
     line
 }
 
@@ -545,6 +965,8 @@ pub(crate) async fn run(
     subscribers: usize,
     churn_rate: f64,
     slow_every_secs: u64,
+    neg_every_secs: u64,
+    vanish_every_secs: u64,
     label: String,
 ) {
     let counters = Arc::new(Counters::default());
@@ -604,6 +1026,25 @@ pub(crate) async fn run(
         )));
     }
 
+    if neg_every_secs > 0 {
+        tasks.push(tokio::spawn(neg_spawner(
+            url.clone(),
+            Duration::from_secs(neg_every_secs),
+            Arc::clone(&authors),
+            Arc::clone(&counters),
+            stop_rx.clone(),
+        )));
+    }
+
+    if vanish_every_secs > 0 {
+        tasks.push(tokio::spawn(vanish_spawner(
+            url.clone(),
+            Duration::from_secs(vanish_every_secs),
+            Arc::clone(&counters),
+            stop_rx.clone(),
+        )));
+    }
+
     // Sampling.
     let deadline = Duration::from_secs(duration_secs);
     let mut ticker = tokio::time::interval(Duration::from_secs(sample_secs.max(1)));
@@ -630,15 +1071,18 @@ pub(crate) async fn run(
     }
 
     // Drain check: once every harness connection is closed the relay
-    // must report zero queued outbound bytes — a non-zero gauge means
-    // a closed connection still holds a charge.
+    // must report zero queued outbound bytes and zero reserved sync
+    // memory — a non-zero gauge means a closed connection still holds
+    // a charge or a session reservation.
     let mut drained = None;
+    let mut sync_drained = None;
     if let Some(u) = &metrics_url {
         let until = Instant::now() + Duration::from_secs(10);
         while Instant::now() < until {
             match http_get(u).await.as_deref().map(parse_metrics) {
                 Some(m) if m.conns == Some(0) => {
                     drained = m.outbound_pending;
+                    sync_drained = m.sync_memory;
                     break;
                 }
                 Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -651,6 +1095,7 @@ pub(crate) async fn run(
     let obj = end.as_object_mut().expect("snapshot is an object");
     obj.insert("type".into(), json!("end"));
     obj.insert("outbound_pending_after_close".into(), opt(drained));
+    obj.insert("sync_memory_after_close".into(), opt(sync_drained));
     obj.insert("label".into(), json!(label));
     obj.insert("t".into(), json!(start.elapsed().as_secs()));
     let stats = pid.and_then(proc_stats);

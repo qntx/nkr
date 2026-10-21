@@ -104,6 +104,12 @@ enum Cmd {
         /// Spawn one never-reading `REQ {}` consumer this often; 0 off.
         #[arg(long, default_value_t = 60)]
         slow_every_secs: u64,
+        /// Start one negentropy session this often; 0 off.
+        #[arg(long, default_value_t = 10)]
+        neg_every_secs: u64,
+        /// Run one vanish round this often; 0 off.
+        #[arg(long, default_value_t = 60)]
+        vanish_every_secs: u64,
         #[arg(long, default_value = "")]
         label: String,
     },
@@ -710,6 +716,8 @@ async fn main() {
             subscribers,
             churn_rate,
             slow_every_secs,
+            neg_every_secs,
+            vanish_every_secs,
             label,
         } => {
             let url = url.parse().expect("valid ws url");
@@ -726,6 +734,8 @@ async fn main() {
                 subscribers,
                 churn_rate,
                 slow_every_secs,
+                neg_every_secs,
+                vanish_every_secs,
                 label,
             )
             .await;
