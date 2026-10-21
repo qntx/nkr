@@ -9,6 +9,10 @@ use nosfry_core::sign::{event, keys, pubkey_hex};
 use proptest::prelude::*;
 use serde_json::json;
 
+/// The relay URL the suite writes with — also the `relay` tag
+/// value [`TagSpec::RelayService`] emits.
+pub const SERVICE_URL: &str = "wss://relay.example.com";
+
 /// One tag of a generated event, resolved against the case's id
 /// corpus and key pool at build time.
 #[derive(Debug, Clone)]
@@ -27,6 +31,12 @@ pub enum TagSpec {
     AForeign(usize),
     /// Malformed `a` value.
     ABad(String),
+    /// NIP-62 `relay` tag holding `ALL_RELAYS`.
+    RelayAll,
+    /// `relay` tag naming [`SERVICE_URL`] — honored.
+    RelayService,
+    /// `relay` tag naming a foreign relay — never honored.
+    RelayForeign,
 }
 
 /// One generated event before signing.
@@ -102,6 +112,9 @@ fn tag_json(tag: &TagSpec, ids: &[String], specs: &[EventSpec]) -> serde_json::V
         TagSpec::A(i) => json!(["a", a_value(*i, false, specs)]),
         TagSpec::AForeign(i) => json!(["a", a_value(*i, true, specs)]),
         TagSpec::ABad(s) => json!(["a", s]),
+        TagSpec::RelayAll => json!(["relay", "ALL_RELAYS"]),
+        TagSpec::RelayService => json!(["relay", SERVICE_URL]),
+        TagSpec::RelayForeign => json!(["relay", "wss://foreign.example.com"]),
     }
 }
 
@@ -230,6 +243,11 @@ pub fn tag_strategy() -> impl Strategy<Value = TagSpec> {
             Just("70000:00:d".to_owned()),
             Just("1:".to_owned()),
         ].prop_map(TagSpec::ABad),
+        2 => prop_oneof![
+            Just(TagSpec::RelayAll),
+            Just(TagSpec::RelayService),
+            Just(TagSpec::RelayForeign),
+        ],
     ]
 }
 
@@ -246,22 +264,44 @@ pub fn event_spec_strategy() -> impl Strategy<Value = EventSpec> {
             3 => Just(30_001u16),
             1 => Just(30_002u16),
             2 => Just(5u16),
+            1 => Just(62u16),
+            1 => Just(1059u16),
         ],
         0u64..30,
         proptest::collection::vec(tag_strategy(), 0..4),
         proptest::collection::vec(0u8..8, 1..6),
         prop_oneof![3 => Just(None), 1 => (100u64..400).prop_map(Some)],
     )
-        .prop_map(
-            |(key, kind, created_at, tags, content, expiration)| EventSpec {
+        .prop_map(|(key, kind, created_at, mut tags, content, expiration)| {
+            // A kind-62 spec always carries a `relay` tag so the
+            // vanish paths actually fire, rotating which URL it
+            // names; a kind-1059 wrap always `p`-tags a pool key.
+            if kind == 62
+                && !tags.iter().any(|t| {
+                    matches!(
+                        t,
+                        TagSpec::RelayAll | TagSpec::RelayService | TagSpec::RelayForeign
+                    )
+                })
+            {
+                tags.push(match (key + usize::try_from(created_at).unwrap_or(0)) % 3 {
+                    0 => TagSpec::RelayAll,
+                    1 => TagSpec::RelayService,
+                    _ => TagSpec::RelayForeign,
+                });
+            }
+            if kind == 1059 && !tags.iter().any(|t| matches!(t, TagSpec::P(_))) {
+                tags.push(TagSpec::P(key + 1));
+            }
+            EventSpec {
                 key,
                 kind,
                 created_at,
                 tags,
                 content: content.iter().map(|b| char::from(b'a' + b)).collect(),
                 expiration,
-            },
-        )
+            }
+        })
 }
 
 /// Filter-spec generation covering every cursor shape plus empty

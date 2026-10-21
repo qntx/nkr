@@ -25,10 +25,11 @@ use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
 use nosfry_core::store::WriteOutcome;
+use nosfry_core::url::RelayUrl;
 use nosfry_sql::rusqlite::Connection;
 use nosfry_sql::{Executor, SqlStore, Value};
 use nosfry_testkit::driver::{Count, StoreDriver, build_case, check};
-use nosfry_testkit::spec::{event_spec_strategy, filter_spec_strategy};
+use nosfry_testkit::spec::{SERVICE_URL, event_spec_strategy, filter_spec_strategy};
 use proptest::prelude::*;
 
 /// The SQL store driven through the shared suite.
@@ -38,7 +39,8 @@ struct SqlDriver {
 
 impl StoreDriver for SqlDriver {
     fn write(&mut self, events: &[Arc<Event>]) -> Vec<WriteOutcome> {
-        self.store.write(events).unwrap()
+        let url = RelayUrl::parse(SERVICE_URL).unwrap();
+        self.store.write(events, Some(&url)).unwrap().outcomes
     }
 
     fn snapshot(&mut self) -> u64 {
@@ -94,6 +96,10 @@ impl StoreDriver for SqlDriver {
 
     fn expire(&mut self, now: u64) {
         self.store.expire(now, usize::MAX).unwrap();
+    }
+
+    fn drain_vanish(&mut self) {
+        while self.store.vanish_step(3).unwrap().more {}
     }
 }
 

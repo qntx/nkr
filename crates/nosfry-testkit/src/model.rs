@@ -9,6 +9,7 @@ use nosfry_core::auth::ReadGate;
 use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, cmp_newest_first, supersedes};
 use nosfry_core::filter::Filter;
+use nosfry_core::url::RelayUrl;
 
 /// The store's state model: stored events plus the deletion blocks a
 /// kind 5 leaves behind.
@@ -22,6 +23,10 @@ pub struct Model {
     blocked_ids: HashMap<(EventId, PublicKey), HashSet<u64>>,
     /// `address` → `(created_at, seq)` of the kind-5 events blocking it.
     blocked_addrs: HashMap<[u8; 32], Vec<(u64, u64)>>,
+    /// NIP-62 vanish points: author → max honored `created_at` `T`.
+    /// The model applies the sweep eagerly on write; the point is
+    /// permanent so later equal-or-older publishes stay blocked.
+    vanish: HashMap<PublicKey, u64>,
 }
 
 /// Remove `seq` from the model, lifting the blocks it carried.
@@ -51,21 +56,75 @@ fn model_delete_seq(m: &mut Model, seq: u64) {
     }
 }
 
-/// Model `Store::write` in arrival order, NIP-09 included.
+/// Whether a NIP-62 vanish point covers `ev`: the author's `T`
+/// blocks its events with `created_at <= T` (kind 62 exempt, checked
+/// by the caller), and a kind-1059 gift wrap is blocked by the
+/// `p`-tagged recipient's `T`.
+fn vanish_blocked(m: &Model, ev: &Event) -> bool {
+    if m.vanish
+        .get(&ev.pubkey())
+        .is_some_and(|t| ev.created_at() <= *t)
+    {
+        return true;
+    }
+    ev.kind().0 == 1059
+        && ev.packed().tags().any(|(name, value)| {
+            name == b'p'
+                && <&[u8; 32]>::try_from(value).is_ok_and(|pk| {
+                    m.vanish
+                        .get(&PublicKey(*pk))
+                        .is_some_and(|t| ev.created_at() <= *t)
+                })
+        })
+}
+
+/// Apply the NIP-62 sweep `t` demands for `author` right away —
+/// where the real stores queue it for `vanish_step`, the model
+/// deletes at once. Kind 62 survives; only kind-1059 wraps (not
+/// mere `p` mentions) are removed for the author.
+fn apply_vanish(m: &mut Model, author: &PublicKey, t: u64) {
+    let doomed: Vec<u64> = m
+        .stored
+        .iter()
+        .filter(|(_, ev)| {
+            if ev.created_at() > t {
+                return false;
+            }
+            if ev.pubkey() == *author {
+                return ev.kind().0 != 62;
+            }
+            ev.kind().0 == 1059
+                && ev.packed().tags().any(|(name, value)| {
+                    name == b'p' && <&[u8; 32]>::try_from(value).is_ok_and(|pk| *pk == author.0)
+                })
+        })
+        .map(|(seq, _)| *seq)
+        .collect();
+    for seq in doomed {
+        model_delete_seq(m, seq);
+    }
+}
+
+/// Model `Store::write` in arrival order, NIP-09 and NIP-62
+/// included; `service_url` decides which kind-62 `relay` tags this
+/// relay honors.
 ///
 /// # Panics
 ///
 /// Panics when the address index references a missing seq — a model
 /// bug, never reachable from valid inputs.
 #[must_use]
-pub fn model_store(events: &[Arc<Event>]) -> Model {
+pub fn model_store(events: &[Arc<Event>], service_url: Option<&RelayUrl>) -> Model {
     let mut m = Model::default();
     let mut next_seq = 1u64;
     for ev in events {
+        if ev.kind().0 != 62 && vanish_blocked(&m, ev) {
+            continue;
+        }
         if ev.kind().is_ephemeral() || m.by_id.contains_key(&ev.id()) {
             continue;
         }
-        if ev.kind().0 != 5
+        if !matches!(ev.kind().0, 5 | 62)
             && m.blocked_ids
                 .get(&(ev.id(), ev.pubkey()))
                 .is_some_and(|set| !set.is_empty())
@@ -101,6 +160,14 @@ pub fn model_store(events: &[Arc<Event>]) -> Model {
         if ev.kind().0 == 5 {
             model_apply_deletions(&mut m, ev, seq);
         }
+        // NIP-62: raise the vanish point and apply the sweep now —
+        // same-batch events stored earlier are covered too.
+        if ev.requests_vanish(service_url) {
+            let point = m.vanish.entry(ev.pubkey()).or_insert(0);
+            *point = (*point).max(ev.created_at());
+            let t = *point;
+            apply_vanish(&mut m, &ev.pubkey(), t);
+        }
     }
     m
 }
@@ -135,7 +202,9 @@ fn model_apply_deletions(m: &mut Model, ev: &Event, seq: u64) {
         let deletable = m.stored.get(&tseq).is_some_and(|t| {
             t.pubkey() == ev.pubkey()
                 && match target {
-                    DeletionTarget::Event(_) => t.kind().0 != 5,
+                    // NIP-09/NIP-62: deletions and requests to vanish
+                    // are never deletable.
+                    DeletionTarget::Event(_) => !matches!(t.kind().0, 5 | 62),
                     DeletionTarget::Address(_) => t.created_at() <= ev.created_at(),
                 }
         });
