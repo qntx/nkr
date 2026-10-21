@@ -1,0 +1,17 @@
+# Shared relay profile for the black-box conformance suite. Only keys
+# both editions accept may appear here; `run.sh` injects
+# `[relay] service_url` (and, for native, the bind/db keys it needs).
+
+[events]
+# The strict defaults: a future-dated event is rejected.
+
+[relay.limits]
+max_filter_limit = 1000
+
+[relay.auth]
+restricted_read_kinds     = [4, 1059]
+restrict_read_to_involved = true
+
+[relay.info]
+name        = "nosfry conformance"
+description = "edition under test"
