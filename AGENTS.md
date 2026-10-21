@@ -20,7 +20,25 @@ cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo deny check
 CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang" \
-    cargo check -p nosfry-core --target wasm32-unknown-unknown
+    cargo check -p nosfry-core -p nosfry-sql -p nosfry-worker --target wasm32-unknown-unknown
+CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang" \
+    cargo clippy -p nosfry-worker --target wasm32-unknown-unknown -- -D warnings
+```
+
+Black-box conformance suite (same cases against both editions; the
+worker run needs `worker-build` 0.8.7 and Node, and uses wrangler
+4.150.0 through `npx`):
+
+```bash
+crates/nosfry-conformance/run.sh native
+crates/nosfry-conformance/run.sh worker
+```
+
+Run the Workers edition locally (from `crates/nosfry-worker`, with
+`CC_wasm32_unknown_unknown` set as above):
+
+```bash
+npx --yes wrangler@4.150.0 dev --local
 ```
 
 Run the relay locally:
