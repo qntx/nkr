@@ -1067,4 +1067,29 @@ mod tests {
             "SEARCH events USING INTEGER PRIMARY KEY",
         );
     }
+
+    #[test]
+    fn vanish_plans_use_their_indexes() {
+        use crate::store::{SQL_VANISH_PUBKEY, SQL_VANISH_WRAPS};
+        let store = store();
+        assert_plan(
+            store.exec(),
+            SQL_VANISH_PUBKEY,
+            &[Param::Blob(&[0; 32]), int(0), int(0), int(0), int(0)],
+            "SEARCH events USING INDEX ix_pubkey",
+        );
+        assert_plan(
+            store.exec(),
+            SQL_VANISH_WRAPS,
+            &[
+                Param::Int(i64::from(b'p')),
+                Param::Blob(&[0; 32]),
+                int(0),
+                int(0),
+                int(0),
+                int(0),
+            ],
+            "SEARCH t USING PRIMARY KEY",
+        );
+    }
 }

@@ -155,13 +155,17 @@ fn write_outcomes_and_scan_order() {
     let b = event(&k, 1, 200, &json!([]), "b");
     let c = event(&k, 1, 300, &json!([]), "c");
     let outcomes = store
-        .write(&[
-            Arc::clone(&a),
-            Arc::clone(&b),
-            Arc::clone(&c),
-            Arc::clone(&a),
-        ])
-        .unwrap();
+        .write(
+            &[
+                Arc::clone(&a),
+                Arc::clone(&b),
+                Arc::clone(&c),
+                Arc::clone(&a),
+            ],
+            None,
+        )
+        .unwrap()
+        .outcomes;
     assert!(matches!(outcomes[0], WriteOutcome::Stored { seq: 1 }));
     assert!(matches!(outcomes[1], WriteOutcome::Stored { seq: 2 }));
     assert!(matches!(outcomes[2], WriteOutcome::Stored { seq: 3 }));
@@ -187,10 +191,13 @@ fn replaceable_supersedes_and_loses() {
     let k = key(2);
     let old = event(&k, 0, 100, &json!([]), "old");
     let new = event(&k, 0, 200, &json!([]), "new");
-    let outcomes = store.write(&[Arc::clone(&old), Arc::clone(&new)]).unwrap();
+    let outcomes = store
+        .write(&[Arc::clone(&old), Arc::clone(&new)], None)
+        .unwrap()
+        .outcomes;
     assert!(matches!(outcomes[1], WriteOutcome::Stored { seq: 2 }));
     // The loser is superseded, not stored.
-    let late = store.write(&[old]).unwrap();
+    let late = store.write(&[old], None).unwrap().outcomes;
     assert_eq!(late[0], WriteOutcome::Superseded);
     // Only the winner serves.
     let hits = store
@@ -213,10 +220,10 @@ fn nip09_blocks_and_deletes() {
     let victim = event(&k, 1, 100, &json!([]), "victim");
     let kept = event(&k, 1, 200, &json!([]), "kept");
     store
-        .write(&[Arc::clone(&victim), Arc::clone(&kept)])
+        .write(&[Arc::clone(&victim), Arc::clone(&kept)], None)
         .unwrap();
     let del = event(&k, 5, 300, &json!([["e", format!("{}", victim.id())]]), "");
-    let out = store.write(&[del]).unwrap();
+    let out = store.write(&[del], None).unwrap().outcomes;
     assert!(matches!(out[0], WriteOutcome::Stored { .. }));
     // The victim is gone and stays blocked.
     let hits = store
@@ -230,7 +237,7 @@ fn nip09_blocks_and_deletes() {
         .unwrap();
     assert_eq!(hits.hits.len(), 1);
     assert_eq!(hits.hits[0].json.as_ref(), kept.json());
-    let blocked = store.write(&[victim]).unwrap();
+    let blocked = store.write(&[victim], None).unwrap().outcomes;
     assert_eq!(blocked[0], WriteOutcome::Deleted);
 }
 
@@ -242,11 +249,14 @@ fn next_expiration_tracks_earliest() {
     let k = key(1);
     assert_eq!(store.next_expiration().unwrap(), None);
     store
-        .write(&[
-            event(&k, 1, 100, &json!([]), "plain"),
-            event(&k, 1, 100, &json!([["expiration", "500"]]), "later"),
-            event(&k, 1, 100, &json!([["expiration", "150"]]), "soon"),
-        ])
+        .write(
+            &[
+                event(&k, 1, 100, &json!([]), "plain"),
+                event(&k, 1, 100, &json!([["expiration", "500"]]), "later"),
+                event(&k, 1, 100, &json!([["expiration", "150"]]), "soon"),
+            ],
+            None,
+        )
         .unwrap();
     assert_eq!(store.next_expiration().unwrap(), Some(150));
     assert_eq!(store.expire(200, 10).unwrap(), 1);
@@ -259,7 +269,7 @@ fn expire_hides_then_sweeps() {
     let k = key(4);
     let dying = event(&k, 1, 100, &json!([["expiration", "150"]]), "dying");
     let alive = event(&k, 1, 200, &json!([]), "alive");
-    store.write(&[dying, alive]).unwrap();
+    store.write(&[dying, alive], None).unwrap();
     // `now = 0` disables the check; `now = 200` hides the event even
     // before the sweep.
     assert_eq!(seqs(&store, "{\"kinds\":[1]}", 0), vec![2, 1]);
@@ -275,7 +285,7 @@ fn row_budget_bounds_rows_read() {
     let events: Vec<Arc<Event>> = (0..20u64)
         .map(|i| event(&k, 1, 100 + i, &json!([]), "e"))
         .collect();
-    store.write(&events).unwrap();
+    store.write(&events, None).unwrap();
     store.exec().take_index_rows();
 
     let scan = store
@@ -313,7 +323,7 @@ fn first_page_scales_with_the_cursor_count() {
             )
         })
         .collect();
-    store.write(&events).unwrap();
+    store.write(&events, None).unwrap();
     let authors = (0..4)
         .map(nosfry_core::sign::pubkey_hex)
         .map(|pk| format!("\"{pk}\""))
@@ -356,7 +366,7 @@ fn count_budget_marks_approximate() {
             )
         })
         .collect();
-    store.write(&events).unwrap();
+    store.write(&events, None).unwrap();
     let authors = (0..4)
         .map(nosfry_core::sign::pubkey_hex)
         .map(|pk| format!("\"{pk}\""))
