@@ -38,18 +38,23 @@ fn unknown_keys_are_rejected() {
 }
 
 #[test]
-fn limits_disable_negentropy_but_not_count() {
+fn limits_pass_sync_and_count_through() {
     let config = Config::parse("").unwrap();
     let limits = config.limits().unwrap();
+    let defaults = nosfry_core::limits::ReqLimits::default();
     assert_eq!(
         limits.req.max_filter_limit_count,
-        nosfry_core::limits::ReqLimits::default().max_filter_limit_count
+        defaults.max_filter_limit_count
     );
-    assert_eq!(limits.req.max_sync_events, 0);
-    assert_eq!(
-        limits.req.max_filter_limit,
-        nosfry_core::limits::ReqLimits::default().max_filter_limit
-    );
+    assert_eq!(limits.req.max_sync_events, defaults.max_sync_events);
+    assert_eq!(limits.req.max_filter_limit, defaults.max_filter_limit);
+    let tuned = Config::parse(
+        "[relay.limits]
+max_sync_events = 7
+",
+    )
+    .unwrap();
+    assert_eq!(tuned.limits().unwrap().req.max_sync_events, 7);
 }
 
 #[test]

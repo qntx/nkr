@@ -12,6 +12,7 @@ authors.workspace      = true
 
 [dependencies]
 nosfry-core.workspace = true
+faster-hex.workspace  = true
 nosfry-sql.workspace  = true
 serde.workspace       = true
 serde_json.workspace  = true
@@ -24,7 +25,6 @@ futures-util             = { workspace = true }
 wasm-bindgen             = { workspace = true }
 js-sys                   = { workspace = true }
 console_error_panic_hook = { workspace = true }
-faster-hex               = { workspace = true }
 getrandom                = { workspace = true, features = ["wasm_js"] }
 
 [dev-dependencies]
@@ -32,6 +32,7 @@ nosfry-core          = { workspace = true, features = ["test-util"] }
 nosfry-sql           = { workspace = true, features = ["rusqlite"] }
 base64.workspace     = true
 faster-hex.workspace = true
+negentropy.workspace = true
 serde_json.workspace = true
 sha2.workspace       = true
 

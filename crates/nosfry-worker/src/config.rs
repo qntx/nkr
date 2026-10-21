@@ -50,6 +50,10 @@ pub struct Relay {
     pub auth: AuthConfig,
     /// NIP-86 management API.
     pub management: ManagementConfig,
+    /// Process-wide budget for sealed negentropy sync storages,
+    /// `0` = unlimited. Workers keeps a tighter default than native
+    /// because a Durable Object holds all of them on one isolate.
+    pub max_sync_memory_bytes: usize,
     /// NIP-11 relay information.
     pub info: Info,
 }
@@ -79,6 +83,7 @@ impl Default for Relay {
             rate_limits: RateLimits::default(),
             auth: AuthConfig::default(),
             management: ManagementConfig::default(),
+            max_sync_memory_bytes: 33_554_432,
             info: Info::default(),
         }
     }
@@ -134,21 +139,17 @@ impl Config {
 
     /// `nosfry_core::limits::Limits` assembled from `[events]`,
     /// `[relay.limits]`, `[relay.rate_limits]`, and `[relay.auth]`.
-    ///
-    /// COUNT (NIP-45) is served; the session still refuses negentropy
-    /// itself because `max_sync_events` is forced to 0 until slice
-    /// 3.5.
+    /// `max_sync_events` reaches the session verbatim; the effective
+    /// sync event cap is its minimum with `[worker] max_scan_rows`.
     ///
     /// # Errors
     ///
     /// [`ConfigError::ServiceUrl`] on an invalid
     /// `[relay] service_url`.
     pub fn limits(&self) -> Result<Limits, ConfigError> {
-        let mut req = self.relay.limits;
-        req.max_sync_events = 0;
         Ok(Limits {
             event: self.events,
-            req,
+            req: self.relay.limits,
             rate: self.relay.rate_limits,
             auth: self.auth_rules()?,
         })

@@ -27,6 +27,7 @@ use std::cell::RefCell;
 use std::ops::ControlFlow;
 use std::rc::Rc;
 
+use negentropy::{Id, Negentropy, NegentropyStorageVector};
 use nosfry_core::event::PublicKey;
 use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
@@ -1126,5 +1127,343 @@ fn management_persists_across_reopen() {
             .any(|f| f.contains("blocked: pubkey not allowed")),
         "{:?}",
         socket.sent()
+    );
+}
+
+/// `["NEG-OPEN",sub,{filter},"<hex>"]`.
+fn neg_open_wire(sub: &str, filter: &serde_json::Value, msg: &[u8]) -> String {
+    format!(
+        "[\"NEG-OPEN\",\"{sub}\",{filter},\"{}\"]",
+        faster_hex::hex_string(msg)
+    )
+}
+
+/// `["NEG-MSG",sub,"<hex>"]`.
+fn neg_msg_wire(sub: &str, msg: &[u8]) -> String {
+    format!(
+        "[\"NEG-MSG\",\"{sub}\",\"{}\"]",
+        faster_hex::hex_string(msg)
+    )
+}
+
+/// `["NEG-CLOSE",sub]`.
+fn neg_close_wire(sub: &str) -> String {
+    format!("[\"NEG-CLOSE\",\"{sub}\"]")
+}
+
+/// Hex-decode a wire payload.
+fn unhex(text: &str) -> Vec<u8> {
+    let mut buf = vec![0u8; text.len() / 2];
+    faster_hex::hex_decode(text.as_bytes(), &mut buf).unwrap();
+    buf
+}
+
+/// A client-side `Negentropy` owning `records`.
+fn client_neg(records: &[(u64, [u8; 32])]) -> Negentropy<'static, NegentropyStorageVector> {
+    let mut storage = NegentropyStorageVector::with_capacity(records.len());
+    for (created_at, id) in records {
+        storage
+            .insert(*created_at, Id::from_byte_array(*id))
+            .unwrap();
+    }
+    storage.seal().unwrap();
+    Negentropy::owned(storage, 500_000).unwrap()
+}
+
+/// Frames `socket` received for `sub` since `from`.
+fn neg_msgs(socket: &FakeSocket, sub: &str, from: usize) -> Vec<String> {
+    socket.sent()[from..]
+        .iter()
+        .filter(|f| f.starts_with(&format!("[\"NEG-MSG\",\"{sub}\"")))
+        .cloned()
+        .collect()
+}
+
+/// Drive one negentropy session: `NEG-OPEN` then `NEG-MSG` rounds
+/// until `reconcile_with_ids` finishes. Returns `(have, need)` — ids
+/// the client has that the relay lacks, and ids the relay has that
+/// the client still needs.
+fn neg_sync(
+    relay: &mut TestRelay,
+    socket: &FakeSocket,
+    conn: u64,
+    sub: &str,
+    filter: &serde_json::Value,
+    records: &[(u64, [u8; 32])],
+) -> (Vec<String>, Vec<String>) {
+    let mut neg = client_neg(records);
+    let init = neg.initiate().unwrap();
+    let mut seen = socket.sent().len();
+    msg(relay, conn, &neg_open_wire(sub, filter, &init));
+    let mut have_ids = Vec::new();
+    let mut need_ids = Vec::new();
+    loop {
+        let msgs = neg_msgs(socket, sub, seen);
+        assert_eq!(msgs.len(), 1, "expected one NEG-MSG: {:?}", socket.sent());
+        seen = socket.sent().len();
+        let frame: serde_json::Value = serde_json::from_str(&msgs[0]).unwrap();
+        let reply = unhex(frame[2].as_str().unwrap());
+        match neg
+            .reconcile_with_ids(&reply, &mut have_ids, &mut need_ids)
+            .unwrap()
+        {
+            Some(next) => msg(relay, conn, &neg_msg_wire(sub, &next)),
+            None => break,
+        }
+    }
+    let hexes = |ids: Vec<Id>| -> Vec<String> {
+        ids.iter()
+            .map(|id| faster_hex::hex_string(id.as_bytes()))
+            .collect()
+    };
+    (hexes(have_ids), hexes(need_ids))
+}
+
+/// Both directions converge: `have` is the client-only id, `need`
+/// the relay-only one.
+#[test]
+fn negentropy_reconciles_both_directions() {
+    let mut r = relay("");
+    let socket = connect(&mut r, 1);
+    let shared_a = event(&key(1), 1, NOW + 1, &json!([]), "a");
+    let shared_b = event(&key(1), 1, NOW + 2, &json!([]), "b");
+    let relay_only = event(&key(2), 1, NOW + 3, &json!([]), "r");
+    let client_only = event(&key(3), 1, NOW + 4, &json!([]), "c");
+    for ev in [&shared_a, &shared_b, &relay_only] {
+        msg(&mut r, 1, &event_frame(ev));
+    }
+    let (have, need) = neg_sync(
+        &mut r,
+        &socket,
+        1,
+        "s",
+        &json!({"kinds": [1]}),
+        &[
+            (shared_a.created_at(), shared_a.id().0),
+            (shared_b.created_at(), shared_b.id().0),
+            (client_only.created_at(), client_only.id().0),
+        ],
+    );
+    assert_eq!(have, [format!("{}", client_only.id())]);
+    assert_eq!(need, [format!("{}", relay_only.id())]);
+}
+
+/// Over the effective cap the open is refused `blocked:` with the
+/// limit as the fourth element.
+#[test]
+fn negentropy_over_cap_blocked() {
+    let mut r = relay("[relay.limits]\nmax_sync_events = 1\n");
+    let socket = connect(&mut r, 1);
+    for i in 0..2u64 {
+        let ev = event(&key(1), 1, NOW + i, &json!([]), "x");
+        msg(&mut r, 1, &event_frame(&ev));
+    }
+    let mut neg = client_neg(&[]);
+    let init = neg.initiate().unwrap();
+    msg(&mut r, 1, &neg_open_wire("s", &json!({}), &init));
+    assert_eq!(
+        socket.sent().last().unwrap(),
+        "[\"NEG-ERR\",\"s\",\"blocked: too many query results\",1]"
+    );
+}
+
+/// An exhausted row budget refuses the same way.
+#[test]
+fn negentropy_row_budget_blocked() {
+    let mut r = relay("[worker]\nmax_scan_rows = 1\n[relay.limits]\nmax_sync_events = 100\n");
+    let socket = connect(&mut r, 1);
+    for i in 0..2u64 {
+        let ev = event(&key(1), 1, NOW + i, &json!([]), "x");
+        msg(&mut r, 1, &event_frame(&ev));
+    }
+    let mut neg = client_neg(&[]);
+    let init = neg.initiate().unwrap();
+    msg(&mut r, 1, &neg_open_wire("s", &json!({}), &init));
+    assert_eq!(
+        socket.sent().last().unwrap(),
+        "[\"NEG-ERR\",\"s\",\"blocked: too many query results\",1]"
+    );
+}
+
+/// The sync-memory budget refuses a session it cannot reserve.
+#[test]
+fn negentropy_memory_budget_refusal() {
+    let mut r = relay("[relay]\nmax_sync_memory_bytes = 40\n");
+    let socket = connect(&mut r, 1);
+    for i in 0..2u64 {
+        let ev = event(&key(1), 1, NOW + i, &json!([]), "x");
+        msg(&mut r, 1, &event_frame(&ev));
+    }
+    let mut neg = client_neg(&[]);
+    let init = neg.initiate().unwrap();
+    msg(&mut r, 1, &neg_open_wire("s", &json!({}), &init));
+    assert_eq!(
+        socket.sent().last().unwrap(),
+        "[\"NEG-ERR\",\"s\",\"blocked: sync capacity exhausted\"]"
+    );
+}
+
+/// A `NEG-MSG` with no session is refused and a malformed round
+/// closes an open session — both with the native wording.
+#[test]
+fn negentropy_unknown_and_malformed() {
+    let mut r = relay("");
+    let socket = connect(&mut r, 1);
+    let ev = event(&key(1), 1, NOW, &json!([]), "x");
+    msg(&mut r, 1, &event_frame(&ev));
+
+    // No session ever opened under "s".
+    msg(&mut r, 1, &neg_msg_wire("s", &[0x60]));
+    assert!(
+        socket
+            .sent()
+            .contains(&"[\"NEG-ERR\",\"s\",\"closed: unknown subscription\"]".to_owned()),
+        "{:?}",
+        socket.sent()
+    );
+
+    // A malformed initial message refuses the open.
+    msg(&mut r, 1, &neg_open_wire("t", &json!({}), &[0xde, 0xad]));
+    assert!(
+        socket
+            .sent()
+            .contains(&"[\"NEG-ERR\",\"t\",\"invalid: malformed negentropy message\"]".to_owned()),
+        "{:?}",
+        socket.sent()
+    );
+
+    // A malformed round closes the open session.
+    let (have, need) = neg_sync(&mut r, &socket, 1, "u", &json!({}), &[]);
+    assert!(have.is_empty() && need.len() == 1, "{have:?} {need:?}");
+    let at = socket.sent().len();
+    msg(&mut r, 1, &neg_msg_wire("u", &[0xde, 0xad]));
+    assert_eq!(
+        socket.sent()[at..],
+        ["[\"NEG-ERR\",\"u\",\"invalid: malformed negentropy message\"]"]
+    );
+    msg(&mut r, 1, &neg_msg_wire("u", &[0x60]));
+    assert!(
+        socket.sent()[at..]
+            .contains(&"[\"NEG-ERR\",\"u\",\"closed: unknown subscription\"]".to_owned()),
+        "{:?}",
+        socket.sent()
+    );
+}
+
+/// `NEG-CLOSE` releases the reservation: with a budget of one
+/// record, a second open only succeeds when the first released.
+#[test]
+fn negentropy_close_releases_the_reservation() {
+    let mut r = relay("[relay]\nmax_sync_memory_bytes = 40\n");
+    let socket = connect(&mut r, 1);
+    let ev = event(&key(1), 1, NOW, &json!([]), "x");
+    msg(&mut r, 1, &event_frame(&ev));
+    let (have, need) = neg_sync(&mut r, &socket, 1, "s", &json!({}), &[]);
+    assert!(have.is_empty() && need.len() == 1, "{have:?} {need:?}");
+    msg(&mut r, 1, &neg_close_wire("s"));
+    // The reservation is gone: a second open fits the budget again.
+    let (have, need) = neg_sync(&mut r, &socket, 1, "t", &json!({}), &[]);
+    assert!(have.is_empty() && need.len() == 1, "{have:?} {need:?}");
+}
+
+/// Disconnecting releases the reservation the same way.
+#[test]
+fn negentropy_disconnect_releases_the_reservation() {
+    let mut r = relay("[relay]\nmax_sync_memory_bytes = 40\n");
+    let socket = connect(&mut r, 1);
+    let ev = event(&key(1), 1, NOW, &json!([]), "x");
+    msg(&mut r, 1, &event_frame(&ev));
+    let (have, need) = neg_sync(&mut r, &socket, 1, "s", &json!({}), &[]);
+    assert!(have.is_empty() && need.len() == 1, "{have:?} {need:?}");
+    r.close(1);
+    let socket2 = connect(&mut r, 2);
+    let (have, need) = neg_sync(&mut r, &socket2, 2, "s", &json!({}), &[]);
+    assert!(have.is_empty() && need.len() == 1, "{have:?} {need:?}");
+}
+
+/// A session idle 60 s is reaped with `closed: idle timeout` at the
+/// head of the next message.
+#[test]
+fn negentropy_idle_reap() {
+    let mut r = relay("");
+    let socket = connect(&mut r, 1);
+    let ev = event(&key(1), 1, NOW, &json!([]), "x");
+    msg(&mut r, 1, &event_frame(&ev));
+    let (have, need) = neg_sync(&mut r, &socket, 1, "s", &json!({}), &[]);
+    assert!(have.is_empty() && need.len() == 1, "{have:?} {need:?}");
+    let at = socket.sent().len();
+    // Any later message reaps the idle session first.
+    let _ = r.message(1, (NOW + 60) * 1000, "[\"REQ\",\"x\",{\"kinds\":[999]}]");
+    assert_eq!(
+        socket.sent()[at],
+        "[\"NEG-ERR\",\"s\",\"closed: idle timeout\"]"
+    );
+    // The session is gone: a NEG-MSG answers unknown.
+    let _ = r.message(1, (NOW + 61) * 1000, &neg_msg_wire("s", &[0x60]));
+    assert!(
+        socket.sent()[at..]
+            .contains(&"[\"NEG-ERR\",\"s\",\"closed: unknown subscription\"]".to_owned()),
+        "{:?}",
+        socket.sent()
+    );
+}
+
+/// A Durable Object wake loses every session: reopening the relay
+/// over the same store leaves `NEG-MSG` answering
+/// `closed: unknown subscription`.
+#[test]
+fn negentropy_reopen_loses_sessions() {
+    let exec = Connection::open_in_memory().unwrap();
+    let socket = FakeSocket::default();
+    let attachment;
+    {
+        let mut r = relay_on(exec, "", vec![]);
+        attachment = r
+            .accept(socket.clone(), 1, None, "challenge-1".to_owned())
+            .unwrap();
+        msg(
+            &mut r,
+            1,
+            &event_frame(&event(&key(1), 1, NOW, &json!([]), "x")),
+        );
+        let (have, need) = neg_sync(&mut r, &socket, 1, "s", &json!({}), &[]);
+        assert!(have.is_empty() && need.len() == 1, "{have:?} {need:?}");
+        // Reopen over the same store: a fresh isolate lost the
+        // in-memory session, and `resume` restored no neg slots.
+        let mut r = relay_on(
+            r.into_store().into_exec(),
+            "",
+            vec![(socket.clone(), attachment)],
+        );
+        msg(&mut r, 1, &neg_msg_wire("s", &[0x60]));
+        assert!(
+            socket
+                .sent()
+                .contains(&"[\"NEG-ERR\",\"s\",\"closed: unknown subscription\"]".to_owned()),
+            "{:?}",
+            socket.sent()
+        );
+    }
+}
+
+/// NIP-11 advertises 77 while sync is enabled and not when
+/// `max_sync_events` disables it.
+#[test]
+fn nip11_lists_77_when_sync_enabled() {
+    let r = relay("");
+    let info: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
+    assert!(
+        info["supported_nips"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(77))
+    );
+    let r = relay("[relay.limits]\nmax_sync_events = 0\n");
+    let info: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
+    assert!(
+        !info["supported_nips"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(77))
     );
 }
