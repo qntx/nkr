@@ -8,6 +8,7 @@ use nosfry_core::deletion::DeletionTarget;
 use nosfry_core::event::{Event, EventId, PublicKey, UnverifiedEvent, supersedes};
 use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
+use nosfry_core::moderation::{ModOp, Moderation};
 use nosfry_core::packed::PackedRef;
 use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
@@ -16,7 +17,7 @@ use crate::exec::{Executor, Param, Value};
 use crate::{Count, Scan, StoreError};
 
 /// The on-disk schema version `meta.format` must hold.
-pub const FORMAT_VERSION: i64 = 2;
+pub const FORMAT_VERSION: i64 = 3;
 
 /// The largest integer JavaScript exchanges losslessly (`2^53 - 1`).
 /// Every integer bound into SQL is clamped to it; a `created_at`
@@ -86,7 +87,40 @@ const SCHEMA: &[&str] = &[
         created_at INTEGER,
         seq INTEGER
     ) WITHOUT ROWID",
+    // NIP-86: one `mod_pubkeys` row carries the pubkey's current
+    // state, so ban↔allow exclusivity is automatic on REPLACE.
+    // `reason` is NULL for absent-or-empty.
+    "CREATE TABLE IF NOT EXISTS mod_pubkeys (
+        pubkey BLOB PRIMARY KEY,
+        state INTEGER NOT NULL,
+        reason TEXT
+    ) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS mod_events (
+        id BLOB PRIMARY KEY,
+        reason TEXT
+    ) WITHOUT ROWID",
+    // NIP-86: one `mod_kinds` row carries the kind's current state —
+    // allow↔disallow exclusivity is automatic on REPLACE.
+    "CREATE TABLE IF NOT EXISTS mod_kinds (
+        kind INTEGER PRIMARY KEY,
+        state INTEGER NOT NULL
+    ) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS mod_ips (
+        ip TEXT PRIMARY KEY,
+        reason TEXT
+    ) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS mod_info (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    ) WITHOUT ROWID",
 ];
+
+/// `mod_pubkeys`/`mod_kinds` state codes (the LMDB layout's state
+/// bytes): a single row per key carries the current state, so
+/// ban↔allow and allow↔disallow exclusivity is automatic on REPLACE.
+const ST_BANNED: i64 = 0;
+const ST_ALLOWED: i64 = 1;
+const ST_DISALLOWED: i64 = 2;
 
 /// The result of one [`SqlStore::write`] transaction.
 #[derive(Debug, Default)]
@@ -695,6 +729,142 @@ impl<E: Executor> SqlStore<E> {
         Ok(walk)
     }
 
+    /// Apply one NIP-86 `op` in a single transaction and return the
+    /// rebuilt [`Moderation`] snapshot. [`ModOp::BanEvent`] also
+    /// deletes the stored event, when present, through the full
+    /// `delete_seq` routine in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure,
+    /// [`StoreError::Corrupt`] on a row that cannot decode.
+    pub fn moderate(&self, op: ModOp) -> Result<Moderation, StoreError> {
+        self.exec.transaction(|| {
+            match op {
+                ModOp::BanPubkey { pubkey, reason } => self.exec_sql(
+                    "INSERT OR REPLACE INTO mod_pubkeys (pubkey, state, reason)
+                     VALUES (?1, ?2, ?3)",
+                    &[
+                        Param::Blob(&pubkey.0),
+                        Param::Int(ST_BANNED),
+                        reason_param(reason.as_deref()),
+                    ],
+                )?,
+                ModOp::UnbanPubkey { pubkey } => self.exec_sql(
+                    "DELETE FROM mod_pubkeys WHERE pubkey = ?1 AND state = ?2",
+                    &[Param::Blob(&pubkey.0), Param::Int(ST_BANNED)],
+                )?,
+                ModOp::AllowPubkey { pubkey, reason } => self.exec_sql(
+                    "INSERT OR REPLACE INTO mod_pubkeys (pubkey, state, reason)
+                     VALUES (?1, ?2, ?3)",
+                    &[
+                        Param::Blob(&pubkey.0),
+                        Param::Int(ST_ALLOWED),
+                        reason_param(reason.as_deref()),
+                    ],
+                )?,
+                ModOp::UnallowPubkey { pubkey } => self.exec_sql(
+                    "DELETE FROM mod_pubkeys WHERE pubkey = ?1 AND state = ?2",
+                    &[Param::Blob(&pubkey.0), Param::Int(ST_ALLOWED)],
+                )?,
+                ModOp::BanEvent { id, reason } => self.ban_event(&id, reason.as_deref())?,
+                ModOp::UnbanEvent { id } => self.exec_sql(
+                    "DELETE FROM mod_events WHERE id = ?1",
+                    &[Param::Blob(&id.0)],
+                )?,
+                ModOp::AllowKind { kind } => self.exec_sql(
+                    "INSERT OR REPLACE INTO mod_kinds (kind, state) VALUES (?1, ?2)",
+                    &[Param::Int(i64::from(kind)), Param::Int(ST_ALLOWED)],
+                )?,
+                ModOp::DisallowKind { kind } => self.exec_sql(
+                    "INSERT OR REPLACE INTO mod_kinds (kind, state) VALUES (?1, ?2)",
+                    &[Param::Int(i64::from(kind)), Param::Int(ST_DISALLOWED)],
+                )?,
+                ModOp::BlockIp { ip, reason } => self.exec_sql(
+                    "INSERT OR REPLACE INTO mod_ips (ip, reason) VALUES (?1, ?2)",
+                    &[
+                        Param::Text(&ip.to_string()),
+                        reason_param(reason.as_deref()),
+                    ],
+                )?,
+                ModOp::UnblockIp { ip } => self.exec_sql(
+                    "DELETE FROM mod_ips WHERE ip = ?1",
+                    &[Param::Text(&ip.to_string())],
+                )?,
+                ModOp::SetInfo { field, value } => self.exec_sql(
+                    "INSERT OR REPLACE INTO mod_info (key, value) VALUES (?1, ?2)",
+                    &[Param::Text(field.as_str()), Param::Text(&value)],
+                )?,
+            }
+            self.moderation()
+        })
+    }
+
+    /// Load the full [`Moderation`] snapshot — used at startup so a
+    /// restart keeps every ban, and after each applied op.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Sql`] on executor failure,
+    /// [`StoreError::Corrupt`] on a row that cannot decode.
+    pub fn moderation(&self) -> Result<Moderation, StoreError> {
+        let mut m = Moderation::default();
+        self.query_rows(
+            "SELECT pubkey, state, reason FROM mod_pubkeys",
+            &[],
+            |row| {
+                let pubkey = PublicKey(blob(row, 0)?);
+                match uint(row, 1)? {
+                    0 => {
+                        m.banned_pubkeys.insert(pubkey, mod_reason(row, 2)?);
+                    }
+                    1 => {
+                        m.allowed_pubkeys.insert(pubkey, mod_reason(row, 2)?);
+                    }
+                    _ => return Err(StoreError::Corrupt("bad mod_pubkeys state")),
+                }
+                Ok(())
+            },
+        )?;
+        self.query_rows("SELECT id, reason FROM mod_events", &[], |row| {
+            m.banned_events
+                .insert(EventId(blob(row, 0)?), mod_reason(row, 1)?);
+            Ok(())
+        })?;
+        self.query_rows("SELECT kind, state FROM mod_kinds", &[], |row| {
+            let kind = u16::try_from(uint(row, 0)?)
+                .map_err(|_| StoreError::Corrupt("bad mod_kinds key"))?;
+            match uint(row, 1)? {
+                1 => {
+                    m.allowed_kinds.insert(kind);
+                }
+                2 => {
+                    m.disallowed_kinds.insert(kind);
+                }
+                _ => return Err(StoreError::Corrupt("bad mod_kinds state")),
+            }
+            Ok(())
+        })?;
+        self.query_rows("SELECT ip, reason FROM mod_ips", &[], |row| {
+            let ip = text(row, 0)?
+                .parse()
+                .map_err(|_| StoreError::Corrupt("bad mod_ips key"))?;
+            m.blocked_ips.insert(ip, mod_reason(row, 1)?);
+            Ok(())
+        })?;
+        self.query_rows("SELECT key, value FROM mod_info", &[], |row| {
+            let value = Box::<str>::from(text(row, 1)?);
+            match text(row, 0)? {
+                "name" => m.name = Some(value),
+                "description" => m.description = Some(value),
+                "icon" => m.icon = Some(value),
+                _ => return Err(StoreError::Corrupt("bad mod_info key")),
+            }
+            Ok(())
+        })?;
+        Ok(m)
+    }
+
     /// Apply every target of a stored kind-5 `event` (NIP-09). Targets
     /// are processed after the kind 5 itself is inserted.
     fn apply_deletions(&self, event: &Event) -> Result<(), StoreError> {
@@ -818,6 +988,22 @@ impl<E: Executor> SqlStore<E> {
     }
 
     /// Execute one statement, boxing the executor error.
+    /// `banevent`: record the ban and delete a stored event through
+    /// the full `delete_seq` routine (same transaction, caller's).
+    fn ban_event(&self, id: &EventId, reason: Option<&str>) -> Result<(), StoreError> {
+        self.exec_sql(
+            "INSERT OR REPLACE INTO mod_events (id, reason) VALUES (?1, ?2)",
+            &[Param::Blob(&id.0), reason_param(reason)],
+        )?;
+        if let Some(row) = self.row(
+            "SELECT seq FROM events WHERE id = ?1",
+            &[Param::Blob(&id.0)],
+        )? {
+            self.delete_seq(uint(&row, 0)?)?;
+        }
+        Ok(())
+    }
+
     fn exec_sql(&self, sql: &str, params: &[Param<'_>]) -> Result<(), StoreError> {
         self.exec.execute(sql, params).map_err(StoreError::sql)
     }
@@ -971,6 +1157,26 @@ pub(crate) fn record(row: &[Value], i: usize) -> Result<PackedRef<'_>, StoreErro
             PackedRef::new(bytes).ok_or(StoreError::Corrupt("bad packed record"))
         }
         _ => Err(StoreError::Corrupt("row column is not a blob")),
+    }
+}
+
+/// A `reason` for a `mod_*` row: `None` and empty both bind NULL —
+/// the loaded snapshot maps them back to `None`, as the LMDB
+/// encoding does.
+fn reason_param(reason: Option<&str>) -> Param<'_> {
+    reason
+        .filter(|reason| !reason.is_empty())
+        .map_or(Param::Null, Param::Text)
+}
+
+/// Column `i` of `row` as an optional reason (`NULL` or empty =
+/// `None` — the LMDB encoding collapses both).
+fn mod_reason(row: &[Value], i: usize) -> Result<Option<Box<str>>, StoreError> {
+    match row.get(i) {
+        Some(Value::Null) => Ok(None),
+        Some(Value::Text(s)) if s.is_empty() => Ok(None),
+        Some(Value::Text(s)) => Ok(Some(Box::from(s.as_str()))),
+        _ => Err(StoreError::Corrupt("row column is not text")),
     }
 }
 
