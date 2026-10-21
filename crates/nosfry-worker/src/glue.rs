@@ -700,6 +700,11 @@ impl DurableObject for RelayObject {
     }
 
     async fn alarm(&self) -> Result<Response> {
+        // The fired alarm is consumed: clear the cache so an early
+        // error below cannot leave the stale (past) time suppressing
+        // every later `schedule_alarm` — the next schedule reconciles
+        // with `get_alarm`.
+        self.alarm.set(None);
         let now = worker::Date::now().as_millis() / 1000;
         let next = {
             let borrowed = self.relay.borrow();
