@@ -28,8 +28,8 @@ use std::sync::Arc;
 use nosfry_core::event::{PublicKey, event_id, serialize_for_id};
 use nosfry_core::kind::Kind;
 use nosfry_core::limits::{AddressBuckets, Limits};
-use nosfry_core::message::ClientVerb;
-use nosfry_core::session::{Command, Received, Session};
+use nosfry_core::message::{ClientVerb, SubId};
+use nosfry_core::session::{Command, Received, Session, SubKey};
 use nosfry_core::url::RelayUrl;
 use secp256k1::Keypair;
 use secp256k1::schnorr;
@@ -366,7 +366,7 @@ fn sub_id_emoji_length_counts_chars() {
 
 #[test]
 fn close_by_relay_only_removes_current_generation() {
-    use nosfry_core::session::SubKey;
+    use SubKey;
     let mut s = session();
     let out = feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
     let Command::Subscribe { sub: first, .. } = &out[0] else {
@@ -1021,8 +1021,8 @@ fn refused_re_req_closes_old_subscription() {
     let mut s = session();
     // Open "a", then re-REQ it with a filter that fails parsing.
     feed(&mut s, 1, "[\"REQ\",\"a\",{}]");
-    assert!(s.is_current(&nosfry_core::session::SubKey {
-        id: nosfry_core::message::SubId::parse("a").unwrap(),
+    assert!(s.is_current(&SubKey {
+        id: SubId::parse("a").unwrap(),
         generation: 1,
     }));
     let out = feed(&mut s, 1, "[\"REQ\",\"a\",{\"kinds\":[\"x\"]}]");
@@ -1033,8 +1033,8 @@ fn refused_re_req_closes_old_subscription() {
         ),
         "{out:?}"
     );
-    assert!(!s.is_current(&nosfry_core::session::SubKey {
-        id: nosfry_core::message::SubId::parse("a").unwrap(),
+    assert!(!s.is_current(&SubKey {
+        id: SubId::parse("a").unwrap(),
         generation: 1,
     }));
     // Too many filters: same teardown before CLOSED.
@@ -1311,7 +1311,7 @@ fn neg_close_by_relay_matches_generation() {
     let Command::NegOpen { sub, .. } = &out[0] else {
         unreachable!()
     };
-    let stale = nosfry_core::session::SubKey {
+    let stale = SubKey {
         id: sub.id.clone(),
         generation: sub.generation + 1,
     };
@@ -1464,4 +1464,82 @@ fn neg_and_req_share_id_not_state() {
         sends(&out)[0].contains("closed: unknown subscription"),
         "{out:?}"
     );
+}
+
+/// A session resumed from persisted state keeps the authenticated
+/// pubkeys: a protected event by an authed author publishes without
+/// another AUTH, and `challenge_sent` stays set.
+#[test]
+fn resumed_session_keeps_authed_pubkeys() {
+    let t = 1_700_000_000u64;
+    let service_url = RelayUrl::parse("wss://relay.example.com").expect("service url");
+    let authed: Arc<[PublicKey]> = Arc::from([PublicKey::from_hex(&pubkey_hex([9; 32])).unwrap()]);
+    let mut s = Session::resume(
+        Arc::new(Limits {
+            auth: Arc::new(nosfry_core::auth::AuthRules::new(
+                Some(service_url),
+                &[4],
+                true,
+            )),
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+        true,
+        authed,
+    );
+    assert!(s.challenge_sent());
+    assert_eq!(s.authenticated().len(), 1);
+    let protected = format!(
+        "[\"EVENT\",{}]",
+        signed_event_json([9; 32], t, 1, "[[\"-\"]]", "for me only")
+    );
+    let out = feed(&mut s, t, &protected);
+    assert!(
+        matches!(out.as_slice(), [Command::Publish { .. }]),
+        "{out:?}"
+    );
+}
+
+/// A resumed session whose challenge was already sent does not send
+/// it again.
+#[test]
+fn resumed_session_does_not_resend_challenge() {
+    let service_url = RelayUrl::parse("wss://relay.example.com").expect("service url");
+    let mut s = Session::resume(
+        Arc::new(Limits {
+            auth: Arc::new(nosfry_core::auth::AuthRules::new(
+                Some(service_url),
+                &[4],
+                true,
+            )),
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+        true,
+        Arc::from([]),
+    );
+    let out = feed(&mut s, 1, "[\"REQ\",\"a\",{\"kinds\":[4]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"a\",\"auth-required: requested filter requires authentication\"]"],
+        "{out:?}"
+    );
+}
+
+/// `CLOSE` of a subscription restored by `resume_sub` emits
+/// `Unsubscribe` and drops the generation.
+#[test]
+fn close_of_resumed_sub_unsubscribes() {
+    let mut s = session();
+    let key = s.resume_sub(SubId::parse("a").expect("sub id"));
+    assert!(s.is_current(&key));
+    let out = feed(&mut s, 1, "[\"CLOSE\",\"a\"]");
+    assert!(
+        matches!(out.as_slice(), [Command::Unsubscribe { .. }]),
+        "{out:?}"
+    );
+    assert!(!s.is_current(&key));
 }
