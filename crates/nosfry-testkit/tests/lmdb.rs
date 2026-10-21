@@ -25,6 +25,7 @@ use nosfry_core::auth::ReadGate;
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
+use nosfry_core::moderation::{ModOp, Moderation};
 use nosfry_core::sign::{event, keys};
 use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
@@ -126,6 +127,18 @@ impl StoreDriver for LmdbDriver<'_> {
     fn drain_vanish(&mut self) {
         while self.store.vanish_step(3).unwrap().more {}
     }
+
+    fn moderate(&mut self, op: ModOp) -> Moderation {
+        self.store.moderate(op).unwrap()
+    }
+}
+
+/// The shared NIP-86 script replays identically on LMDB.
+#[test]
+fn moderation_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path(), &StoreOptions::default()).unwrap();
+    nosfry_testkit::driver::moderation_check(&mut LmdbDriver { store: &store });
 }
 
 proptest! {

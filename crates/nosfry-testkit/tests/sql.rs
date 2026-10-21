@@ -24,6 +24,7 @@ use nosfry_core::auth::ReadGate;
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
 use nosfry_core::hll::Hll;
+use nosfry_core::moderation::{ModOp, Moderation};
 use nosfry_core::store::WriteOutcome;
 use nosfry_core::url::RelayUrl;
 use nosfry_sql::rusqlite::Connection;
@@ -101,6 +102,17 @@ impl StoreDriver for SqlDriver {
     fn drain_vanish(&mut self) {
         while self.store.vanish_step(3).unwrap().more {}
     }
+
+    fn moderate(&mut self, op: ModOp) -> Moderation {
+        self.store.moderate(op).unwrap()
+    }
+}
+
+/// The shared NIP-86 script replays identically on SQL.
+#[test]
+fn moderation_script() {
+    let store = SqlStore::open(Connection::open_in_memory().unwrap()).unwrap();
+    nosfry_testkit::driver::moderation_check(&mut SqlDriver { store });
 }
 
 proptest! {
