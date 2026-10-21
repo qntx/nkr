@@ -586,6 +586,27 @@ impl<'a> Connection<'a> {
         drop(tokio::time::timeout(CLOSE_TIMEOUT, ws.send(Frame::close(code, reason))).await);
     }
 
+    /// Best-effort flush of yawc's queued control frames — the close
+    /// a read error (oversized payload, protocol violation) or a
+    /// peer close leaves in `obligated_sends` — under the close
+    /// deadline so the peer sees the code instead of a bare EOF.
+    /// `Sink::poll_ready` is what drains the queue (`poll_flush`
+    /// does not).
+    async fn drain_obligated(&self, ws: &mut HttpWebSocket) {
+        drop(
+            tokio::time::timeout(CLOSE_TIMEOUT, async {
+                drop(
+                    futures_util::future::poll_fn(|cx| {
+                        futures_util::Sink::poll_ready(std::pin::Pin::new(&mut *ws), cx)
+                    })
+                    .await,
+                );
+                drop(ws.flush().await);
+            })
+            .await,
+        );
+    }
+
     /// Drop everything this connection registered at the shard.
     async fn teardown(&self) {
         drop(
@@ -641,5 +662,6 @@ pub(crate) async fn run(
         }
     }
 
+    conn.drain_obligated(ws).await;
     conn.teardown().await;
 }
