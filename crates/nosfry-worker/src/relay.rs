@@ -522,28 +522,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
         nips.sort_unstable();
         let relay = &self.config.relay;
-        let info = nosfry_core::info::Info {
-            name: self
-                .moderation
-                .name
-                .as_deref()
-                .unwrap_or(&relay.info.name)
-                .to_owned(),
-            description: self
-                .moderation
-                .description
-                .as_deref()
-                .unwrap_or(&relay.info.description)
-                .to_owned(),
-            pubkey: relay.info.pubkey.clone(),
-            contact: relay.info.contact.clone(),
-            icon: self
-                .moderation
-                .icon
-                .as_deref()
-                .unwrap_or(&relay.info.icon)
-                .to_owned(),
-        };
+        let info = relay.info.with_overrides(&self.moderation);
         nosfry_core::info::document(&info, &nips, &self.limits, relay.max_websocket_payload_size)
     }
 
