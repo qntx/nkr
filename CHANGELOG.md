@@ -135,6 +135,9 @@ down`; CLOSE is never charged.
   `relay.query_timeslice_budget_microseconds`,
   `relay.limits.max_filter_limit`) keep their startup values and are
   logged as ignored.
+- The writer thread logs a warning when a store commit, the shard
+  enqueue, or an expiry sweep takes over one second — a stall there
+  delays every publisher's `OK` while read queries keep completing.
 
 ### Changed
 

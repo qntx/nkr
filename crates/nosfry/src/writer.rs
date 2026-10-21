@@ -2,13 +2,13 @@
 
 use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nosfry_core::message::{RelayVerb, ok_frame};
 use nosfry_lmdb::{Store, WriteOutcome};
 use tokio::sync::mpsc;
 
-use crate::channels::{Batch, Out, ShardMsg, WriteRequest, WriterMsg};
+use crate::channels::{Batch, Out, Outbound, ShardMsg, WriteRequest, WriterMsg};
 use crate::metrics::{Metrics, StoreOp};
 
 /// Maximum events applied per write transaction.
@@ -20,6 +20,10 @@ const EXPIRE_CAP: usize = 10_000;
 
 /// Expiry timer cadence (strfry's cron interval is ~9 s).
 const EXPIRE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// A store commit, shard enqueue, or expiry sweep slower than this is
+/// logged — it stalls every publisher's `OK` while reads keep flowing.
+const SLOW_WRITE: Duration = Duration::from_secs(1);
 
 /// Current unix time; `0` before the epoch (never in practice).
 fn now() -> u64 {
@@ -89,21 +93,37 @@ pub(crate) fn run(
             Some(WriterMsg::Expire) | None => expire_pending = true,
         }
         if expire_pending {
-            match store.expire(now(), EXPIRE_CAP) {
-                Ok(deleted) => {
-                    expire_backlog = deleted >= EXPIRE_CAP;
-                    expire_pending = expire_backlog;
-                }
-                Err(err) => {
-                    metrics.store_error(StoreOp::Expire);
-                    tracing::error!(%err, "expiry sweep failed");
-                    expire_pending = false;
-                    expire_backlog = false;
-                }
-            }
-            clear_stale_readers(store);
+            expire_backlog = expire_sweep(store, metrics);
+            expire_pending = expire_backlog;
         }
     }
+}
+
+/// One expiry sweep plus the stale-reader check. `true` means the
+/// sweep hit its cap, so the loop keeps polling the inbox
+/// non-blockingly and sweeps again.
+fn expire_sweep(store: &Store, metrics: &Metrics) -> bool {
+    let started = Instant::now();
+    let backlog = match store.expire(now(), EXPIRE_CAP) {
+        Ok(deleted) => {
+            let elapsed = started.elapsed();
+            if elapsed > SLOW_WRITE {
+                tracing::warn!(
+                    elapsed_ms = elapsed.as_millis(),
+                    deleted,
+                    "slow expiry sweep"
+                );
+            }
+            deleted >= EXPIRE_CAP
+        }
+        Err(err) => {
+            metrics.store_error(StoreOp::Expire);
+            tracing::error!(%err, "expiry sweep failed");
+            false
+        }
+    };
+    clear_stale_readers(store);
+    backlog
 }
 
 /// `mdb_reader_check`: clear lock-table slots left by readers whose
@@ -128,22 +148,73 @@ fn write_batch(
 ) {
     let events: Vec<Arc<nosfry_core::event::Event>> =
         reqs.iter().map(|r| Arc::clone(&r.event)).collect();
+    let started = Instant::now();
     let written = match store.write(&events) {
         Ok(written) => written,
         Err(err) => {
-            metrics.store_error(StoreOp::Write);
-            tracing::error!(%err, "store write failed");
-            for req in reqs {
-                req.out.push(Out::Frame {
-                    sub: None,
-                    verb: RelayVerb::Ok,
-                    text: ok_frame(&req.event.id(), false, "error: internal error"),
-                });
-            }
+            write_failed(reqs, metrics, &err);
             return;
         }
     };
-    let mut batch: Batch = Vec::new();
+    let commit_elapsed = started.elapsed();
+    if commit_elapsed > SLOW_WRITE {
+        tracing::warn!(
+            elapsed_ms = commit_elapsed.as_millis(),
+            events = events.len(),
+            "slow store commit"
+        );
+    }
+    let (batch, replies) = collect_batch(reqs, written, events);
+    enqueue_batch(batch, shards);
+    for (out, text) in replies {
+        out.push(Out::Frame {
+            sub: None,
+            verb: RelayVerb::Ok,
+            text,
+        });
+    }
+}
+
+/// A failed commit: count the error and answer every request
+/// `OK false "error: internal error"`.
+fn write_failed(reqs: Vec<WriteRequest>, metrics: &Metrics, err: &nosfry_lmdb::StoreError) {
+    metrics.store_error(StoreOp::Write);
+    tracing::error!(%err, "store write failed");
+    for req in reqs {
+        req.out.push(Out::Frame {
+            sub: None,
+            verb: RelayVerb::Ok,
+            text: ok_frame(&req.event.id(), false, "error: internal error"),
+        });
+    }
+}
+
+/// Queue the stored batch on every monitor shard (`blocking_send`:
+/// the writer applies backpressure instead of dropping events).
+fn enqueue_batch(batch: Batch, shards: &[mpsc::Sender<ShardMsg>]) {
+    if batch.is_empty() {
+        return;
+    }
+    let batch = Arc::new(batch);
+    let started = Instant::now();
+    for shard in shards {
+        drop(shard.blocking_send(ShardMsg::Batch(Arc::clone(&batch))));
+    }
+    let elapsed = started.elapsed();
+    if elapsed > SLOW_WRITE {
+        tracing::warn!(elapsed_ms = elapsed.as_millis(), "slow shard enqueue");
+    }
+}
+
+/// Split a commit's outcomes into the shard batch (`Stored` events
+/// minus the ones the same transaction deleted) and each request's
+/// serialized `OK` reply.
+fn collect_batch(
+    reqs: Vec<WriteRequest>,
+    written: nosfry_lmdb::Written,
+    events: Vec<Arc<nosfry_core::event::Event>>,
+) -> (Batch, Vec<(Outbound, String)>) {
+    let mut batch = Vec::new();
     let mut replies = Vec::with_capacity(reqs.len());
     for (req, (outcome, event)) in reqs
         .into_iter()
@@ -157,19 +228,7 @@ fn write_batch(
             batch.push((seq, event));
         }
     }
-    if !batch.is_empty() {
-        let batch = Arc::new(batch);
-        for shard in shards {
-            drop(shard.blocking_send(ShardMsg::Batch(Arc::clone(&batch))));
-        }
-    }
-    for (out, text) in replies {
-        out.push(Out::Frame {
-            sub: None,
-            verb: RelayVerb::Ok,
-            text,
-        });
-    }
+    (batch, replies)
 }
 
 /// The expiry timer: nudge the writer every [`EXPIRE_INTERVAL`]. The
