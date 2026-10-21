@@ -535,6 +535,222 @@ async fn oversized_frame_closes_connection() {
     relay.stop().await;
 }
 
+/// A raw WebSocket client that negotiates permessage-deflate by hand:
+/// the tests need to see RSV1 bits and craft frames whose wire size
+/// differs from the inflated size, which a library client hides.
+struct DeflateSocket {
+    stream: tokio::net::TcpStream,
+    /// Inflate state persists across frames: with the sliding window
+    /// negotiated the compressor may back-reference earlier messages.
+    inflater: flate2::Decompress,
+}
+
+impl DeflateSocket {
+    async fn connect(addr: std::net::SocketAddr) -> Self {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: nosfry-test\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+            "\r\n",
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("sec-websocket-extensions: permessage-deflate"),
+            "deflate was not negotiated: {head}"
+        );
+        Self {
+            stream,
+            inflater: flate2::Decompress::new(false),
+        }
+    }
+
+    /// One masked client frame of the given opcode.
+    async fn send_frame(&mut self, compressed: bool, opcode: u8, payload: &[u8]) {
+        let mask = [0x12, 0x34, 0x56, 0x78u8];
+        let mut frame = Vec::with_capacity(payload.len() + 14);
+        frame.push(0x80 | (u8::from(compressed) << 6) | opcode);
+        let len = payload.len();
+        if len <= 125 {
+            frame.push(0x80 | u8::try_from(len).unwrap());
+        } else if u16::try_from(len).is_ok() {
+            frame.push(0x80 | 0x7e);
+            frame.extend_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+        } else {
+            frame.push(0x80 | 0x7f);
+            frame.extend_from_slice(&u64::try_from(len).unwrap().to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i & 3]));
+        self.stream.write_all(&frame).await.unwrap();
+    }
+
+    /// One server frame; `None` on EOF. The relay does not fragment.
+    async fn read(&mut self) -> Option<(bool, u8, Vec<u8>)> {
+        let mut header = [0u8; 2];
+        self.stream.read_exact(&mut header).await.ok()?;
+        let rsv1 = header[0] & 0x40 != 0;
+        let opcode = header[0] & 0x0f;
+        let mut len = u64::from(header[1] & 0x7f);
+        if len == 126 {
+            let mut ext = [0u8; 2];
+            self.stream.read_exact(&mut ext).await.ok()?;
+            len = u64::from(u16::from_be_bytes(ext));
+        } else if len == 127 {
+            let mut ext = [0u8; 8];
+            self.stream.read_exact(&mut ext).await.ok()?;
+            len = u64::from_be_bytes(ext);
+        }
+        let mut payload = vec![0u8; usize::try_from(len).unwrap()];
+        self.stream.read_exact(&mut payload).await.ok()?;
+        if rsv1 {
+            payload = self.inflate(&payload);
+        }
+        Some((rsv1, opcode, payload))
+    }
+
+    /// Decompress one message through the persistent window.
+    fn inflate(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut wire = data.to_vec();
+        wire.extend_from_slice(&[0, 0, 0xff, 0xff]);
+        let mut out = Vec::with_capacity(wire.len() * 4 + 64);
+        let base = self.inflater.total_in();
+        while (self.inflater.total_in() - base) < wire.len() as u64 {
+            let before = self.inflater.total_in();
+            self.inflater
+                .decompress_vec(&wire, &mut out, flate2::FlushDecompress::Sync)
+                .unwrap();
+            assert!(self.inflater.total_in() > before, "inflate stalled");
+        }
+        out
+    }
+
+    /// The next data or close frame; pings get an automatic pong and
+    /// other control frames are skipped.
+    async fn read_data(&mut self) -> Option<(bool, u8, Vec<u8>)> {
+        loop {
+            let (rsv1, opcode, payload) = self.read().await?;
+            match opcode {
+                0x9 => self.send_frame(false, 0xa, &payload).await,
+                0xa => {}
+                _ => return Some((rsv1, opcode, payload)),
+            }
+        }
+    }
+}
+
+/// Raw permessage-deflate message compression (`Z_SYNC_FLUSH` tail
+/// stripped, as RFC 7692 requires).
+fn deflate(text: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 64);
+    flate2::Compress::new(flate2::Compression::fast(), false)
+        .compress_vec(text, &mut out, flate2::FlushCompress::Sync)
+        .unwrap();
+    out.truncate(out.len() - 4);
+    out
+}
+
+/// One server frame, decompressed when RSV1 is set.
+async fn recv_deflated(ws: &mut DeflateSocket) -> Option<(u8, Vec<u8>)> {
+    let (_rsv1, opcode, payload) = ws.read_data().await?;
+    Some((opcode, payload))
+}
+
+/// A frame whose wire size is tiny but whose inflated size exceeds
+/// `max_websocket_payload_size` must close the connection with 1009
+/// without delivering anything (yawc#55, fixed by 0.4.4).
+#[tokio::test]
+async fn compressed_inflation_over_limit_closes_1009() {
+    let mut config = common::config();
+    config.relay.compression.enabled = true;
+    config.relay.max_websocket_payload_size = 4096;
+    let relay = Relay::start_with(config).await;
+    let mut ws = DeflateSocket::connect(relay.addr).await;
+
+    let text = "x".repeat(4097);
+    ws.send_frame(true, 0x1, &deflate(text.as_bytes())).await;
+    let deadline = Instant::now() + T;
+    loop {
+        let frame = tokio::time::timeout(T, ws.read_data()).await.unwrap();
+        let Some((_, opcode, payload)) = frame else {
+            panic!("connection dropped without a close frame");
+        };
+        assert!(Instant::now() <= deadline, "no close frame within deadline");
+        assert_ne!(opcode, 0x1, "oversized message must not be delivered");
+        if opcode == 0x8 {
+            assert_eq!(
+                u16::from_be_bytes([payload[0], payload[1]]),
+                1009,
+                "close code"
+            );
+            break;
+        }
+    }
+    relay.stop().await;
+}
+
+/// With deflate negotiated, a compressed EVENT under the limit is
+/// accepted and replies (OK, EVENT, EOSE) come back compressed.
+#[tokio::test]
+async fn compressed_event_round_trip() {
+    let mut config = common::config();
+    config.relay.compression.enabled = true;
+    let relay = Relay::start_with(config).await;
+    let mut ws = DeflateSocket::connect(relay.addr).await;
+
+    let ev = common::event(&key(7), 1, now(), &json!([]), "compressed");
+    let id = json(ev.json())["id"].as_str().unwrap().to_owned();
+    ws.send_frame(true, 0x1, &deflate(event_wire(&ev).as_bytes()))
+        .await;
+    let (opcode, payload) = recv_deflated(&mut ws).await.unwrap();
+    assert_eq!(opcode, 0x1);
+    let ok = json(std::str::from_utf8(&payload).unwrap());
+    assert_eq!(ok[0], "OK");
+    assert_eq!(ok[1], id);
+    assert_eq!(ok[2], true);
+
+    ws.send_frame(
+        true,
+        0x1,
+        &deflate(req_wire("s", &format!("{{\"ids\":[\"{id}\"]}}")).as_bytes()),
+    )
+    .await;
+    let mut saw_event = false;
+    let mut saw_eose = false;
+    for _ in 0..4 {
+        let (rsv1, opcode, payload) = ws.read_data().await.unwrap();
+        assert!(rsv1, "relayed frames must be compressed once negotiated");
+        assert_eq!(opcode, 0x1);
+        let frame = json(std::str::from_utf8(&payload).unwrap());
+        match frame[0].as_str().unwrap() {
+            "EVENT" => {
+                assert_eq!(frame[2]["id"], id);
+                saw_event = true;
+            }
+            "EOSE" => saw_eose = true,
+            other => panic!("unexpected frame: {other}"),
+        }
+        if saw_event && saw_eose {
+            break;
+        }
+    }
+    assert!(saw_event && saw_eose);
+    relay.stop().await;
+}
+
 /// One HTTP GET returning the raw response text.
 async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
     let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -1012,12 +1228,14 @@ async fn read_server_frames(tcp: &mut tokio::net::TcpStream) -> Vec<(u8, Vec<u8>
     frames
 }
 
-/// With the default config permessage-deflate is off: a client offering
-/// it gets no extension header back, and a compressed (RSV1) frame is a
-/// protocol error.
+/// With permessage-deflate disabled a client offering it gets no
+/// extension header back, and a compressed (RSV1) frame is a protocol
+/// error.
 #[tokio::test]
 async fn compression_not_negotiated_and_rsv1_rejected() {
-    let relay = Relay::start().await;
+    let mut config = common::config();
+    config.relay.compression.enabled = false;
+    let relay = Relay::start_with(config).await;
     let mut tcp = tokio::net::TcpStream::connect(relay.addr).await.unwrap();
     let request = format!(
         "GET / HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\n\
@@ -1041,9 +1259,8 @@ async fn compression_not_negotiated_and_rsv1_rejected() {
         "compression negotiated despite being off: {head}"
     );
 
-    // A compressed frame (FIN|RSV1|text) must close the connection,
-    // not be processed. yawc queues a 1002 close frame but drops the
-    // socket without flushing it, so EOF is the observable signal.
+    // A compressed frame (FIN|RSV1|text) must close the connection
+    // with a 1002 protocol error, not be processed.
     tcp.write_all(&masked_frame(0xC1, b"hi")).await.unwrap();
     let mut close_code = None;
     tokio::time::timeout(T, async {
@@ -1055,7 +1272,7 @@ async fn compression_not_negotiated_and_rsv1_rejected() {
     })
     .await
     .expect("RSV1 frame did not close the connection");
-    assert!(close_code.is_none() || close_code == Some(1002));
+    assert_eq!(close_code, Some(1002));
     relay.stop().await;
 }
 

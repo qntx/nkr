@@ -238,6 +238,10 @@ down`; CLOSE is never charged.
 - `ServerError::Serve` is renamed to `ServerError::Shutdown`: it now
   wraps the `JoinError` of the worker-shutdown task (it previously
   wrapped `std::io::Error`).
+- `relay.compression.enabled` now defaults to `true` (strfry parity):
+  yawc 0.4.4 bounds the inflated size of a compressed message by
+  `max_websocket_payload_size`, so permessage-deflate is safe to
+  negotiate. `sliding_window` stays enabled.
 
 ### Fixed
 
@@ -275,10 +279,10 @@ down`; CLOSE is never charged.
 
 ### Security
 
-- `relay.compression.enabled` now defaults to `false`: yawc bounds the
-  compressed frame size, not the inflated one, so a permessage-deflate
-  message could decompress hundreds of times past
-  `max_websocket_payload_size`. Enable it only for trusted clients.
+- Upgraded to yawc 0.4.4: the inflated size of a permessage-deflate
+  message is now bounded by `max_websocket_payload_size`, so a small
+  compressed frame can no longer deliver an oversized payload
+  (yawc#55, fixed upstream in infinitefield/yawc#56).
 - `real_ip_header` now trusts the _last_ comma-separated value parsed
   as an `IpAddr` (the entry written by the proxy in front), falling
   back to the socket peer on missing or unparsable values — the first

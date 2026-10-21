@@ -132,11 +132,10 @@ readers = 3
 monitors = 3
 
 [relay.compression]
-# Negotiate permessage-deflate. Off by default: the inflated size of
-# an inbound message is not bounded by max_websocket_payload_size
-# (https://github.com/infinitefield/yawc/issues/55), so enable it only
-# for trusted clients.
-enabled = false
+# Negotiate permessage-deflate. On by default: yawc bounds the
+# inflated size of an inbound message by max_websocket_payload_size
+# since 0.4.4.
+enabled = true
 # Keep the LZ77 sliding window between messages (false = no context
 # takeover either direction).
 sliding_window = true
