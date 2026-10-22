@@ -36,7 +36,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use worker::{
     Context, DurableObject, Env, Error, Fetcher, Method, Request, RequestInit, Response, Result,
     ScheduledTime, State, WebSocket, WebSocketIncomingMessage, WebSocketPair, console_error,
-    durable_object, event,
+    console_log, durable_object, event,
 };
 
 use crate::config::Config;
@@ -631,6 +631,14 @@ impl DurableObject for RelayObject {
             }
             Relay::open(store, config, sockets, policy.is_some()).map_err(|e| e.to_string())
         })();
+        // One line per construction — a hibernation wake re-runs
+        // this and the restore counts prove the object restarted.
+        if let Ok(relay) = relay.as_ref() {
+            let (conns, subs, dropped) = relay.restored();
+            console_log!(
+                "restored {conns} connections, {subs} subscriptions ({dropped} rows dropped)"
+            );
+        }
         // Reconcile the alarm once on wake: `next_alarm` is
         // synchronous, so the wanted time is computed before any
         // future — the `RefCell` borrow never crosses an await.

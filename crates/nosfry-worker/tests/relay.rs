@@ -511,6 +511,9 @@ fn hibernation_restores_subscriptions() {
         let exec = r.into_store().into_exec();
         // Wake with conn 1 and 2 only; conn 3's socket is gone.
         let mut r = relay_on(exec, config, vec![(a.clone(), att_a), (b.clone(), att_b)]);
+        // The wake's restore summary: two live connections, both of
+        // their subscriptions, and conn 3's stranded row dropped.
+        assert_eq!(r.restored(), (2, 2, 1));
         // A new kind-4 p-tagging conn 2's authed pubkey arrives as
         // before: conn 2's post-AUTH sub sees it, conn 1's pre-AUTH
         // sub does not.
@@ -1906,6 +1909,7 @@ fn restore_deletes_stale_subs_without_loading_them() {
     .unwrap();
     // Only the live connection's row was ever streamed; both stale
     // rows were deleted by the sweep before it.
+    assert_eq!(r.restored(), (1, 1, 2));
     let exec = r.into_store().into_exec();
     assert_eq!(exec.rows.get(), 1, "the SELECT streamed only live rows");
     let mut count = 0u64;
