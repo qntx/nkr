@@ -229,12 +229,14 @@ impl Config {
     /// [`ServerError::Info`] on an invalid `[relay.info]` value,
     /// [`ServerError::FilterValidation`] on an invalid
     /// `[relay.filter_validation]` value, [`ServerError::RelayValue`]
-    /// on `relay.auto_ping_seconds = 0`.
+    /// on `relay.auto_ping_seconds = 0` or a write-policy plugin on a
+    /// system without `/bin/sh`.
     pub fn load(path: &Path) -> Result<Self, ServerError> {
         let text = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&text)?;
         config.limits()?;
         config.relay.info.validate()?;
+        Self::plugin_needs_shell(&config.relay.write_policy.plugin, Path::new("/bin/sh"))?;
         Ok(config)
     }
 
@@ -307,6 +309,21 @@ impl Config {
             max_readers: self.db.max_readers,
             no_read_ahead: self.db.no_read_ahead,
         }
+    }
+
+    /// A write-policy plugin is spawned under `sh -c` (strfry does the
+    /// same): a configured plugin on a system without a shell — the
+    /// distroless runtime image has none — would only fail every publish
+    /// `error: internal error` at runtime, so refuse it at load.
+    fn plugin_needs_shell(plugin: &str, shell: &Path) -> Result<(), ServerError> {
+        if !plugin.is_empty() && !shell.exists() {
+            return Err(ServerError::RelayValue(format!(
+                "relay.write_policy.plugin needs {}, which this system lacks \
+             (the distroless container image has no shell)",
+                shell.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Merge a reloaded config into the running one: every restart-only
@@ -476,6 +493,30 @@ mod tests {
             unreachable!("auto_ping_seconds = 0 must fail")
         };
         assert_eq!(msg, "relay.auto_ping_seconds must be at least 1");
+    }
+
+    /// A write-policy plugin runs under `/bin/sh -c`; without a shell
+    /// it is refused at load, with one it loads.
+    #[test]
+    fn plugin_needs_a_shell() {
+        let missing = Path::new("/definitely/not/a/shell");
+        let err = Config::plugin_needs_shell("/bin/true", missing).unwrap_err();
+        assert!(
+            matches!(&err, ServerError::RelayValue(_)),
+            "expected RelayValue, got {err:?}"
+        );
+        let ServerError::RelayValue(msg) = err else {
+            unreachable!("matched above")
+        };
+        assert!(
+            msg.starts_with("relay.write_policy.plugin needs /definitely/not/a/shell"),
+            "{msg}"
+        );
+        assert!(msg.contains("no shell"), "{msg}");
+
+        let shell = tempfile::NamedTempFile::new().unwrap();
+        Config::plugin_needs_shell("/bin/true", shell.path()).unwrap();
+        Config::plugin_needs_shell("", missing).unwrap();
     }
 
     /// Restart-only fields keep the running value and are reported;
