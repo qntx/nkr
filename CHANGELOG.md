@@ -12,6 +12,16 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- strfry's HTTP surface on both editions: `GET /` without
+  `Accept: application/nostr+json` answers a self-contained HTML
+  landing page (name, icon/banner, description, relay URL, admin
+  and relay pubkeys, contact, supported NIPs, terms of service,
+  privacy policy — every interpolated value escaped), and
+  `/.well-known/nodeinfo` plus `/nodeinfo/2.1` serve NodeInfo
+  discovery and the 2.1 document. The discovery link derives from
+  `[relay] service_url`, never the `Host` header; the Workers
+  edition answers both at the entry Worker and now 404s every
+  other path without waking the relay object.
 - The full NIP-11 field set on `[relay.info]`: `banner`, `self` (the
   relay's own pubkey), `terms_of_service`, `privacy_policy`, and
   `supported_nips` (when present it replaces the computed list
@@ -27,7 +37,7 @@ The format is based on [Keep a Changelog]; this project follows
   edition. WebSocket hibernation persists attachments and a `subs`
   table restores subscriptions on wake. Publishes can be gated by a
   strfry write-policy through an optional `POLICY` service binding
-(the request line is `POST`ed and the `reject`/`shadowReject`
+  (the request line is `POST`ed and the `reject`/`shadowReject`
   verdicts behave identically). `nosfry-sql` is a portable store
   over a minimal executor trait with a rusqlite adapter, and the
   conformance suite runs the same cases against both editions.
@@ -36,7 +46,7 @@ The format is based on [Keep a Changelog]; this project follows
   100,000), and `[worker] max_subscription_bytes` (live-subscription
   byte budget, default 32 MiB, `0` unlimited); the Workers defaults
   for `[relay] max_connections` (5,000) and `[relay]
-  max_sync_memory_bytes` (32 MiB) are tighter than native's.
+max_sync_memory_bytes` (32 MiB) are tighter than native's.
 - NIP-86 relay management API over NIP-98 auth: `POST /` with
   `application/nostr+json+rpc` answers `{"result"|"error"}` JSON for
   pubkey/event/kind bans and allow-lists, IP blocks, and NIP-11

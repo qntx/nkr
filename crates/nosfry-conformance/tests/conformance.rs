@@ -133,6 +133,33 @@ fn events(frames: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
+/// A plain HTTP GET (no NIP-11 Accept), returning (status,
+/// content-type, body).
+async fn http_get(path: &str) -> (u16, String, String) {
+    let url = url();
+    let authority = url
+        .strip_prefix("ws://")
+        .expect("NOSFRY_URL must use ws://")
+        .trim_end_matches('/');
+    let mut tcp = tokio::net::TcpStream::connect(authority).await.unwrap();
+    tcp.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8(buf).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let content_type = head
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+        .map(|l| l.split_once(':').map(|(_, v)| v.trim().to_owned()).unwrap())
+        .unwrap_or_default();
+    (status, content_type, body.to_owned())
+}
+
 /// The relay's NIP-11 document over plain HTTP.
 async fn nip11() -> Value {
     let url = url();
@@ -177,6 +204,40 @@ async fn nip11_document() {
     for nip in [1, 9, 11, 40, 42, 45, 62, 70, 77, 86] {
         assert!(nips.contains(&nip), "missing NIP-{nip}: {nips:?}");
     }
+}
+
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn http_surface() {
+    // GET / without a NIP-11 Accept is the HTML landing page.
+    let (status, content_type, body) = http_get("/").await;
+    assert_eq!(status, 200);
+    assert!(content_type.starts_with("text/html"), "{content_type}");
+    assert!(body.contains("nosfry conformance"), "{body}");
+
+    // /nodeinfo/2.1 is the NodeInfo document.
+    let (status, content_type, body) = http_get("/nodeinfo/2.1").await;
+    assert_eq!(status, 200);
+    assert!(content_type.contains("application/json"), "{content_type}");
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(doc["version"], "2.1");
+    assert_eq!(doc["software"]["name"], "nosfry");
+
+    // /.well-known/nodeinfo links at the service_url host — run.sh
+    // injects ws://127.0.0.1:PORT, so the href is its http:// twin.
+    let (status, _, body) = http_get("/.well-known/nodeinfo").await;
+    assert_eq!(status, 200);
+    let doc: Value = serde_json::from_str(&body).unwrap();
+    let url = url();
+    let authority = url.strip_prefix("ws://").unwrap().trim_end_matches('/');
+    assert_eq!(
+        doc["links"][0]["href"],
+        format!("http://{authority}/nodeinfo/2.1")
+    );
+
+    // Unknown paths are 404 without reaching the relay.
+    let (status, _, _) = http_get("/nope").await;
+    assert_eq!(status, 404);
 }
 
 #[tokio::test]
