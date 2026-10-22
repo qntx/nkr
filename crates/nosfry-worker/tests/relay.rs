@@ -1779,7 +1779,7 @@ fn policy_accept_survives_a_lost_connection() {
 }
 
 /// `[worker] max_subscription_bytes`: a REQ that would push the
-/// persisted-filters byte total over the budget is refused
+/// charged `approx_bytes` total over the budget is refused
 /// `blocked:` and registers nothing.
 #[test]
 fn subscription_byte_budget_refuses_over_capacity() {
@@ -1799,8 +1799,8 @@ fn subscription_byte_budget_refuses_over_capacity() {
 /// CLOSE and connection close release a subscription's charge.
 #[test]
 fn subscription_byte_budget_releases() {
-    // The persisted filters JSON of one `{"kinds":[1]}` REQ.
-    let bytes = format!("[{}]", Filter::parse("{\"kinds\":[1]}").unwrap().to_json()).len();
+    // The `approx_bytes` charge of one `{"kinds":[1]}` REQ.
+    let bytes = Filter::parse("{\"kinds\":[1]}").unwrap().approx_bytes();
     let config = format!("[worker]\nmax_subscription_bytes = {bytes}\n");
     let mut r = relay(&config);
     let a = connect(&mut r, 1);
@@ -1923,7 +1923,7 @@ fn restore_deletes_stale_subs_without_loading_them() {
 /// budget: rows over it are deleted, not restored.
 #[test]
 fn restore_honors_the_subscription_byte_budget() {
-    let bytes = format!("[{}]", Filter::parse("{\"kinds\":[1]}").unwrap().to_json()).len();
+    let bytes = Filter::parse("{\"kinds\":[1]}").unwrap().approx_bytes();
     let socket = FakeSocket::default();
     let (att, exec) = {
         let mut r = relay("[relay]\nservice_url = \"wss://x\"\n");

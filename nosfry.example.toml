@@ -72,6 +72,12 @@ max_pending_outbound_bytes_total = 1073741824
 # Process-wide budget for sealed negentropy sync storages, accounted
 # at 40 bytes per scanned record (restart-only; 0 = unlimited).
 max_sync_memory_bytes = 1073741824
+# Process-wide budget for live subscriptions (restart-only; 0 =
+# unlimited). Every REQ is charged the Filter::approx_bytes sum of
+# its filters — the compiled filter plus its monitor index entries —
+# and refused CLOSED `blocked: subscription capacity exhausted` over
+# budget; CLOSE and disconnects release the charge.
+max_subscription_bytes_total = 1073741824
 # Maximum simultaneous WebSocket connections (0 = unlimited).
 max_connections = 0
 # Maximum simultaneous WebSocket connections per client IP (0 =

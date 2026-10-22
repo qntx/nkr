@@ -967,7 +967,8 @@ impl<E: Executor, S: Socket> Relay<E, S> {
                 .collect::<Vec<_>>()
                 .join(",")
         );
-        if !self.sub_fits(conn, &sub.id, filters_json.len()) {
+        let bytes: usize = filters.iter().map(Filter::approx_bytes).sum();
+        if !self.sub_fits(conn, &sub.id, bytes) {
             self.send(
                 conn,
                 &closed_frame(&sub.id, "blocked: subscription capacity exhausted"),
@@ -1021,7 +1022,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             )
             .is_ok();
         if persisted {
-            self.charge_sub(conn, &sub.id, filters_json.len());
+            self.charge_sub(conn, &sub.id, bytes);
             self.monitors.insert(conn, sub, filters, gate);
         } else {
             self.send(conn, &closed_frame(&sub.id, "error: internal error"));
@@ -1160,9 +1161,10 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     }
 
     /// One streamed `subs` row: resume the subscription and charge
-    /// its filters-JSON length against the budget, or answer the
-    /// row's primary key when it should be deleted — over-budget or
-    /// corrupt state is dropped, never a reason to brick the open.
+    /// its filters' `approx_bytes` against the budget — the same
+    /// estimate a REQ is charged — or answer the row's primary key
+    /// when it should be deleted: over-budget or corrupt state is
+    /// dropped, never a reason to brick the open.
     fn restore_row(
         row: &[Value],
         conns: &mut HashMap<u64, Conn<S>>,
@@ -1173,16 +1175,13 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         budget: usize,
     ) -> Option<(u64, String)> {
         let (conn, sub_id) = sub_pk(row)?;
-        let bytes = match row.get(2) {
-            Some(Value::Text(s)) => s.len(),
-            _ => usize::MAX,
-        };
-        let keep = (budget == 0 || bytes <= budget.saturating_sub(*subs_bytes))
-            .then(|| Self::decode_sub(conns, limits, row))
-            .flatten();
-        let Some((key, filters, gate)) = keep else {
+        let Some((key, filters, gate)) = Self::decode_sub(conns, limits, row) else {
             return Some((conn, sub_id));
         };
+        let bytes: usize = filters.iter().map(Filter::approx_bytes).sum();
+        if budget != 0 && bytes > budget.saturating_sub(*subs_bytes) {
+            return Some((conn, sub_id));
+        }
         *subs_bytes += bytes;
         sub_bytes
             .entry(conn)

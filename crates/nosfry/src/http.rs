@@ -35,6 +35,9 @@ pub(crate) struct AppState {
     /// Process-wide reserved sync-storage bytes (the
     /// `nosfry_sync_memory_bytes` gauge).
     pub(crate) sync_memory: Arc<std::sync::atomic::AtomicUsize>,
+    /// Process-wide charged live-subscription bytes (the
+    /// `nosfry_subscription_bytes` gauge).
+    pub(crate) subscription_bytes: Arc<std::sync::atomic::AtomicUsize>,
     /// Latest NIP-86 snapshot; read-only copies for the handlers.
     /// The writer thread publishes in commit order on this channel —
     /// nothing else may send.
@@ -76,6 +79,9 @@ async fn metrics(State(state): State<AppState>) -> Response {
                 .outbound_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             state.sync_memory.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .subscription_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
         ),
     )
         .into_response()

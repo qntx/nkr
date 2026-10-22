@@ -32,9 +32,10 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
     that publish then ask the relay to delete them. Every
     `--sample-secs` it prints one cumulative JSON line with relay
     RSS, `data.mdb` size, connection, rate-limit,
-    `nosfry_outbound_pending_bytes` and `nosfry_sync_memory_bytes`
-    metrics, and the workload counters; a final `end` line (with
-    `outbound_pending_after_close` and `sync_memory_after_close`,
+    `nosfry_outbound_pending_bytes`, `nosfry_sync_memory_bytes` and
+    `nosfry_subscription_bytes` metrics, and the workload counters; a
+    final `end` line (with `outbound_pending_after_close`,
+    `sync_memory_after_close` and `subscription_bytes_after_close`,
     the gauge values once every harness connection is closed) and a
     `relay_exit` line close the JSONL.
 - **aggregate.py**: `python3 bench/aggregate.py <results-dir>` prints the

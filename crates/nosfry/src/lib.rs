@@ -168,6 +168,32 @@ async fn reload_loop(
     }
 }
 
+/// Spawn one monitor-shard thread per inbox, all sharing the
+/// process-wide live-subscription charge.
+fn spawn_shards(
+    store: &Arc<Store>,
+    shard_rxs: Vec<mpsc::Receiver<ShardMsg>>,
+    readers: &Arc<[std::sync::mpsc::Sender<ReaderMsg>]>,
+    charge: &Arc<AtomicUsize>,
+    budget: usize,
+    threads: &mut Vec<JoinHandle<()>>,
+) -> Result<(), ServerError> {
+    for rx in shard_rxs {
+        let shard_store = Arc::clone(store);
+        let shard_readers = Arc::clone(readers);
+        let shard_charge = Arc::clone(charge);
+        threads.push(
+            std::thread::Builder::new()
+                .name("nosfry-monitor".into())
+                .spawn(move || {
+                    shard::run(&shard_store, rx, shard_readers, shard_charge, budget);
+                })
+                .map_err(ServerError::Spawn)?,
+        );
+    }
+    Ok(())
+}
+
 /// Reader tunables derived from the startup config (restart-only:
 /// readers hold them for their lifetime).
 fn reader_tuning(config: &Config, sync_memory: &Arc<AtomicUsize>) -> reader::Tuning {
@@ -271,9 +297,11 @@ impl Server {
         let metrics = Arc::new(metrics::Metrics::new());
         // Process-wide pending outbound bytes, shared by every
         // connection's `Outbound`; process-wide sealed-sync-storage
-        // bytes, shared by every reader.
+        // bytes, shared by every reader; process-wide live-subscription
+        // bytes, shared by every monitor shard.
         let outbound_total = Arc::new(AtomicUsize::new(0));
         let sync_memory = Arc::new(AtomicUsize::new(0));
+        let subscription_bytes = Arc::new(AtomicUsize::new(0));
         let tuning = reader_tuning(&config, &sync_memory);
         let mut threads = Vec::with_capacity(monitors + readers + 1);
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -284,16 +312,14 @@ impl Server {
         let (reader_txs, reader_rxs) = reader_channels(readers);
 
         // Monitor shards.
-        for rx in shard_rxs {
-            let shard_store = Arc::clone(&store);
-            let shard_readers = Arc::clone(&reader_txs);
-            threads.push(
-                std::thread::Builder::new()
-                    .name("nosfry-monitor".into())
-                    .spawn(move || shard::run(&shard_store, rx, shard_readers))
-                    .map_err(ServerError::Spawn)?,
-            );
-        }
+        spawn_shards(
+            &store,
+            shard_rxs,
+            &reader_txs,
+            &subscription_bytes,
+            config.relay.max_subscription_bytes_total,
+            &mut threads,
+        )?;
 
         // Readers.
         let tuning = Arc::new(tuning);
@@ -387,6 +413,7 @@ impl Server {
                 live: live_rx,
                 conn,
                 sync_memory,
+                subscription_bytes,
                 metrics,
                 moderation: mod_rx,
                 live_tx: live_tx.clone(),

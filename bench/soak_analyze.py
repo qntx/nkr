@@ -142,6 +142,14 @@ def main():
         f"{sync_drained if end else 'run not finished'} bytes, "
         f"last sample {post[-1].get('sync_memory')} bytes",
     ))
+    subs_drained = end.get("subscription_bytes_after_close") if end else None
+    checks.append((
+        "subscriptions",
+        subs_drained == 0,
+        f"subscription bytes after all connections closed: "
+        f"{subs_drained if end else 'run not finished'} bytes, "
+        f"last sample {post[-1].get('subscription_bytes')} bytes",
+    ))
     coverage = {k: counts.get(k, 0) for k in ("churn_done", "count_done", "neg_done", "vanish_done")}
     checks.append(("coverage", all(coverage.values()), f"{coverage}"))
     checks.append((

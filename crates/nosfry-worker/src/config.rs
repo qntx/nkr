@@ -97,12 +97,13 @@ pub struct Worker {
     /// minimum, `0` disabling COUNT entirely.
     pub max_scan_rows: usize,
     /// Process-wide budget for live subscriptions, charged as the
-    /// length of each subscription's persisted filters JSON
-    /// (`0` = unlimited). `max_connections` ×
-    /// `max_subs_per_connection` × payload-sized filters would far
-    /// exceed an isolate's memory, so a REQ that would cross the
-    /// budget answers `blocked: subscription capacity exhausted` —
-    /// there is no native equivalent.
+    /// `Filter::approx_bytes` sum of each subscription's filters —
+    /// the same estimate the native `[relay]
+    /// max_subscription_bytes_total` uses (`0` = unlimited).
+    /// `max_connections` × `max_subs_per_connection` × payload-sized
+    /// filters would far exceed an isolate's memory, so a REQ that
+    /// would cross the budget answers `blocked: subscription
+    /// capacity exhausted`.
     pub max_subscription_bytes: usize,
 }
 

@@ -55,6 +55,19 @@ The format is based on [Keep a Changelog]; this project follows
   hash, canonical size, and every structural/limit check still run.
   Backed by `UnverifiedEvent::verify_unsigned`, which shares one
   implementation with `verify`.
+- `[relay] max_subscription_bytes_total` (default 1 GiB, `0`
+  unlimited, restart-only): a process-wide budget for live
+  subscriptions on the native edition. Every REQ is charged the
+  `Filter::approx_bytes` sum of its filters — an estimate of the
+  compiled filters plus their monitor index entries — and a REQ
+  that would cross the budget answers `CLOSED blocked:
+  subscription capacity exhausted`; `CLOSE`, disconnects, and
+  relay-side closes release the charge. New gauge
+  `nosfry_subscription_bytes` reports the shared total, and the
+  soak harness asserts it drains to zero once every connection
+  is closed. The Workers `[worker] max_subscription_bytes` now
+  charges the same `approx_bytes` estimate instead of the
+  persisted filters-JSON length.
 - strfry `relay.filterValidation` parity on both editions: a
   `[relay.filter_validation]` section limits REQ/COUNT filters by
   count (`min_filters_per_req`/`max_filters_per_req`), kinds per
