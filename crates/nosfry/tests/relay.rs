@@ -3745,3 +3745,26 @@ async fn nip86_absent_without_admins() {
     assert!(!doc["supported_nips"].to_string().contains("86"));
     relay.stop().await;
 }
+
+/// `[relay.filter_validation]`: a REQ violating the rules answers
+/// `CLOSED blocked:` and registers nothing — the same id still opens
+/// a valid subscription afterwards.
+#[tokio::test]
+async fn filter_validation_refuses_req() {
+    let mut config = common::config();
+    config.relay.filter_validation.enabled = true;
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+
+    send_text(&mut ws, "[\"REQ\",\"s\",{},{},{},{}]").await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        frame,
+        json!(["CLOSED", "s", "blocked: invalid number of filters: 4"]),
+        "{frame}"
+    );
+    send_text(&mut ws, &req_wire("s", "{\"kinds\":[1]}")).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(frame, json!(["EOSE", "s"]), "{frame}");
+    relay.stop().await;
+}

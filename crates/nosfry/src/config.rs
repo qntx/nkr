@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use nosfry_core::auth::AuthConfig;
 use nosfry_core::event::{EventLimits, PublicKey};
 use nosfry_core::info::Info;
-use nosfry_core::limits::{Limits, RateLimits, ReqLimits};
+use nosfry_core::limits::{FilterValidationConfig, Limits, RateLimits, ReqLimits};
 use nosfry_core::management::ManagementConfig;
 use nosfry_lmdb::StoreOptions;
 use serde::Deserialize;
@@ -87,6 +87,9 @@ pub struct Relay {
     pub query_timeslice_budget_microseconds: u64,
     /// REQ limits (`nosfry_core::limits::ReqLimits` verbatim).
     pub limits: ReqLimits,
+    /// REQ/COUNT filter-validation rules
+    /// (`nosfry_core::limits::FilterValidationConfig` verbatim).
+    pub filter_validation: FilterValidationConfig,
     /// Per-connection EVENT/REQ rate limits
     /// (`nosfry_core::limits::RateLimits` verbatim).
     pub rate_limits: RateLimits,
@@ -179,6 +182,7 @@ impl Default for Relay {
             metrics: false,
             query_timeslice_budget_microseconds: 10_000,
             limits: ReqLimits::default(),
+            filter_validation: FilterValidationConfig::default(),
             rate_limits: RateLimits::default(),
             threads: Threads::default(),
             compression: Compression::default(),
@@ -217,7 +221,9 @@ impl Config {
     /// TOML syntax errors or unknown keys, [`ServerError::ServiceUrl`]
     /// on an invalid `[relay] service_url`, [`ServerError::Admins`] on
     /// a malformed `[relay.management] admins` entry,
-    /// [`ServerError::Info`] on an invalid `[relay.info]` value.
+    /// [`ServerError::Info`] on an invalid `[relay.info]` value,
+    /// [`ServerError::FilterValidation`] on an invalid
+    /// `[relay.filter_validation]` value.
     pub fn load(path: &Path) -> Result<Self, ServerError> {
         let text = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&text)?;
@@ -227,13 +233,16 @@ impl Config {
     }
 
     /// `nosfry_core::limits::Limits` assembled from `[events]`,
-    /// `[relay.limits]`, `[relay.rate_limits]`, and `[relay.auth]`.
+    /// `[relay.limits]`, `[relay.filter_validation]`,
+    /// `[relay.rate_limits]`, and `[relay.auth]`.
     ///
     /// # Errors
     ///
     /// [`ServerError::ServiceUrl`] on an invalid `[relay] service_url`,
     /// [`ServerError::Admins`] on a malformed
-    /// `[relay.management] admins` entry.
+    /// `[relay.management] admins` entry,
+    /// [`ServerError::FilterValidation`] on an invalid
+    /// `[relay.filter_validation]` value.
     pub fn limits(&self) -> Result<Limits, ServerError> {
         let service_url = if self.relay.service_url.is_empty() {
             None
@@ -246,7 +255,10 @@ impl Config {
             .map_err(|e| ServerError::Admins(e.0))?;
         Ok(Limits {
             event: self.events,
-            req: self.relay.limits,
+            req: ReqLimits {
+                filter_validation: self.relay.filter_validation.limits()?,
+                ..self.relay.limits.clone()
+            },
             rate: self.relay.rate_limits,
             auth: std::sync::Arc::new(nosfry_core::auth::AuthRules::new(
                 service_url,
@@ -406,6 +418,35 @@ mod tests {
             std::fs::write(&path, format!("[relay.info]\n{key} = \"npub1bad\"\n")).unwrap();
             assert!(matches!(Config::load(&path), Err(ServerError::Info(_))));
         }
+    }
+
+    /// `Config::load` validates `[relay.filter_validation]` when
+    /// enabled: `max_filters_per_req = 0` or a `min` over `max`
+    /// fails with `ServerError::FilterValidation` naming the key, and
+    /// a broken reload keeps the running configuration.
+    #[test]
+    fn load_rejects_invalid_filter_validation() {
+        for section in [
+            "enabled = true\nmax_filters_per_req = 0",
+            "enabled = true\nmin_filters_per_req = 4",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nosfry.toml");
+            std::fs::write(&path, format!("[relay.filter_validation]\n{section}\n")).unwrap();
+            assert!(
+                matches!(Config::load(&path), Err(ServerError::FilterValidation(_))),
+                "{section}"
+            );
+        }
+        // Disabled sections are never validated.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nosfry.toml");
+        std::fs::write(
+            &path,
+            "[relay.filter_validation]\nenabled = false\nmax_filters_per_req = 0\n",
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_ok());
     }
 
     /// Restart-only fields keep the running value and are reported;

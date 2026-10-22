@@ -8,6 +8,11 @@
 [relay.limits]
 max_filter_limit = 1000
 
+# On so both editions pin the same refusal; every suite REQ fits the
+# defaults (1-3 filters, <=3 kinds).
+[relay.filter_validation]
+enabled = true
+
 [relay.auth]
 restricted_read_kinds     = [4, 1059]
 restrict_read_to_involved = true

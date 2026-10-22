@@ -87,6 +87,24 @@ max_sync_events = 1000000
 # Maximum `#x` conditions per filter.
 max_tags_per_filter = 3
 
+[relay.filter_validation]
+# strfry `relay.filterValidation` parity: refuse REQ/COUNT messages
+# whose filters violate the rules below (CLOSED `blocked:`; NEG-OPEN
+# is exempt). Reloads on SIGHUP for new connections.
+enabled = false
+# Filters allowed in one REQ, inclusive.
+max_filters_per_req = 3
+# Filters required in one REQ, inclusive.
+min_filters_per_req = 1
+# Kinds allowed per filter.
+max_kinds_per_filter = 3
+# Kinds a filter may list; empty allows every kind. When non-empty a
+# filter without `kinds` is refused (strfry lets it match every kind).
+allowed_kinds = []
+# Require each filter to pin exactly one `authors` entry or exactly
+# one `#p`/`#e` value.
+require_author_or_tag = false
+
 [relay.rate_limits]
 # Per-connection token buckets; over-limit EVENTs get `OK false
 # rate-limited:`, over-limit REQs get `CLOSED rate-limited:`. A

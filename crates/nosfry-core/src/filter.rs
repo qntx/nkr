@@ -156,6 +156,15 @@ impl Filter {
         &self.tags
     }
 
+    /// Sorted values of the `#<letter>` condition, if present.
+    #[must_use]
+    pub fn tag_values(&self, letter: u8) -> Option<&[TagValueBuf]> {
+        self.tags
+            .iter()
+            .find(|(name, _)| *name == letter)
+            .map(|(_, values)| &**values)
+    }
+
     /// Intrinsic result bound implied by the filter itself, independent of
     /// any external cap: empty ids/kinds/authors => `0`, deduplicated ids
     /// count, explicit `limit`, or `None` when unbounded

@@ -4,7 +4,9 @@
 use nosfry_core::auth::{AuthConfig, AuthRules};
 use nosfry_core::event::EventLimits;
 use nosfry_core::info::Info;
-use nosfry_core::limits::{Limits, RateLimits, ReqLimits};
+use nosfry_core::limits::{
+    FilterValidationConfig, FilterValidationError, Limits, RateLimits, ReqLimits,
+};
 use nosfry_core::management::{AdminsError, ManagementConfig};
 use nosfry_core::url::RelayUrlError;
 use serde::Deserialize;
@@ -43,6 +45,9 @@ pub struct Relay {
     pub max_connections_per_ip: usize,
     /// REQ limits (`nosfry_core::limits::ReqLimits` verbatim).
     pub limits: ReqLimits,
+    /// REQ/COUNT filter-validation rules
+    /// (`nosfry_core::limits::FilterValidationConfig` verbatim).
+    pub filter_validation: FilterValidationConfig,
     /// Per-connection EVENT/REQ rate limits
     /// (`nosfry_core::limits::RateLimits` verbatim).
     pub rate_limits: RateLimits,
@@ -109,6 +114,7 @@ impl Default for Relay {
             max_connections: 5_000,
             max_connections_per_ip: 128,
             limits: ReqLimits::default(),
+            filter_validation: FilterValidationConfig::default(),
             rate_limits: RateLimits::default(),
             auth: AuthConfig::default(),
             management: ManagementConfig::default(),
@@ -149,6 +155,9 @@ pub enum ConfigError {
     /// An invalid `[relay.info]` value.
     #[error(transparent)]
     Info(#[from] nosfry_core::info::InfoError),
+    /// An invalid `[relay.filter_validation]` value.
+    #[error(transparent)]
+    FilterValidation(#[from] FilterValidationError),
 }
 
 impl Config {
@@ -161,7 +170,9 @@ impl Config {
     /// `[relay] service_url`, [`ConfigError::MaxScanRows`] when
     /// `[worker] max_scan_rows` is 0, [`ConfigError::Admins`] on a
     /// malformed `[relay.management] admins` entry,
-    /// [`ConfigError::Info`] on an invalid `[relay.info]` value.
+    /// [`ConfigError::Info`] on an invalid `[relay.info]` value,
+    /// [`ConfigError::FilterValidation`] on an invalid
+    /// `[relay.filter_validation]` value.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text)?;
         config.limits()?;
@@ -174,18 +185,23 @@ impl Config {
     }
 
     /// `nosfry_core::limits::Limits` assembled from `[events]`,
-    /// `[relay.limits]`, `[relay.rate_limits]`, and `[relay.auth]`.
-    /// `max_sync_events` reaches the session verbatim; the effective
-    /// sync event cap is its minimum with `[worker] max_scan_rows`.
+    /// `[relay.limits]`, `[relay.filter_validation]`,
+    /// `[relay.rate_limits]`, and `[relay.auth]`. `max_sync_events`
+    /// reaches the session verbatim; the effective sync event cap is
+    /// its minimum with `[worker] max_scan_rows`.
     ///
     /// # Errors
     ///
     /// [`ConfigError::ServiceUrl`] on an invalid
-    /// `[relay] service_url`.
+    /// `[relay] service_url`, [`ConfigError::FilterValidation`] on an
+    /// invalid `[relay.filter_validation]` value.
     pub fn limits(&self) -> Result<Limits, ConfigError> {
         Ok(Limits {
             event: self.events,
-            req: self.relay.limits,
+            req: ReqLimits {
+                filter_validation: self.relay.filter_validation.limits()?,
+                ..self.relay.limits.clone()
+            },
             rate: self.relay.rate_limits,
             auth: self.auth_rules()?,
         })

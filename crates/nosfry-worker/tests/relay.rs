@@ -1960,3 +1960,41 @@ fn restore_honors_the_subscription_byte_budget() {
     .unwrap();
     assert_eq!(count, 1);
 }
+
+/// `[relay.filter_validation]`: a REQ violating the rules answers
+/// `CLOSED blocked:` and registers nothing — the same id still opens
+/// a valid subscription.
+#[test]
+fn filter_validation_refuses_req() {
+    let mut r = relay("[relay.filter_validation]\nenabled = true\n");
+    let socket = connect(&mut r, 1);
+    msg(&mut r, 1, "[\"REQ\",\"s\",{},{},{},{}]");
+    assert_eq!(
+        socket.sent().last().unwrap(),
+        "[\"CLOSED\",\"s\",\"blocked: invalid number of filters: 4\"]"
+    );
+    msg(&mut r, 1, &req_frame("s", &json!({"kinds": [1]})));
+    assert!(
+        socket.sent().iter().any(|f| f == "[\"EOSE\",\"s\"]"),
+        "{:?}",
+        socket.sent()
+    );
+}
+
+/// `Config::parse` refuses contradictory filter-validation bounds
+/// when enabled, naming the offending key.
+#[test]
+fn filter_validation_config_rejects_bad_bounds() {
+    for config in [
+        "[relay.filter_validation]\nenabled = true\nmax_filters_per_req = 0\n",
+        "[relay.filter_validation]\nenabled = true\nmin_filters_per_req = 4\n",
+    ] {
+        assert!(
+            matches!(
+                Config::parse(config),
+                Err(nosfry_worker::ConfigError::FilterValidation(_))
+            ),
+            "{config}"
+        );
+    }
+}

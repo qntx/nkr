@@ -1173,3 +1173,21 @@ async fn write_policy_verdicts() {
     assert_eq!(got.len(), 1, "{frames:?}");
     assert_eq!(got[0]["content"], "policy:accepted");
 }
+
+/// `[relay.filter_validation]` (enabled in the shared profile): a
+/// REQ over the filter-count bound answers the same
+/// `CLOSED blocked:` on both editions, and the refused REQ
+/// registered nothing — the id opens a valid subscription.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn filter_validation_refuses_req() {
+    let mut ws = connect().await;
+    send(&mut ws, "[\"REQ\",\"fv\",{},{},{},{}]").await;
+    let closed = collect_until(&mut ws, |v| v[0] == "CLOSED").await;
+    assert_eq!(
+        closed.last().unwrap(),
+        &json!(["CLOSED", "fv", "blocked: invalid number of filters: 4"])
+    );
+    let frames = req(&mut ws, "fv", "{\"kinds\":[1]}").await;
+    assert_eq!(frames.last().unwrap()[0], "EOSE", "{frames:?}");
+}
