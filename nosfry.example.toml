@@ -56,7 +56,8 @@ nofiles = 1000000
 real_ip_header = ""
 # Maximum inbound WebSocket payload in bytes.
 max_websocket_payload_size = 131072
-# WebSocket ping interval in seconds.
+# WebSocket ping interval in seconds; at least 1 (unlike strfry, 0
+# does not disable pings — it also bounds writes and idle closes).
 auto_ping_seconds = 55
 # Set SO_KEEPALIVE on accepted sockets with OS default timings
 # (strfry enableTcpKeepalive). Reloadable — applies to connections

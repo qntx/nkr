@@ -82,6 +82,10 @@ pub enum ServerError {
     /// Invalid `[relay.filter_validation]` value.
     #[error("config: {0}")]
     FilterValidation(#[from] nosfry_core::limits::FilterValidationError),
+    /// An invalid `[relay]` value with no dedicated error type; the
+    /// message names the key.
+    #[error("config: {0}")]
+    RelayValue(String),
     /// The worker shutdown task failed.
     #[error("worker shutdown: {0}")]
     Shutdown(#[source] tokio::task::JoinError),

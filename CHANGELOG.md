@@ -19,6 +19,11 @@ The format is based on [Keep a Changelog]; this project follows
   200, 400, 401, 405 — carries the allow-origin header. The header
   set lives in `nosfry_core::site::CORS_HEADERS`, shared with the
   Workers edition.
+- `[relay] auto_ping_seconds = 0` is refused at load and on reload
+  (`config: relay.auto_ping_seconds must be at least 1`): tokio's
+  `interval` panics on a zero period and the interval doubles as the
+  write deadline — unlike strfry, 0 cannot mean "no pings". A broken
+  reload keeps the running configuration.
 
 ### Added
 

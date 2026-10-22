@@ -228,7 +228,8 @@ impl Config {
     /// a malformed `[relay.management] admins` entry,
     /// [`ServerError::Info`] on an invalid `[relay.info]` value,
     /// [`ServerError::FilterValidation`] on an invalid
-    /// `[relay.filter_validation]` value.
+    /// `[relay.filter_validation]` value, [`ServerError::RelayValue`]
+    /// on `relay.auto_ping_seconds = 0`.
     pub fn load(path: &Path) -> Result<Self, ServerError> {
         let text = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&text)?;
@@ -247,8 +248,17 @@ impl Config {
     /// [`ServerError::Admins`] on a malformed
     /// `[relay.management] admins` entry,
     /// [`ServerError::FilterValidation`] on an invalid
-    /// `[relay.filter_validation]` value.
+    /// `[relay.filter_validation]` value, [`ServerError::RelayValue`]
+    /// on `relay.auto_ping_seconds = 0`.
     pub fn limits(&self) -> Result<Limits, ServerError> {
+        // `interval(Duration::ZERO)` panics and the interval doubles
+        // as the write deadline — unlike strfry, 0 cannot mean
+        // "no pings".
+        if self.relay.auto_ping_seconds == 0 {
+            return Err(ServerError::RelayValue(
+                "relay.auto_ping_seconds must be at least 1".into(),
+            ));
+        }
         let service_url = if self.relay.service_url.is_empty() {
             None
         } else {
@@ -452,6 +462,20 @@ mod tests {
         )
         .unwrap();
         assert!(Config::load(&path).is_ok());
+    }
+
+    /// `relay.auto_ping_seconds = 0` would panic every connection
+    /// task (`interval(Duration::ZERO)`); `Config::limits` — run at
+    /// load and on every reload — refuses it.
+    #[test]
+    fn load_rejects_zero_auto_ping() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nosfry.toml");
+        std::fs::write(&path, "[relay]\nauto_ping_seconds = 0\n").unwrap();
+        let Err(ServerError::RelayValue(msg)) = Config::load(&path) else {
+            unreachable!("auto_ping_seconds = 0 must fail")
+        };
+        assert_eq!(msg, "relay.auto_ping_seconds must be at least 1");
     }
 
     /// Restart-only fields keep the running value and are reported;
