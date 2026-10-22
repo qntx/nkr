@@ -12,6 +12,30 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- strfry `enableTcpKeepalive` parity on the native edition:
+  `[relay] tcp_keepalive` sets `SO_KEEPALIVE` with OS default
+  timings on each accepted socket. Reloadable on SIGHUP for new
+  connections; a failed `setsockopt` warns and the connection
+  proceeds, as strfry does.
+- strfry's logging switches as tracing targets (native):
+  `nosfry::ingest` (DEBUG) logs every relay-sent `OK` frame — accept
+  and reject — plus relay-sent `CLOSED` frames;
+  `nosfry::inbound` (TRACE) logs every inbound text message;
+  `nosfry::scan` (DEBUG) logs each finished stored REQ scan (filters,
+  events sent, elapsed microseconds) and COUNT (count, index entries
+  examined). Disabled levels cost nothing measurable; no config keys
+  — select with `RUST_LOG`, e.g.
+  `RUST_LOG=info,nosfry::ingest=debug`.
+- `nosfry delete --age <SECONDS>` bounds the deletion by
+  `created_at` (`until = now - SECONDS`, the earlier of that and the
+  filter's own `until`); FILTER is now optional but at least one of
+  `--age`/FILTER is required, so nothing can delete the whole
+  database by accident.
+- `nosfry import --no-verify` skips only the BIP-340 signature
+  check (trusted input such as a dump from a trusted relay); the id
+  hash, canonical size, and every structural/limit check still run.
+  Backed by `UnverifiedEvent::verify_unsigned`, which shares one
+  implementation with `verify`.
 - strfry `relay.filterValidation` parity on both editions: a
   `[relay.filter_validation]` section limits REQ/COUNT filters by
   count (`min_filters_per_req`/`max_filters_per_req`), kinds per

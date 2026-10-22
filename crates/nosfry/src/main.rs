@@ -48,6 +48,12 @@ enum Cmd {
         /// Log each rejected line with its reason.
         #[arg(long)]
         show_rejected: bool,
+        /// Skip only the BIP-340 signature check: the id hash,
+        /// canonical size, and every structural/limit check still
+        /// run. For trusted input such as a dump from a trusted
+        /// relay; never for network input.
+        #[arg(long)]
+        no_verify: bool,
     },
     /// Emit stored events matching a REQ filter (JSON), newest first.
     Scan {
@@ -57,13 +63,19 @@ enum Cmd {
         /// Filter JSON, e.g. '{"kinds":[1]}'.
         filter: String,
     },
-    /// Delete stored events matching a REQ filter (JSON).
+    /// Delete stored events matching a REQ filter (JSON) and/or
+    /// `--age`. At least one of the two is required.
     Delete {
         /// Count matches without deleting.
         #[arg(long)]
         dry_run: bool,
+        /// Only events with `created_at` older than `now - SECONDS`;
+        /// combined with FILTER the earlier `until` wins.
+        #[arg(long, value_name = "SECONDS")]
+        age: Option<u64>,
         /// Filter JSON, e.g. '{"kinds":[1]}'.
-        filter: String,
+        #[arg(required_unless_present = "age")]
+        filter: Option<String>,
     },
     /// Write a compacted copy of the database to a new file.
     Compact {
@@ -177,9 +189,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             until,
             reverse,
         } => export(&config, since, until, reverse),
-        Cmd::Import { show_rejected } => import(&config, show_rejected),
+        Cmd::Import {
+            show_rejected,
+            no_verify,
+        } => import(&config, show_rejected, no_verify),
         Cmd::Scan { count, filter } => scan(&config, &filter, count),
-        Cmd::Delete { dry_run, filter } => delete(&config, &filter, dry_run),
+        Cmd::Delete {
+            dry_run,
+            age,
+            filter,
+        } => delete(&config, filter.as_deref(), age, dry_run),
         Cmd::Compact { dest } => compact(&config, &dest),
     }
 }
@@ -231,7 +250,11 @@ fn export(
     Ok(())
 }
 
-fn import(config: &Config, show_rejected: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn import(
+    config: &Config,
+    show_rejected: bool,
+    no_verify: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let store = Store::open(&config.db.path, &config.store_options())?;
     let limits = config.limits()?;
     let stdin = std::io::stdin();
@@ -242,6 +265,7 @@ fn import(config: &Config, show_rejected: bool) -> Result<(), Box<dyn std::error
         config.relay.max_websocket_payload_size,
         stdin.lock(),
         show_rejected,
+        no_verify,
     )?;
     Ok(())
 }
@@ -258,8 +282,25 @@ fn scan(config: &Config, filter: &str, count: bool) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-fn delete(config: &Config, filter: &str, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let filter = nosfry_core::filter::Filter::parse(filter)?;
+fn delete(
+    config: &Config,
+    filter: Option<&str>,
+    age: Option<u64>,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // `required_unless_present` guarantees filter or age; an absent
+    // filter parses as the empty filter, but `--age` then always
+    // bounds it with `until`, so nothing can delete all.
+    let mut filter = match filter {
+        Some(json) => nosfry_core::filter::Filter::parse(json)?,
+        None => nosfry_core::filter::Filter::parse("{}")?,
+    };
+    if let Some(age) = age {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        filter = filter.with_until(now.saturating_sub(age));
+    }
     let store = open_existing(config)?;
     let mut out = stdout();
     let deleted = nosfry::admin::delete(&store, filter, dry_run)?;

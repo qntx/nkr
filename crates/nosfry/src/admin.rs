@@ -80,9 +80,12 @@ pub fn export(
 /// Verified events go into one [`Store::write`] per `IMPORT_BATCH`
 /// plus a final partial batch. There is no `created_at` time-window
 /// check (strfry's `verifyTime=false`): the window is a session-level
-/// policy, not an import policy. Lines longer than `max_line` and
-/// lines failing parse or verification are rejected and counted;
-/// blank lines are skipped entirely.
+/// policy, not an import policy. `no_verify` skips only the BIP-340
+/// signature check (trusted input such as a dump from a trusted
+/// relay — never network input); the id hash, canonical size, and
+/// every structural/limit check still run. Lines longer than
+/// `max_line` and lines failing parse or verification are rejected
+/// and counted; blank lines are skipped entirely.
 ///
 /// # Errors
 ///
@@ -95,6 +98,7 @@ pub fn import(
     max_line: usize,
     mut input: impl BufRead,
     show_rejected: bool,
+    no_verify: bool,
 ) -> Result<ImportStats, AdminError> {
     let mut importer = Importer {
         store,
@@ -102,6 +106,7 @@ pub fn import(
         service_url,
         max_line,
         show_rejected,
+        no_verify,
         batch: Vec::with_capacity(IMPORT_BATCH),
         stats: ImportStats::default(),
     };
@@ -116,7 +121,7 @@ pub fn import(
         importer.line(&buf, line_no)?;
     }
     importer.flush()?;
-    tracing::info!(stats = ?importer.stats, "import done");
+    tracing::info!(stats = ?importer.stats, signatures_verified = !no_verify, "import done");
     Ok(importer.stats)
 }
 
@@ -129,6 +134,8 @@ struct Importer<'a> {
     service_url: Option<&'a RelayUrl>,
     max_line: usize,
     show_rejected: bool,
+    /// Skip the BIP-340 signature check only (trusted input).
+    no_verify: bool,
     batch: Vec<Arc<Event>>,
     stats: ImportStats,
 }
@@ -156,7 +163,13 @@ impl Importer<'_> {
         }
         let text = std::str::from_utf8(text).map_err(|err| err.to_string())?;
         UnverifiedEvent::parse(text, self.limits)
-            .and_then(|unverified| unverified.verify(self.limits))
+            .and_then(|unverified| {
+                if self.no_verify {
+                    unverified.verify_unsigned(self.limits)
+                } else {
+                    unverified.verify(self.limits)
+                }
+            })
             .map_err(|err| err.reason())
             .map(Arc::new)
     }

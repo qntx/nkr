@@ -32,6 +32,8 @@ pub struct CountResult {
     pub count: u64,
     /// `true` when the entry budget stopped the scan early.
     pub approximate: bool,
+    /// Index entries examined (matched or not, duplicates included).
+    pub examined: u64,
     /// The HLL registers of counted authors, when the query was
     /// eligible for a sketch.
     pub hll: Option<[u8; 256]>,
@@ -197,6 +199,7 @@ impl CountScan {
         CountResult {
             count: self.count,
             approximate: self.approximate,
+            examined: self.examined,
             hll: self.hll.as_ref().map(|hll| *hll.registers()),
         }
     }

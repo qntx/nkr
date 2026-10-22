@@ -353,6 +353,24 @@ impl<'a> UnverifiedEvent<'a> {
     /// [`EventError::IdMismatch`], [`EventError::EventTooLarge`], or
     /// [`EventError::Sig`].
     pub fn verify(self, limits: &EventLimits) -> Result<Event, EventError> {
+        self.verify_impl(limits, true)
+    }
+
+    /// [`verify`](Self::verify) skipping only the BIP-340 signature
+    /// check: the id hash, canonical size, and every structural/limit
+    /// check still run. Only for trusted input such as importing a
+    /// dump from a trusted relay — never on network input.
+    ///
+    /// # Errors
+    ///
+    /// [`EventError::IdMismatch`] or [`EventError::EventTooLarge`].
+    pub fn verify_unsigned(self, limits: &EventLimits) -> Result<Event, EventError> {
+        self.verify_impl(limits, false)
+    }
+
+    /// [`verify`](Self::verify) with the signature step optional —
+    /// `check_sig` false skips only the BIP-340 check.
+    fn verify_impl(self, limits: &EventLimits, check_sig: bool) -> Result<Event, EventError> {
         let preimage = id_preimage(
             self.pubkey_hex.as_ref(),
             self.created_at,
@@ -379,9 +397,12 @@ impl<'a> UnverifiedEvent<'a> {
             return Err(EventError::EventTooLarge(json.len(), limits.max_event_size));
         }
 
-        let sig = Signature::from_byte_array(self.sig);
-        let pubkey = XOnlyPublicKey::from_byte_array(self.pubkey.0).map_err(|_| EventError::Sig)?;
-        schnorr::verify(&sig, &computed, &pubkey).map_err(|_| EventError::Sig)?;
+        if check_sig {
+            let sig = Signature::from_byte_array(self.sig);
+            let pubkey =
+                XOnlyPublicKey::from_byte_array(self.pubkey.0).map_err(|_| EventError::Sig)?;
+            schnorr::verify(&sig, &computed, &pubkey).map_err(|_| EventError::Sig)?;
+        }
 
         let packed = PackedEvent::build(
             &self.id,
@@ -669,6 +690,36 @@ mod tests {
             matches!(error, EventError::EventTooLarge(..)),
             "expected EventTooLarge before the signature check, got {error}"
         );
+    }
+
+    /// `verify_unsigned` skips only the BIP-340 check: a corrupted
+    /// signature passes while a wrong id still fails.
+    #[test]
+    fn verify_unsigned_skips_only_the_signature() {
+        let limits = EventLimits::default();
+        let signed = sign_json(1, 1000, &[], "x");
+        let mut value: serde_json::Value = serde_json::from_str(&signed).expect("json");
+        *value.get_mut("sig").expect("sig field") = serde_json::json!("00".repeat(64));
+        let tampered = serde_json::to_string(&value).expect("json");
+
+        UnverifiedEvent::parse(&tampered, &limits)
+            .expect("structural parse")
+            .verify_unsigned(&limits)
+            .expect("unsigned verify accepts a corrupted signature");
+        let error = UnverifiedEvent::parse(&tampered, &limits)
+            .expect("structural parse")
+            .verify(&limits)
+            .expect_err("verify still rejects it");
+        assert!(matches!(error, EventError::Sig), "got {error}");
+
+        let mut doc: serde_json::Value = serde_json::from_str(&signed).expect("json");
+        *doc.get_mut("id").expect("id field") = serde_json::json!("11".repeat(32));
+        let bad_id = serde_json::to_string(&doc).expect("json");
+        let id_error = UnverifiedEvent::parse(&bad_id, &limits)
+            .expect("structural parse")
+            .verify_unsigned(&limits)
+            .expect_err("a wrong id still fails without the sig check");
+        assert!(matches!(id_error, EventError::IdMismatch), "got {id_error}");
     }
 
     #[test]

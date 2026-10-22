@@ -163,6 +163,12 @@ impl<'a> Connection<'a> {
                     });
                     return true;
                 };
+                tracing::trace!(
+                    target: "nosfry::inbound",
+                    conn = self.conn,
+                    msg = text,
+                    "inbound message"
+                );
                 let mut commands = Vec::new();
                 let received = self.session.on_text(now_ms(), text, &mut commands);
                 if let Some(verb) = received.verb {
@@ -485,6 +491,33 @@ impl<'a> Connection<'a> {
         true
     }
 
+    /// Send one text frame and count it; `OK` and relay-sent `CLOSED`
+    /// frames also log on `nosfry::ingest` (strfry's `invalidEvents`
+    /// counterpart — accept *and* reject `OK`s, refused REQs/COUNTs).
+    /// The log copy is only built when the target is enabled, so a
+    /// disabled level costs nothing measurable.
+    async fn feed_frame(
+        &self,
+        ws: &mut HttpWebSocket,
+        verb: RelayVerb,
+        text: String,
+    ) -> Result<(), yawc::WebSocketError> {
+        let log = matches!(verb, RelayVerb::Ok | RelayVerb::Closed)
+            && tracing::enabled!(target: "nosfry::ingest", tracing::Level::DEBUG);
+        let frame = log.then(|| text.clone());
+        ws.feed(Frame::text(text.into_bytes())).await?;
+        self.handle.metrics.relay_message(verb);
+        if let Some(frame) = frame {
+            tracing::debug!(
+                target: "nosfry::ingest",
+                conn = self.conn,
+                frame = %frame,
+                "sent"
+            );
+        }
+        Ok(())
+    }
+
     /// Feed one outbound message; skipped subscriptions consume nothing.
     async fn feed(&mut self, ws: &mut HttpWebSocket, msg: Out) -> Result<(), yawc::WebSocketError> {
         match msg {
@@ -492,8 +525,7 @@ impl<'a> Connection<'a> {
                 if sub.as_ref().is_some_and(|s| !self.session.is_current(s)) {
                     return Ok(());
                 }
-                ws.feed(Frame::text(text.into_bytes())).await?;
-                self.handle.metrics.relay_message(verb);
+                self.feed_frame(ws, verb, text).await?;
             }
             Out::Frames { sub, texts } => {
                 if !self.session.is_current(&sub) {
@@ -527,8 +559,7 @@ impl<'a> Connection<'a> {
                         .await,
                 );
                 let text = closed_frame(&sub.id, &reason);
-                ws.feed(Frame::text(text.into_bytes())).await?;
-                self.handle.metrics.relay_message(RelayVerb::Closed);
+                self.feed_frame(ws, RelayVerb::Closed, text).await?;
             }
             Out::Count { sub, text } => {
                 if !self.session.is_current(&sub) {

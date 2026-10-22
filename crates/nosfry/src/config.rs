@@ -63,6 +63,10 @@ pub struct Relay {
     pub max_websocket_payload_size: usize,
     /// WebSocket ping interval in seconds.
     pub auto_ping_seconds: u64,
+    /// Set `SO_KEEPALIVE` on accepted sockets (strfry
+    /// `enableTcpKeepalive`): OS default timings, reloadable for new
+    /// connections.
+    pub tcp_keepalive: bool,
     /// Pending outbound bytes above which the connection is closed.
     pub max_pending_outbound_bytes: usize,
     /// Process-wide pending outbound byte budget: when the sum of
@@ -174,6 +178,7 @@ impl Default for Relay {
             real_ip_header: String::new(),
             max_websocket_payload_size: 131_072,
             auto_ping_seconds: 55,
+            tcp_keepalive: false,
             max_pending_outbound_bytes: 33_554_432,
             max_pending_outbound_bytes_total: 1_073_741_824,
             max_sync_memory_bytes: 1_073_741_824,

@@ -3768,3 +3768,85 @@ async fn filter_validation_refuses_req() {
     assert_eq!(frame, json!(["EOSE", "s"]), "{frame}");
     relay.stop().await;
 }
+
+/// A `MakeWriter` collecting formatted log lines into a shared buffer.
+#[derive(Clone)]
+struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// A rejected EVENT produces a `nosfry::ingest` DEBUG line carrying
+/// the OK-false frame. The relay logs on spawned tasks, so the
+/// capture needs a global subscriber (a scoped thread-local default
+/// would miss them); only this test installs one.
+#[tokio::test]
+async fn ingest_logs_rejected_ok() {
+    let sink = LogSink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let dispatch: tracing::Dispatch = tracing_subscriber::fmt()
+        .with_env_filter("nosfry::ingest=debug")
+        .with_ansi(false)
+        .with_writer(sink.clone())
+        .finish()
+        .into();
+    tracing::dispatcher::set_global_default(dispatch)
+        .expect("no other test installs a global subscriber");
+
+    let relay = Relay::start().await;
+    let mut ws = relay.connect().await;
+    let ev = common::event(&key(13), 1, now(), &json!([]), "bad");
+    let mut doc = json(ev.json());
+    doc["sig"] = json!("00".repeat(64));
+    send_text(
+        &mut ws,
+        &format!("[\"EVENT\",{}]", serde_json::to_string(&doc).unwrap()),
+    )
+    .await;
+    let ok = json(&recv_text(&mut ws, T).await);
+    assert_eq!(ok[0], "OK");
+    assert_eq!(ok[2], false);
+    let id = doc["id"].as_str().unwrap().to_owned();
+
+    // The ingest line is emitted just after the OK frame is sent.
+    let want = format!("[\"OK\",\"{id}\",false");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let logged = {
+            let buf = sink
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            drop(buf);
+            text.contains("nosfry::ingest") && text.contains(&want)
+        };
+        if logged {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no ingest line containing {want}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    relay.stop().await;
+}
