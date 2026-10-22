@@ -21,3 +21,7 @@ available.
   over TLS.
 - `relay.real_ip_header` must only be set behind a proxy that sets or appends
   the header; otherwise clients choose their own address.
+- HTTP routes have no request-rate limit of their own. WebSocket messages are
+  rate-limited (`relay.rate_limits`), HTTP requests are not; a NIP-86 request
+  that passes its cheap checks costs one signature verification each. Put the
+  relay behind a reverse proxy that rate-limits HTTP.
