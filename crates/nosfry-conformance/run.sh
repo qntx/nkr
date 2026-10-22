@@ -3,12 +3,14 @@
 #
 #   run.sh native   build nosfry and run it with profile.toml
 #   run.sh worker   build nosfry-worker and run it under wrangler dev
+#   run.sh remote   run the suite against an already-running relay;
+#                   NOSFRY_URL must be set (e.g. ws:// or wss://host)
 #
-# Both get the shared profile plus an injected service_url, then the
-# suite runs against NOSFRY_URL.
+# The local editions get the shared profile plus an injected
+# service_url; every mode runs the suite against NOSFRY_URL.
 set -euo pipefail
 
-edition="${1:?usage: run.sh <native|worker>}"
+edition="${1:?usage: run.sh <native|worker|remote>}"
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 profile="$here/profile.toml"
@@ -31,8 +33,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-export NOSFRY_URL="ws://127.0.0.1:$port"
+if [ "$edition" = "remote" ]; then
+    : "${NOSFRY_URL:?remote mode needs NOSFRY_URL set to a running relay}"
+else
+    port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+    export NOSFRY_URL="ws://127.0.0.1:$port"
+fi
 
 wait_ready() {
     for _ in $(seq 1 600); do
@@ -55,6 +61,8 @@ wait_ready() {
 # whose id is its pid, so cleanup can signal every descendant.
 set -m
 case "$edition" in
+remote)
+    ;;
 native)
     cat "$profile" >"$tmpdir/config.toml"
     cat >>"$tmpdir/config.toml" <<EOF
@@ -119,11 +127,14 @@ EOF
     server_pid=$!
     ;;
 *)
-    echo "usage: run.sh <native|worker>" >&2
+    echo "usage: run.sh <native|worker|remote>" >&2
     exit 2
     ;;
 esac
 set +m
 
-wait_ready
+# A remote relay is already up; nothing to launch or wait on.
+if [ "$edition" != "remote" ]; then
+    wait_ready
+fi
 cd "$root" && cargo test -p nosfry-conformance -- --ignored --test-threads 8
