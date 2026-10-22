@@ -10,24 +10,7 @@ The format is based on [Keep a Changelog]; this project follows
 
 ## [Unreleased]
 
-### Fixed
-
-- NIP-86 is callable from browsers on both editions: the CORS
-  preflight now allows `POST` and names `Authorization` explicitly
-  (the Fetch wildcard never covers it), `Access-Control-Max-Age`
-  caches the preflight for a day, and every management response —
-  200, 400, 401, 405 — carries the allow-origin header. The header
-  set lives in `nosfry_core::site::CORS_HEADERS`, shared with the
-  Workers edition.
-- `[relay] auto_ping_seconds = 0` is refused at load and on reload
-  (`config: relay.auto_ping_seconds must be at least 1`): tokio's
-  `interval` panics on a zero period and the interval doubles as the
-  write deadline — unlike strfry, 0 cannot mean "no pings". A broken
-  reload keeps the running configuration.
-- A configured `relay.write_policy.plugin` is refused at load when
-  `/bin/sh` does not exist: plugins spawn via `sh -c` like strfry,
-  and the distroless runtime image has no shell — every publish
-  would have been rejected `error: internal error`.
+## [0.2.0] - 2026-10-22
 
 ### Added
 
@@ -353,6 +336,23 @@ down`; CLOSE is never charged.
 
 ### Fixed
 
+- NIP-86 is callable from browsers on both editions: the CORS
+  preflight now allows `POST` and names `Authorization` explicitly
+  (the Fetch wildcard never covers it), `Access-Control-Max-Age`
+  caches the preflight for a day, and every management response —
+  200, 400, 401, 405 — carries the allow-origin header. The header
+  set lives in `nosfry_core::site::CORS_HEADERS`, shared with the
+  Workers edition.
+- `[relay] auto_ping_seconds = 0` is refused at load and on reload
+  (`config: relay.auto_ping_seconds must be at least 1`): tokio's
+  `interval` panics on a zero period and the interval doubles as the
+  write deadline — unlike strfry, 0 cannot mean "no pings". A broken
+  reload keeps the running configuration.
+- A configured `relay.write_policy.plugin` is refused at load when
+  `/bin/sh` does not exist: plugins spawn via `sh -c` like strfry,
+  and the distroless runtime image has no shell — every publish
+  would have been rejected `error: internal error`.
+
 - Frames still queued when a connection ended (slow consumer, socket
   error, stall, shutdown) kept their bytes charged to the
   process-wide outbound budget forever: `nosfry_outbound_pending_bytes`
@@ -480,5 +480,6 @@ down`; CLOSE is never charged.
   - relayBench and nosfry-bench drivers;
   - the `aggregate.py` summary script.
 
-[Unreleased]: https://github.com/qntx/nosfry/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/qntx/nosfry/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/qntx/nosfry/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/qntx/nosfry/releases/tag/v0.1.0
