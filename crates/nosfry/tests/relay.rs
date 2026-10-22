@@ -3471,6 +3471,59 @@ async fn nip86_ip_block_and_relay_info() {
     relay.stop().await;
 }
 
+/// The served NIP-11 `limitation.restricted_writes` follows the
+/// allow-lists: every `allow*`/`unallow*` op rebuilds the cached
+/// document when the flag flips.
+#[tokio::test]
+async fn nip11_restricted_writes_follows_allow_lists() {
+    let admin = key(9);
+    let relay = Relay::start_with(mgmt_config(&admin)).await;
+    let pk = pubkey_hex(&key(1));
+    let restricted = |doc: &Value| doc["limitation"]["restricted_writes"].as_bool().unwrap();
+
+    assert!(!restricted(&nip11_body(&http_get(relay.addr, "/").await)));
+    rpc(&relay, &admin, "allowpubkey", json!([pk, "vip"]), &[]).await;
+    assert!(restricted(&nip11_body(&http_get(relay.addr, "/").await)));
+    rpc(&relay, &admin, "unallowpubkey", json!([pk]), &[]).await;
+    assert!(!restricted(&nip11_body(&http_get(relay.addr, "/").await)));
+    relay.stop().await;
+}
+
+/// Concurrent management ops commit in order and publish snapshots
+/// in commit order: after 50 joined `allowpubkey` calls the hot-path
+/// snapshot contains every key — `listallowedpubkeys` sees all of
+/// them and the publish gate applies the union.
+#[tokio::test]
+async fn nip86_concurrent_ops_publish_in_order() {
+    let admin = key(9);
+    let relay = Relay::start_with(mgmt_config(&admin)).await;
+    let pks: Vec<String> = (1..=50).map(|i| pubkey_hex(&key(i))).collect();
+    futures_util::future::join_all(
+        pks.iter()
+            .map(|pk| rpc(&relay, &admin, "allowpubkey", json!([pk]), &[])),
+    )
+    .await;
+
+    let list = rpc(&relay, &admin, "listallowedpubkeys", json!([]), &[]).await;
+    assert_eq!(list["result"].as_array().unwrap().len(), 50, "{list}");
+
+    let mut ws = relay.connect().await;
+    let allowed = common::event(&key(1), 1, now(), &json!([]), "vip note");
+    let frame = publish(&mut ws, &allowed).await;
+    assert_eq!(frame[2], true, "{frame}");
+    let intruder = common::event(&key(51), 1, now(), &json!([]), "intruder");
+    let frame = publish(&mut ws, &intruder).await;
+    assert_eq!(frame[2], false);
+    assert!(
+        frame[3]
+            .as_str()
+            .unwrap()
+            .starts_with("blocked: pubkey not allowed"),
+        "{frame}"
+    );
+    relay.stop().await;
+}
+
 #[tokio::test]
 async fn nip86_auth_failures() {
     let admin = key(9);

@@ -36,10 +36,9 @@ pub(crate) struct AppState {
     /// `nosfry_sync_memory_bytes` gauge).
     pub(crate) sync_memory: Arc<std::sync::atomic::AtomicUsize>,
     /// Latest NIP-86 snapshot; read-only copies for the handlers.
+    /// The writer thread publishes in commit order on this channel —
+    /// nothing else may send.
     pub(crate) moderation: watch::Receiver<Arc<Moderation>>,
-    /// Moderation snapshot sender — the management handler publishes
-    /// the snapshot the writer returned after each applied op.
-    pub(crate) mod_tx: watch::Sender<Arc<Moderation>>,
     /// [`Live`] sender — `changerelay*` ops rebuild `nip11`.
     pub(crate) live_tx: watch::Sender<Arc<Live>>,
 }

@@ -5,6 +5,7 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use nosfry_core::message::{RelayVerb, ok_frame};
+use nosfry_core::moderation::Moderation;
 use nosfry_core::store::WriteOutcome;
 use nosfry_lmdb::Store;
 use tokio::sync::mpsc;
@@ -58,6 +59,7 @@ pub(crate) fn run(
     shards: &[mpsc::Sender<ShardMsg>],
     metrics: &Metrics,
     live: &watch::Receiver<Arc<Live>>,
+    mod_tx: &watch::Sender<Arc<Moderation>>,
 ) {
     let mut expire_pending = false;
     let mut expire_backlog = false;
@@ -96,11 +98,13 @@ pub(crate) fn run(
                 }
                 vanish_pending |= write_batch(store, reqs, shards, metrics, live);
                 for (op, reply) in moderations {
-                    moderate(store, op, reply, metrics);
+                    moderate(store, op, reply, metrics, mod_tx);
                 }
             }
             Some(WriterMsg::Expire) | None => expire_pending = true,
-            Some(WriterMsg::Moderate { op, reply }) => moderate(store, op, reply, metrics),
+            Some(WriterMsg::Moderate { op, reply }) => {
+                moderate(store, op, reply, metrics, mod_tx);
+            }
         }
         if expire_pending {
             expire_backlog = expire_sweep(store, metrics);
@@ -113,22 +117,31 @@ pub(crate) fn run(
     }
 }
 
-/// One NIP-86 management op; the reply carries the rebuilt snapshot
-/// (or the store error) for the waiting HTTP handler.
+/// One NIP-86 management op. The rebuilt snapshot is published on
+/// `mod_tx` *before* the reply goes out — the writer thread is the
+/// only publisher, so subscribers always observe snapshots in commit
+/// order; the reply only confirms the commit (or the store error)
+/// for the waiting HTTP handler.
 fn moderate(
     store: &Store,
     op: nosfry_core::moderation::ModOp,
-    reply: tokio::sync::oneshot::Sender<
-        Result<nosfry_core::moderation::Moderation, nosfry_lmdb::StoreError>,
-    >,
+    reply: tokio::sync::oneshot::Sender<Result<(), nosfry_lmdb::StoreError>>,
     metrics: &Metrics,
+    mod_tx: &watch::Sender<Arc<Moderation>>,
 ) {
-    let result = store.moderate(op);
-    if result.is_err() {
-        metrics.store_error(StoreOp::Moderate);
-    }
-    if reply.send(result).is_err() {
-        tracing::debug!("management reply receiver dropped");
+    match store.moderate(op) {
+        Ok(snapshot) => {
+            mod_tx.send_replace(Arc::new(snapshot));
+            if reply.send(Ok(())).is_err() {
+                tracing::debug!("management reply receiver dropped");
+            }
+        }
+        Err(err) => {
+            metrics.store_error(StoreOp::Moderate);
+            if reply.send(Err(err)).is_err() {
+                tracing::debug!("management reply receiver dropped");
+            }
+        }
     }
 }
 

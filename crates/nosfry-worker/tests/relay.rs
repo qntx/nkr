@@ -1085,6 +1085,33 @@ fn management_banevent_deletes_and_blocks() {
     );
 }
 
+/// The served NIP-11 `limitation.restricted_writes` follows the
+/// allow-lists, like native.
+#[test]
+fn nip11_restricted_writes_follows_allow_lists() {
+    let mut r = relay(&admin_config());
+    let restricted = |r: &TestRelay| {
+        serde_json::from_str::<serde_json::Value>(&r.nip11()).unwrap()["limitation"]
+            ["restricted_writes"]
+            .as_bool()
+            .unwrap()
+    };
+    assert!(!restricted(&r));
+    let (status, _) = rpc(
+        &mut r,
+        9,
+        &json!({"method": "allowpubkey", "params": [pubkey_of(1)]}),
+    );
+    assert_eq!(status, 200);
+    assert!(restricted(&r));
+    rpc(
+        &mut r,
+        9,
+        &json!({"method": "unallowpubkey", "params": [pubkey_of(1)]}),
+    );
+    assert!(!restricted(&r));
+}
+
 /// `blockip` flips `ip_blocked` for the glue's 403 gate.
 #[test]
 fn management_ip_block() {
