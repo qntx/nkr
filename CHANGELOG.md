@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog]; this project follows
   `interval` panics on a zero period and the interval doubles as the
   write deadline — unlike strfry, 0 cannot mean "no pings". A broken
   reload keeps the running configuration.
+- A configured `relay.write_policy.plugin` is refused at load when
+  `/bin/sh` does not exist: plugins spawn via `sh -c` like strfry,
+  and the distroless runtime image has no shell — every publish
+  would have been rejected `error: internal error`.
 
 ### Added
 
