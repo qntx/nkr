@@ -18,7 +18,10 @@ generated_config=""
 
 cleanup() {
     if [ -n "$server_pid" ]; then
-        kill "$server_pid" 2>/dev/null || true
+        # The server runs in its own process group (see `set -m`
+        # below): signal the whole group, so wrangler's node and
+        # workerd children die with it instead of outliving the run.
+        kill -- "-$server_pid" 2>/dev/null || kill "$server_pid" 2>/dev/null || true
         wait "$server_pid" 2>/dev/null || true
     fi
     if [ -n "$generated_config" ]; then
@@ -48,6 +51,9 @@ wait_ready() {
     return 1
 }
 
+# Job control gives the background server its own process group,
+# whose id is its pid, so cleanup can signal every descendant.
+set -m
 case "$edition" in
 native)
     cat "$profile" >"$tmpdir/config.toml"
@@ -117,6 +123,7 @@ EOF
     exit 2
     ;;
 esac
+set +m
 
 wait_ready
 cd "$root" && cargo test -p nosfry-conformance -- --ignored --test-threads 8
