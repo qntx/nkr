@@ -194,6 +194,11 @@ pub struct Relay<E: Executor, S: Socket> {
     sub_bytes: HashMap<u64, HashMap<SubId, usize>>,
     /// The total `sub_bytes` charges.
     subs_bytes: usize,
+    /// Subscriptions `restore_subs` re-registered at open and the
+    /// `subs` rows it dropped as stale, corrupt, or over budget —
+    /// the wake's one-line restore log.
+    restored_subs: usize,
+    dropped_subs: usize,
 }
 
 impl<E: Executor, S: Socket> Relay<E, S> {
@@ -240,6 +245,8 @@ impl<E: Executor, S: Socket> Relay<E, S> {
             sync_reserved: 0,
             sub_bytes: HashMap::new(),
             subs_bytes: 0,
+            restored_subs: 0,
+            dropped_subs: 0,
         };
         for (socket, attachment) in sockets {
             if attachment.conn > JS_MAX {
@@ -271,6 +278,14 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
         relay.restore_subs()?;
         Ok(relay)
+    }
+
+    /// Wake-restore counts for the one-line construction log: live
+    /// connections, re-registered subscriptions, and `subs` rows
+    /// dropped as stale, corrupt, or over budget.
+    #[must_use]
+    pub fn restored(&self) -> (usize, usize, usize) {
+        (self.conns.len(), self.restored_subs, self.dropped_subs)
     }
 
     /// Whether `ip` is on the NIP-86 block list; the glue answers 403
@@ -1191,6 +1206,23 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         None
     }
 
+    /// `SELECT COUNT(*) FROM subs` for the wake restore summary.
+    fn sub_row_count(&self) -> Result<usize, RelayError> {
+        let mut count = 0usize;
+        self.store
+            .exec()
+            .query("SELECT COUNT(*) FROM subs", &[], &mut |row| {
+                if let Some(Value::Int(v)) = row.first()
+                    && let Ok(v) = usize::try_from(*v)
+                {
+                    count = v;
+                }
+                ControlFlow::Continue(())
+            })
+            .map_err(|err| StoreError::Sql(Box::new(err)))?;
+        Ok(count)
+    }
+
     /// Reload the live connections' `subs` rows. One statement
     /// deletes the rows of connections that are not live (a crash or
     /// deploy strands them) before any row is read, then each
@@ -1209,6 +1241,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
                 .collect::<Vec<_>>()
                 .join(",")
         );
+        let rows_before = self.sub_row_count()?;
         self.store
             .exec()
             .execute(
@@ -1216,6 +1249,7 @@ impl<E: Executor, S: Socket> Relay<E, S> {
                 &[Param::Text(&live)],
             )
             .map_err(|err| StoreError::Sql(Box::new(err)))?;
+        let stale = rows_before - self.sub_row_count()?;
         let budget = self.config.worker.max_subscription_bytes;
         let mut doomed = Vec::new();
         {
@@ -1240,6 +1274,10 @@ impl<E: Executor, S: Socket> Relay<E, S> {
                 )
                 .map_err(|err| StoreError::Sql(Box::new(err)))?;
         }
+        self.restored_subs = self.monitors.len();
+        // Stale-connection rows swept above plus the corrupt or
+        // over-budget rows doomed while streaming.
+        self.dropped_subs = stale + doomed.len();
         for (conn, sub_id) in doomed {
             self.exec(
                 "DELETE FROM subs WHERE conn = ?1 AND sub_id = ?2",
