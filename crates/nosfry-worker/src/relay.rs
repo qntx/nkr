@@ -519,25 +519,40 @@ impl<E: Executor, S: Socket> Relay<E, S> {
         }
     }
 
-    /// The NIP-11 document: the implemented NIPs only — NIP-45 when
-    /// COUNT is enabled, NIP-42 when `service_url` is set, NIP-62
-    /// always, NIP-86 when management admins are configured. The
-    /// moderation snapshot overrides `name`/`description`/`icon` like
-    /// native.
-    #[must_use]
-    pub fn nip11(&self) -> String {
-        let features = nosfry_core::info::Features {
+    /// The optional capabilities the configuration advertises in the
+    /// NIP-11 document and on the landing page.
+    fn features(&self) -> nosfry_core::info::Features {
+        nosfry_core::info::Features {
             count: self.limits.req.max_filter_limit_count > 0,
             sync: self.sync_cap() > 0,
             auth: !self.config.relay.service_url.is_empty(),
             management: !self.config.relay.management.admins.is_empty(),
-        };
+        }
+    }
+
+    /// The NIP-11 relay information document; the NIP-86
+    /// moderation snapshot overrides `name`/`description`/`icon`
+    /// like native.
+    #[must_use]
+    pub fn nip11(&self) -> String {
         nosfry_core::info::document(
             &self.config.relay.info,
             &self.moderation,
-            features,
+            self.features(),
             &self.limits,
             self.config.relay.max_websocket_payload_size,
+        )
+    }
+
+    /// The HTML landing page, mirroring [`Self::nip11`]'s effective
+    /// info.
+    #[must_use]
+    pub fn landing(&self) -> String {
+        nosfry_core::site::landing_page(
+            &self.config.relay.info,
+            &self.moderation,
+            self.features(),
+            &self.config.relay.service_url,
         )
     }
 

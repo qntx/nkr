@@ -71,11 +71,22 @@ fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Forward every request to the `relay` object, honouring
-/// `[worker] location_hint` when it is set.
+/// Route by path: `/` reaches the `relay` object (honouring
+/// `[worker] location_hint`), the `NodeInfo` paths are answered
+/// here from config, and anything else is a 404 that never wakes
+/// the object — like native, the relay answers only its own
+/// endpoints.
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let config = config(&env)?;
+    let path = req.path();
+    match path.as_str() {
+        "/" => {}
+        "/.well-known/nodeinfo" | "/nodeinfo/2.1" => {
+            return nodeinfo_response(&config, &path, &req.method());
+        }
+        _ => return Response::error("not found", 404),
+    }
     let namespace = env.durable_object("RELAY")?;
     let hint = &config.worker.location_hint;
     let stub = if hint.is_empty() {
@@ -98,6 +109,29 @@ fn with_cors(response: Response) -> Result<Response> {
         response.headers().set(name, value)?;
     }
     Ok(response)
+}
+
+/// The entry Worker's static `NodeInfo` answers: the discovery
+/// document 404s without a `service_url`, the 2.1 document always
+/// answers, and only `GET` is accepted — like the native routes.
+fn nodeinfo_response(config: &Config, path: &str, method: &Method) -> Result<Response> {
+    if *method != Method::Get {
+        return Response::error("method not allowed", 405);
+    }
+    let (body, content_type) = if path == "/nodeinfo/2.1" {
+        (
+            nosfry_core::site::nodeinfo(),
+            "application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.1#\"",
+        )
+    } else {
+        let Some(body) = nosfry_core::site::nodeinfo_links(&config.relay.service_url) else {
+            return Response::error("not found", 404);
+        };
+        (body, "application/json")
+    };
+    let response = Response::ok(body)?;
+    response.headers().set("Content-Type", content_type)?;
+    with_cors(response)
 }
 
 /// Connection ids are bound into `subs` rows, so they must stay
@@ -328,10 +362,6 @@ impl std::fmt::Debug for RelayObject {
 }
 
 impl RelayObject {
-    /// The plain-text body the native relay answers non-WebSocket
-    /// requests with.
-    const PLAIN: &'static str = "nosfry: a nostr relay. connect with a websocket client.\n";
-
     /// The 500 every request gets once `new` failed.
     fn down_response(err: &str) -> Result<Response> {
         console_error!("relay object failed to initialize: {err}");
@@ -672,11 +702,17 @@ impl DurableObject for RelayObject {
                 Err(err) => Self::down_response(err),
             };
         }
-        let response = Response::ok(Self::PLAIN.to_owned())?;
-        response
-            .headers()
-            .set("Content-Type", "text/plain; charset=utf-8")?;
-        Ok(response)
+        let mut borrowed = self.relay.borrow_mut();
+        match borrowed.as_mut() {
+            Ok(relay) => {
+                let response = Response::ok(relay.landing())?;
+                response
+                    .headers()
+                    .set("Content-Type", "text/html; charset=utf-8")?;
+                Ok(response)
+            }
+            Err(err) => Self::down_response(err),
+        }
     }
 
     async fn websocket_message(
