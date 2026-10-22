@@ -859,6 +859,73 @@ async fn rpc(method: &str, params: Value) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
+/// A raw HTTP request on `/`; returns (status, head, body). `extra`
+/// carries request header lines, `body` the bytes after the head.
+async fn http_raw(method: &str, extra: &str, body: &[u8]) -> (u16, String, String) {
+    let url = url();
+    let authority = url
+        .strip_prefix("ws://")
+        .expect("NOSFRY_URL must use ws://")
+        .trim_end_matches('/');
+    let mut tcp = tokio::net::TcpStream::connect(authority).await.unwrap();
+    tcp.write_all(
+        format!(
+            "{method} / HTTP/1.1\r\nHost: x\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    tcp.write_all(body).await.unwrap();
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8(buf).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    (
+        head.split_ascii_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap(),
+        head.to_owned(),
+        body.to_owned(),
+    )
+}
+
+/// CORS: a browser admin tool's preflight sees POST + Authorization
+/// (the Fetch wildcard never covers it), and an unauthenticated
+/// NIP-86 POST answers 401 still carrying the allow-origin header.
+#[tokio::test]
+#[ignore = "needs NOSFRY_URL"]
+async fn cors_preflight_and_nip86() {
+    let (status, head, _) = http_raw("OPTIONS", "", b"").await;
+    assert_eq!(status, 204, "{head}");
+    // Header name case differs across editions; compare lowered.
+    let head = head.to_lowercase();
+    for want in [
+        "access-control-allow-origin: *",
+        "access-control-allow-methods: get, post, options",
+        "access-control-allow-headers: authorization, *",
+        "access-control-max-age: 86400",
+    ] {
+        assert!(head.contains(want), "{want} missing: {head}");
+    }
+
+    let body = serde_json::to_vec(&json!({"method": "supportedmethods", "params": []})).unwrap();
+    let extra = format!(
+        "Content-Type: {}\r\n",
+        nosfry_core::management::CONTENT_TYPE
+    );
+    let (status, head, _) = http_raw("POST", &extra, &body).await;
+    assert_eq!(status, 401, "{head}");
+    assert!(
+        head.to_lowercase()
+            .contains("access-control-allow-origin: *"),
+        "{head}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "needs NOSFRY_URL"]
 async fn nip86_requires_nip98() {

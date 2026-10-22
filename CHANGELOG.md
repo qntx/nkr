@@ -10,6 +10,16 @@ The format is based on [Keep a Changelog]; this project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- NIP-86 is callable from browsers on both editions: the CORS
+  preflight now allows `POST` and names `Authorization` explicitly
+  (the Fetch wildcard never covers it), `Access-Control-Max-Age`
+  caches the preflight for a day, and every management response —
+  200, 400, 401, 405 — carries the allow-origin header. The header
+  set lives in `nosfry_core::site::CORS_HEADERS`, shared with the
+  Workers edition.
+
 ### Added
 
 - strfry `enableTcpKeepalive` parity on the native edition:
