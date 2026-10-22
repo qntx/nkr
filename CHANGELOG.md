@@ -12,13 +12,22 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- The full NIP-11 field set on `[relay.info]`: `banner`, `self` (the
+  relay's own pubkey), `terms_of_service`, `privacy_policy`, and
+  `supported_nips` (when present it replaces the computed list
+  verbatim, like strfry `info.nips`). `pubkey` and `self` are
+  validated at load: anything but 64 lowercase hex — an npub,
+  uppercase, or a wrong length — rejects the configuration.
+  `limitation.restricted_writes` now reports whether the NIP-86
+  allow-lists refuse unlisted writes. The document is built by
+  `nosfry_core::info::document`, shared by both editions.
 - A Cloudflare Workers edition (`nosfry-worker`): the relay runs as
   a hibernatable Durable Object over `ctx.storage.sql`, with the
   same NIP-01/09/11/40/42/45/62/70/77/86 coverage as the native
   edition. WebSocket hibernation persists attachments and a `subs`
   table restores subscriptions on wake. Publishes can be gated by a
   strfry write-policy through an optional `POLICY` service binding
-  (the request line is `POST`ed and the `reject`/`shadowReject`
+(the request line is `POST`ed and the `reject`/`shadowReject`
   verdicts behave identically). `nosfry-sql` is a portable store
   over a minimal executor trait with a rusqlite adapter, and the
   conformance suite runs the same cases against both editions.

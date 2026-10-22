@@ -161,6 +161,13 @@ async fn nip11_document() {
     assert_eq!(doc["software"], "https://github.com/qntx/nosfry");
     assert!(doc["version"].is_string());
     assert!(doc["limitation"].is_object());
+    assert_eq!(doc["banner"], "https://example.com/banner.png");
+    assert_eq!(
+        doc["self"],
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    );
+    assert_eq!(doc["terms_of_service"], "https://example.com/terms");
+    assert_eq!(doc["privacy_policy"], "https://example.com/privacy");
     let nips: Vec<u64> = doc["supported_nips"]
         .as_array()
         .unwrap()

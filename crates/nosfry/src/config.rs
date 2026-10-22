@@ -216,11 +216,13 @@ impl Config {
     /// [`ServerError::Io`] on read failure, [`ServerError::Config`] on
     /// TOML syntax errors or unknown keys, [`ServerError::ServiceUrl`]
     /// on an invalid `[relay] service_url`, [`ServerError::Admins`] on
-    /// a malformed `[relay.management] admins` entry.
+    /// a malformed `[relay.management] admins` entry,
+    /// [`ServerError::Info`] on an invalid `[relay.info]` value.
     pub fn load(path: &Path) -> Result<Self, ServerError> {
         let text = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&text)?;
         config.limits()?;
+        config.relay.info.validate()?;
         Ok(config)
     }
 
@@ -390,6 +392,20 @@ mod tests {
             Config::load(&path),
             Err(ServerError::ServiceUrl(_))
         ));
+    }
+
+    /// `Config::load` validates `[relay.info]` too: a `pubkey` or
+    /// `self` that is not 64 lowercase hex fails with
+    /// `ServerError::Info` and a broken reload keeps the running
+    /// configuration.
+    #[test]
+    fn load_rejects_invalid_info_pubkey() {
+        for key in ["pubkey", "self"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("nosfry.toml");
+            std::fs::write(&path, format!("[relay.info]\n{key} = \"npub1bad\"\n")).unwrap();
+            assert!(matches!(Config::load(&path), Err(ServerError::Info(_))));
+        }
     }
 
     /// Restart-only fields keep the running value and are reported;

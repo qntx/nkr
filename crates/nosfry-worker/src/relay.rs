@@ -526,23 +526,19 @@ impl<E: Executor, S: Socket> Relay<E, S> {
     /// native.
     #[must_use]
     pub fn nip11(&self) -> String {
-        let mut nips = vec![1, 9, 11, 40, 62, 70];
-        if self.limits.req.max_filter_limit_count > 0 {
-            nips.push(45);
-        }
-        if self.sync_cap() > 0 {
-            nips.push(77);
-        }
-        if !self.config.relay.service_url.is_empty() {
-            nips.push(42);
-        }
-        if !self.config.relay.management.admins.is_empty() {
-            nips.push(86);
-        }
-        nips.sort_unstable();
-        let relay = &self.config.relay;
-        let info = relay.info.with_overrides(&self.moderation);
-        nosfry_core::info::document(&info, &nips, &self.limits, relay.max_websocket_payload_size)
+        let features = nosfry_core::info::Features {
+            count: self.limits.req.max_filter_limit_count > 0,
+            sync: self.sync_cap() > 0,
+            auth: !self.config.relay.service_url.is_empty(),
+            management: !self.config.relay.management.admins.is_empty(),
+        };
+        nosfry_core::info::document(
+            &self.config.relay.info,
+            &self.moderation,
+            features,
+            &self.limits,
+            self.config.relay.max_websocket_payload_size,
+        )
     }
 
     /// Consume the relay and return the store (tests reopen it with

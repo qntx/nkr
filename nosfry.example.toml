@@ -141,9 +141,16 @@ enabled = true
 sliding_window = true
 
 [relay.info]
-# NIP-11 relay information fields.
-name        = "nosfry"
-description = ""
-pubkey      = ""
-contact     = ""
-icon        = ""
+# NIP-11 relay information fields. `pubkey` and `self` must be
+# 64-char lowercase hex (convert an npub to hex first).
+name             = "nosfry"
+description      = ""
+pubkey           = ""
+contact          = ""
+icon             = ""
+banner           = ""
+self             = ""
+terms_of_service = ""
+privacy_policy   = ""
+# Replace the computed supported_nips list verbatim.
+# supported_nips = [1, 11]

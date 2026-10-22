@@ -240,22 +240,19 @@ pub(crate) fn nip11(
     moderation: &Moderation,
 ) -> String {
     let relay = &config.relay;
-    let mut nips = vec![1, 9, 11, 40, 62, 70];
-    if relay.limits.max_filter_limit_count > 0 {
-        nips.push(45);
-    }
-    if relay.limits.max_sync_events > 0 {
-        nips.push(77);
-    }
-    if !relay.service_url.is_empty() {
-        nips.push(42);
-    }
-    if !relay.management.admins.is_empty() {
-        nips.push(86);
-    }
-    nips.sort_unstable();
-    let info = relay.info.with_overrides(moderation);
-    nosfry_core::info::document(&info, &nips, limits, relay.max_websocket_payload_size)
+    let features = nosfry_core::info::Features {
+        count: relay.limits.max_filter_limit_count > 0,
+        sync: relay.limits.max_sync_events > 0,
+        auth: !relay.service_url.is_empty(),
+        management: !relay.management.admins.is_empty(),
+    };
+    nosfry_core::info::document(
+        &relay.info,
+        moderation,
+        features,
+        limits,
+        relay.max_websocket_payload_size,
+    )
 }
 
 #[cfg(test)]

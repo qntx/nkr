@@ -76,6 +76,9 @@ pub enum ServerError {
     /// Invalid `[relay.management] admins` entry.
     #[error("config: relay.management.admins: {0}: not a 64-hex pubkey")]
     Admins(String),
+    /// Invalid `[relay.info]` value.
+    #[error("config: {0}")]
+    Info(#[from] nosfry_core::info::InfoError),
     /// The worker shutdown task failed.
     #[error("worker shutdown: {0}")]
     Shutdown(#[source] tokio::task::JoinError),
