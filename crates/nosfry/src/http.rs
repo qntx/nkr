@@ -81,15 +81,11 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-const CORS_HEADERS: [(&str, &str); 3] = [
-    ("access-control-allow-origin", "*"),
-    ("access-control-allow-headers", "*"),
-    ("access-control-allow-methods", "GET, OPTIONS"),
-];
-
-/// Apply the CORS headers shared by the preflight and NIP-11 responses.
-fn with_cors(mut response: Response) -> Response {
-    for (name, value) in CORS_HEADERS {
+/// Apply [`nosfry_core::site::CORS_HEADERS`] — shared by the
+/// preflight, NIP-11, `NodeInfo`, and every NIP-86 response (the
+/// management handler wraps its answer in this).
+pub(crate) fn with_cors(mut response: Response) -> Response {
+    for (name, value) in nosfry_core::site::CORS_HEADERS {
         response.headers_mut().insert(
             header::HeaderName::from_static(name),
             header::HeaderValue::from_static(value),

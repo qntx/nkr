@@ -11,6 +11,21 @@ use crate::info::{self, Features, Info};
 use crate::moderation::Moderation;
 use crate::url::RelayUrl;
 
+/// The CORS header set on every HTTP answer a browser may read
+/// (khatru's policy).
+///
+/// Applied to the OPTIONS preflight, NIP-11, `NodeInfo`, and all
+/// NIP-86 responses on both editions. `POST` in the allowed methods
+/// and an explicit `Authorization` in the allowed headers are what
+/// make the NIP-86 RPC callable from a browser — the Fetch wildcard
+/// never covers `Authorization`.
+pub const CORS_HEADERS: [(&str, &str); 4] = [
+    ("access-control-allow-origin", "*"),
+    ("access-control-allow-methods", "GET, POST, OPTIONS"),
+    ("access-control-allow-headers", "Authorization, *"),
+    ("access-control-max-age", "86400"),
+];
+
 /// Escape `&`, `<`, `>`, `"`, and `'` — valid for both text nodes
 /// and double-quoted attribute values.
 fn escape(s: &str) -> String {

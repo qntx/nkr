@@ -39,7 +39,15 @@ pub(crate) async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if ip_blocked(&state, &headers, peer.ip()) {
+    // Every NIP-86 answer carries CORS: a browser admin tool's
+    // preflight must see POST + Authorization, and it must be able
+    // to read the 401/200 replies.
+    crate::http::with_cors(answer(&state, peer, headers, body).await)
+}
+
+/// The NIP-86 answer for one POST; `handle` adds CORS.
+async fn answer(state: &AppState, peer: SocketAddr, headers: HeaderMap, body: Bytes) -> Response {
+    if ip_blocked(state, &headers, peer.ip()) {
         return StatusCode::FORBIDDEN.into_response();
     }
     let live = state.live.borrow().clone();
@@ -85,7 +93,7 @@ pub(crate) async fn handle(
     };
     match serde_json::from_str::<Request<'_>>(text) {
         Err(_) => (StatusCode::BAD_REQUEST, "invalid request json").into_response(),
-        Ok(request) => match dispatch(&state, &request).await {
+        Ok(request) => match dispatch(state, &request).await {
             Ok(result) => Json(json!({ "result": result })).into_response(),
             Err(error) => Json(json!({ "error": error })).into_response(),
         },

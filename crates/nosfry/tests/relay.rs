@@ -3208,6 +3208,78 @@ async fn http_post(
     )
 }
 
+/// One raw HTTP request; returns `(status, response head, body)`.
+/// `request` is the head through the blank line, `body` the bytes
+/// that follow it.
+async fn http_raw(addr: std::net::SocketAddr, request: &str, body: &str) -> (u16, String, String) {
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(format!("{request}{body}").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    (
+        head.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0),
+        head.to_owned(),
+        body.to_owned(),
+    )
+}
+
+/// CORS on the browser-facing surface: the preflight advertises POST
+/// and Authorization (the Fetch wildcard never covers
+/// `Authorization`), and every NIP-86 answer — 401 and 200 — carries
+/// `access-control-allow-origin: *`.
+#[tokio::test]
+async fn cors_preflight_and_management() {
+    let admin = key(9);
+    let relay = Relay::start_with(mgmt_config(&admin)).await;
+
+    let (status, head, _) = http_raw(
+        relay.addr,
+        "OPTIONS / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        "",
+    )
+    .await;
+    assert_eq!(status, 204, "{head}");
+    for want in [
+        "access-control-allow-origin: *",
+        "access-control-allow-methods: GET, POST, OPTIONS",
+        "access-control-allow-headers: Authorization, *",
+        "access-control-max-age: 86400",
+    ] {
+        assert!(head.contains(want), "{want} missing: {head}");
+    }
+
+    let body = json!({"method": "supportedmethods", "params": []}).to_string();
+    let request = |auth: Option<&str>| {
+        let mut request = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            nosfry_core::management::CONTENT_TYPE,
+            body.len()
+        );
+        if let Some(auth) = auth {
+            request.push_str("Authorization: ");
+            request.push_str(auth);
+            request.push_str("\r\n");
+        }
+        request.push_str("\r\n");
+        request
+    };
+    let (status, head, _) = http_raw(relay.addr, &request(None), &body).await;
+    assert_eq!(status, 401, "{head}");
+    assert!(head.contains("access-control-allow-origin: *"), "{head}");
+    let (status, head, _) =
+        http_raw(relay.addr, &request(Some(&nip98(&admin, &body))), &body).await;
+    assert_eq!(status, 200, "{head}");
+    assert!(head.contains("access-control-allow-origin: *"), "{head}");
+    relay.stop().await;
+}
+
 /// A NIP-98 `Authorization` value over `body` signed by `key`; the
 /// `u` tag normalizes to `relay.example.com` — the `service_url`
 /// every management test configures.

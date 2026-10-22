@@ -97,15 +97,10 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     stub.fetch_with_request(req).await
 }
 
-/// The same CORS headers the native `with_cors` emits.
-const CORS_HEADERS: [(&str, &str); 3] = [
-    ("Access-Control-Allow-Origin", "*"),
-    ("Access-Control-Allow-Headers", "*"),
-    ("Access-Control-Allow-Methods", "GET, OPTIONS"),
-];
-
+/// The same CORS headers the native `with_cors` emits
+/// ([`nosfry_core::site::CORS_HEADERS`]).
 fn with_cors(response: Response) -> Result<Response> {
-    for (name, value) in CORS_HEADERS {
+    for (name, value) in nosfry_core::site::CORS_HEADERS {
         response.headers().set(name, value)?;
     }
     Ok(response)
@@ -407,16 +402,16 @@ impl RelayObject {
             .and_then(|v| v.parse::<u64>().ok())
             .is_some_and(|len| len > nosfry_core::management::BODY_LIMIT as u64)
         {
-            return Response::error(
+            return with_cors(Response::error(
                 "Failed to buffer the request body: length limit exceeded",
                 413,
-            );
+            )?);
         }
         let Some(body) = Self::buffered_body(&mut req).await? else {
-            return Response::error(
+            return with_cors(Response::error(
                 "Failed to buffer the request body: length limit exceeded",
                 413,
-            );
+            )?);
         };
         let managed = {
             let mut borrowed = self.relay.borrow_mut();
@@ -435,7 +430,9 @@ impl RelayObject {
         if json {
             response.headers().set("Content-Type", "application/json")?;
         }
-        Ok(response)
+        // Every NIP-86 answer carries CORS — a browser admin tool
+        // must be able to read the 401/200 replies.
+        with_cors(response)
     }
 
     /// Buffer the request body: `None` when it exceeds
@@ -674,7 +671,7 @@ impl DurableObject for RelayObject {
             .as_ref()
             .is_ok_and(|relay| relay.ip_blocked(ip))
         {
-            return Ok(Response::empty()?.with_status(403));
+            return with_cors(Response::empty()?.with_status(403));
         }
         if headers
             .get("Upgrade")?
