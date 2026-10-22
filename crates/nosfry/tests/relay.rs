@@ -2226,6 +2226,23 @@ async fn invalid_auth_reload_rejects_everything() {
     relay.stop().await;
 }
 
+/// `auto_ping_seconds = 0` would panic every connection task; a
+/// reload to 0 fails merged-config validation, so nothing applies and
+/// the running configuration keeps serving (a later valid reload
+/// still lands).
+#[tokio::test]
+async fn zero_auto_ping_reload_is_rejected() {
+    let relay = Relay::start().await;
+    let mut bad = reload_config("must not apply");
+    bad.relay.auto_ping_seconds = 0;
+    relay.reload(bad);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(nip11_name(relay.addr).await, "nosfry");
+    relay.reload(reload_config("sentinel"));
+    assert!(wait_until(|| async { nip11_name(relay.addr).await == "sentinel" }).await);
+    relay.stop().await;
+}
+
 /// The binary re-reads its config file on SIGHUP: a broken file logs
 /// an error and keeps the running configuration, a fixed one applies.
 #[cfg(unix)]
