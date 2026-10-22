@@ -14,7 +14,7 @@ use nosfry_core::message::{
 };
 use nosfry_core::session::SubKey;
 use nosfry_core::sync::{self, NegentropyStorageVector};
-use nosfry_lmdb::{CountScan, Progress, Scan, Store, StoreError};
+use nosfry_lmdb::{CountResult, CountScan, Progress, Scan, Store, StoreError};
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::watch;
 
@@ -96,6 +96,42 @@ struct Work {
     negs: Negs,
 }
 
+/// `nosfry::scan` completion line for a stored REQ scan: one row per
+/// EOSE, spanning every time-slice pause (strfry's `dbScanPerf`).
+fn log_scan_done(conn: ConnId, sub: &SubKey, filters: usize, events: u64, started: Instant) {
+    tracing::debug!(
+        target: "nosfry::scan",
+        conn,
+        sub = sub.id.as_str(),
+        filters,
+        events,
+        elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "stored scan done"
+    );
+}
+
+/// `nosfry::scan` completion line for a COUNT, with the index-entry
+/// count the scan already tracks.
+fn log_count_done(
+    conn: ConnId,
+    sub: &SubKey,
+    filters: usize,
+    started: Instant,
+    result: &CountResult,
+) {
+    tracing::debug!(
+        target: "nosfry::scan",
+        conn,
+        sub = sub.id.as_str(),
+        filters,
+        count = result.count,
+        approximate = result.approximate,
+        examined = result.examined,
+        elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        "count scan done"
+    );
+}
+
 /// One running scan.
 #[derive(Debug)]
 struct ScanEntry {
@@ -106,6 +142,13 @@ struct ScanEntry {
     /// The scan's first emitted frame already went out as its own
     /// chunk so the first event never waits for a full chunk.
     first_pushed: bool,
+    /// Filters the scan was opened with (log field only).
+    filters: usize,
+    /// Stored events emitted so far (log field only).
+    events: u64,
+    /// Scan start; `elapsed_us` at completion spans every
+    /// time-slice pause.
+    started: Instant,
 }
 
 /// Tunables a reader thread holds for its lifetime (restart-only).
@@ -252,6 +295,9 @@ fn step(
         job,
         out,
         first_pushed,
+        filters,
+        mut events,
+        started,
     } = entry;
     match job {
         Job::Neg(mut neg) => {
@@ -265,6 +311,9 @@ fn step(
                     job: Job::Neg(neg),
                     out,
                     first_pushed,
+                    filters,
+                    events,
+                    started,
                 }),
                 Ok(Progress::Done) => finish_neg(conn, &sub, &out, *neg, &mut work.negs, tuning),
                 Err(err) => neg_failed(conn, &sub, &out, &err, metrics),
@@ -277,9 +326,13 @@ fn step(
                 job: Job::Count(scan),
                 out,
                 first_pushed,
+                filters,
+                events,
+                started,
             }),
             Ok(Progress::Done) => {
                 let result = scan.result();
+                log_count_done(conn, &sub, filters, started, &result);
                 let text = count_frame(
                     &sub.id,
                     result.count,
@@ -295,6 +348,7 @@ fn step(
             let mut texts = Vec::new();
             let mut bytes = 0usize;
             let result = scan.step(store, budget, &mut |_seq, json| {
+                events += 1;
                 let text = event_frame(&sub.id, json);
                 if first {
                     first = false;
@@ -328,8 +382,12 @@ fn step(
                     job: Job::Scan(scan),
                     out,
                     first_pushed,
+                    filters,
+                    events,
+                    started,
                 }),
                 Ok(Progress::Done) => {
+                    log_scan_done(conn, &sub, filters, events, started);
                     out.push(Out::Frame {
                         sub: Some(sub.clone()),
                         verb: RelayVerb::Eose,
@@ -570,6 +628,7 @@ fn apply(msg: ReaderMsg, work: &mut Work, tuning: &Tuning) {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs());
+            let filters = start.filters.len();
             let job = match start.kind {
                 ScanKind::Req => Job::Scan(Scan::new(
                     start.filters,
@@ -610,6 +669,9 @@ fn apply(msg: ReaderMsg, work: &mut Work, tuning: &Tuning) {
                 job,
                 out: start.out,
                 first_pushed: false,
+                filters,
+                events: 0,
+                started: Instant::now(),
             });
         }
         ReaderMsg::Cancel { conn, sub_id } => {

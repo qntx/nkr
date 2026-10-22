@@ -443,12 +443,27 @@ fn is_connection_error(err: &std::io::Error) -> bool {
     )
 }
 
+/// Socket tuning for one accepted connection: `TCP_NODELAY` always,
+/// `SO_KEEPALIVE` (OS default timings, like strfry's plain
+/// setsockopt) when `[relay] tcp_keepalive` is on. Failures warn and
+/// the connection proceeds, as strfry does.
+fn tune<S: std::os::fd::AsFd>(tcp: &S, keepalive: bool) {
+    let socket = socket2::SockRef::from(tcp);
+    if let Err(err) = socket.set_tcp_nodelay(true) {
+        tracing::warn!(%err, "failed to set TCP_NODELAY");
+    }
+    if keepalive && let Err(err) = socket.set_keepalive(true) {
+        tracing::warn!(%err, "failed to set SO_KEEPALIVE");
+    }
+}
+
 /// Accept HTTP/1 connections until `shutdown` resolves, serving each
 /// with a header-read deadline `axum::serve` cannot set. In-flight
 /// connections get `graceful_shutdown` once `http_stop` fires.
 async fn accept_loop(
     listener: &TcpListener,
     router: &axum::Router,
+    live: &watch::Receiver<Arc<Live>>,
     shutdown: impl Future<Output = ()>,
     http_stop_rx: &watch::Receiver<()>,
     http_tracker: &tokio_util::task::TaskTracker,
@@ -468,7 +483,9 @@ async fn accept_loop(
             },
             () = &mut shutdown => break,
         };
-        spawn_connection(tcp, peer, router, http_stop_rx, http_tracker);
+        // Read the flag per accept so a reload reaches new sockets.
+        let keepalive = live.borrow().config.relay.tcp_keepalive;
+        spawn_connection(tcp, peer, router, keepalive, http_stop_rx, http_tracker);
     }
 }
 
@@ -478,12 +495,11 @@ fn spawn_connection(
     tcp: tokio::net::TcpStream,
     peer: std::net::SocketAddr,
     router: &axum::Router,
+    keepalive: bool,
     http_stop_rx: &watch::Receiver<()>,
     http_tracker: &tokio_util::task::TaskTracker,
 ) {
-    if let Err(err) = tcp.set_nodelay(true) {
-        tracing::warn!(%err, "failed to set TCP_NODELAY");
-    }
+    tune(&tcp, keepalive);
     let service = TowerToHyperService::new(router.clone().into_service().map_request(
         move |mut req: hyper::Request<Incoming>| {
             req.extensions_mut().insert(ConnectInfo(peer));
@@ -564,6 +580,7 @@ pub async fn serve(
     accept_loop(
         &listener,
         &router,
+        &server.state.live,
         async move {
             shutdown.await;
             stop.send_replace(true);
@@ -588,4 +605,31 @@ pub async fn serve(
         .await
         .map_err(ServerError::Shutdown)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, reason = "unit tests may panic on failure")]
+mod tests {
+    use super::*;
+
+    /// `tune` sets `SO_KEEPALIVE` only when asked; `TCP_NODELAY`
+    /// always (asserted on a real loopback pair).
+    #[test]
+    fn tune_socket_flags() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        tune(&server, true);
+        let socket = socket2::SockRef::from(&server);
+        assert!(socket.keepalive().unwrap());
+        assert!(socket.tcp_nodelay().unwrap());
+
+        let keepalive_off = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let _off = std::net::TcpStream::connect(keepalive_off.local_addr().unwrap()).unwrap();
+        let (plain, _) = keepalive_off.accept().unwrap();
+        tune(&plain, false);
+        let plain = socket2::SockRef::from(&plain);
+        assert!(!plain.keepalive().unwrap());
+        assert!(plain.tcp_nodelay().unwrap());
+    }
 }

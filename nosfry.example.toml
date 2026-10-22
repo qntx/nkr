@@ -2,6 +2,16 @@
 # Copy to nosfry.toml (or pass --config / set NOSFRY_CONFIG).
 # SIGHUP reloads this file without restarting; sections marked
 # "restart-only" keep their startup values until the next start.
+#
+# Logging is RUST_LOG-based instead of strfry's relay.logging.*:
+#   strfry logging.invalidEvents → RUST_LOG=info,nosfry::ingest=debug
+#     (every OK frame sent, accept or reject, plus relay-sent CLOSED
+#     — a superset of strfry's rejected-only output)
+#   dumpInAll/dumpInEvents/dumpInReqs → nosfry::inbound=trace
+#     (every inbound text message, already bounded by
+#     max_websocket_payload_size)
+#   dbScanPerf → nosfry::scan=debug
+#     (one line per finished stored REQ scan or COUNT)
 
 [db] # restart-only
 # LMDB environment directory.
@@ -48,6 +58,10 @@ real_ip_header = ""
 max_websocket_payload_size = 131072
 # WebSocket ping interval in seconds.
 auto_ping_seconds = 55
+# Set SO_KEEPALIVE on accepted sockets with OS default timings
+# (strfry enableTcpKeepalive). Reloadable — applies to connections
+# accepted after the change.
+tcp_keepalive = false
 # Pending outbound bytes above which a connection is closed (1008).
 max_pending_outbound_bytes = 33554432
 # Process-wide pending outbound byte budget (restart-only; 0 =

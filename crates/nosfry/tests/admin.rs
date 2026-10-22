@@ -97,6 +97,7 @@ fn import_mixed_corpus_stats() {
         MAX_LINE,
         Cursor::new(corpus),
         true,
+        false,
     )
     .unwrap();
 
@@ -154,6 +155,7 @@ fn export_import_export_is_byte_identical() {
         MAX_LINE,
         Cursor::new(&dump),
         false,
+        false,
     )
     .unwrap();
     assert_eq!(stats.added, 50);
@@ -177,6 +179,7 @@ fn reimport_reports_all_duplicates() {
         None,
         MAX_LINE,
         Cursor::new(&dump),
+        false,
         false,
     )
     .unwrap();
@@ -337,6 +340,7 @@ fn import_counts_blocked_events() {
         None,
         MAX_LINE,
         Cursor::new(corpus),
+        false,
         false,
     )
     .unwrap();
@@ -522,5 +526,240 @@ fn cli_end_to_end() {
         String::from_utf8_lossy(&nodb_out.stderr).contains("no database"),
         "stderr: {}",
         String::from_utf8_lossy(&nodb_out.stderr)
+    );
+}
+
+/// A line whose id does not match its content (valid signature).
+fn bad_id_line() -> String {
+    let mut line = line(&event(&key(9), 1, 100, &json!([]), "bad-id"));
+    // `{"id":"<64 hex>"`: flip the first nibble.
+    let first = line.as_bytes()[7] as char;
+    line.replace_range(7..8, if first == '0' { "1" } else { "0" });
+    line
+}
+
+#[test]
+fn import_no_verify_accepts_bad_sig_rejects_bad_id() {
+    let (_dir, st) = store();
+    let good = line(&event(&key(6), 1, 100, &json!([]), "ok"));
+    let corpus = [good, bad_sig_line(), bad_id_line()].join("\n");
+    let stats = import(
+        &st,
+        &EventLimits::default(),
+        None,
+        MAX_LINE,
+        Cursor::new(corpus),
+        false,
+        true,
+    )
+    .unwrap();
+    assert_eq!(stats.processed, 3);
+    assert_eq!(stats.added, 2, "bad sig stored, good stored");
+    assert_eq!(stats.rejected, 1, "the wrong id is still rejected");
+
+    // Without --no-verify the same corrupted signature is rejected.
+    let (_dir2, store2) = store();
+    let verified = import(
+        &store2,
+        &EventLimits::default(),
+        None,
+        MAX_LINE,
+        Cursor::new(bad_sig_line()),
+        false,
+        false,
+    )
+    .unwrap();
+    assert_eq!(verified.added, 0);
+    assert_eq!(verified.rejected, 1);
+}
+
+/// Run the CLI `delete` with extra args against `config`; returns the
+/// finished process output.
+fn cli_delete(bin: &str, config: &Path, args: &[&str]) -> std::process::Output {
+    let mut command = Command::new(bin);
+    command.args(["--config", config.to_str().unwrap(), "delete"]);
+    command.args(args);
+    command.output().unwrap()
+}
+
+/// `scan --count {}` output as a number.
+fn cli_count(bin: &str, config: &Path) -> u64 {
+    let out = Command::new(bin)
+        .args([
+            "scan",
+            "--count",
+            "{}",
+            "--config",
+            config.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn cli_delete_age_and_selection() {
+    let bin = env!("CARGO_BIN_EXE_nosfry");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let config = dir.path().join("nosfry.toml");
+    std::fs::write(&config, format!("[db]\npath = \"{}\"\n", db.display())).unwrap();
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    {
+        let store = Store::open(&db, &StoreOptions::default()).unwrap();
+        let k = key(12);
+        store
+            .write(
+                &[
+                    event(&k, 1, now - 10_000, &json!([]), "old-1"),
+                    event(&k, 7, now - 10_000, &json!([]), "old-7"),
+                    event(&k, 1, now - 30_000, &json!([]), "older-1"),
+                    event(&k, 1, now, &json!([]), "new-1"),
+                ],
+                None,
+            )
+            .unwrap();
+    }
+
+    // clap requires at least one of --age / FILTER: bare `delete`
+    // and `delete --dry-run` both fail -- a selection is required,
+    // flags alone never suffice.
+    for args in [&[][..], &["--dry-run"][..]] {
+        let bare = cli_delete(bin, &config, args);
+        assert!(
+            !bare.status.success(),
+            "delete {args:?} must be rejected: {}",
+            String::from_utf8_lossy(&bare.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&bare.stderr).contains("required"),
+            "stderr: {}",
+            String::from_utf8_lossy(&bare.stderr)
+        );
+    }
+    assert_eq!(cli_count(bin, &config), 4, "nothing deleted");
+
+    // --dry-run combines with either selection form.
+    for args in [
+        &["--dry-run", "--age", "5000"][..],
+        &["--dry-run", "{\"kinds\":[1]}"][..],
+    ] {
+        let dry = cli_delete(bin, &config, args);
+        assert!(
+            dry.status.success(),
+            "delete {args:?}: {}",
+            String::from_utf8_lossy(&dry.stderr)
+        );
+    }
+    assert_eq!(cli_count(bin, &config), 4, "dry runs delete nothing");
+
+    // Dry run with --age counts the three old events, deletes nothing.
+    let dry = cli_delete(bin, &config, &["--age", "5000", "--dry-run"]);
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert_eq!(String::from_utf8(dry.stdout).unwrap(), "3\n");
+    assert_eq!(cli_count(bin, &config), 4);
+
+    // Filter until (now-20000) is earlier than the age cutoff
+    // (now-5000): only older-1 matches.
+    let until = format!("{{\"kinds\":[1],\"until\":{}}}", now - 20_000);
+    let out = cli_delete(bin, &config, &["--age", "5000", &until]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "1\n",
+        "until = min wins"
+    );
+
+    // Filter until later than the cutoff: the age bound applies,
+    // deleting old-1 (the only remaining old kind-1).
+    let later = format!("{{\"kinds\":[1],\"until\":{}}}", now + 100_000);
+    let later_out = cli_delete(bin, &config, &["--age", "5000", &later]);
+    assert!(later_out.status.success());
+    assert_eq!(String::from_utf8(later_out.stdout).unwrap(), "1\n");
+
+    // Age only: deletes old-7 regardless of kind; only new-1 remains.
+    let age_only = cli_delete(bin, &config, &["--age", "5000"]);
+    assert!(age_only.status.success());
+    assert_eq!(String::from_utf8(age_only.stdout).unwrap(), "1\n");
+    assert_eq!(cli_count(bin, &config), 1);
+}
+
+#[test]
+fn cli_import_no_verify() {
+    let bin = env!("CARGO_BIN_EXE_nosfry");
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let config = dir.path().join("nosfry.toml");
+    std::fs::write(&config, format!("[db]\npath = \"{}\"\n", db.display())).unwrap();
+
+    // A corrupted signature is accepted under --no-verify; a wrong id
+    // is still rejected.
+    let input_path = dir.path().join("in.jsonl");
+    std::fs::write(
+        &input_path,
+        format!("{}\n{}\n", bad_sig_line(), bad_id_line()),
+    )
+    .unwrap();
+    let import_out = Command::new(bin)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "import",
+            "--no-verify",
+        ])
+        .stdin(Stdio::from(std::fs::File::open(&input_path).unwrap()))
+        .output()
+        .unwrap();
+    assert!(
+        import_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&import_out.stderr).contains("added: 1"),
+        "only the bad-sig line stored, stderr: {}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+
+    let exported = Command::new(bin)
+        .args(["--config", config.to_str().unwrap(), "export"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8(exported.stdout).unwrap().lines().count(),
+        1
+    );
+
+    // The default path still rejects the corrupted signature.
+    let db2 = dir.path().join("db2");
+    let config2 = dir.path().join("nosfry2.toml");
+    std::fs::write(&config2, format!("[db]\npath = \"{}\"\n", db2.display())).unwrap();
+    std::fs::write(&input_path, format!("{}\n", bad_sig_line())).unwrap();
+    let verified = Command::new(bin)
+        .args(["--config", config2.to_str().unwrap(), "import"])
+        .stdin(Stdio::from(std::fs::File::open(&input_path).unwrap()))
+        .output()
+        .unwrap();
+    assert!(verified.status.success());
+    assert!(
+        String::from_utf8_lossy(&verified.stderr).contains("rejected: 1"),
+        "stderr: {}",
+        String::from_utf8_lossy(&verified.stderr)
     );
 }

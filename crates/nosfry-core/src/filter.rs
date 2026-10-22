@@ -42,7 +42,7 @@ impl<'de> Visitor<'de> for PairsVisitor {
 }
 
 /// Fields inside a filter are `AND`ed.
-#[derive(Debug, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub struct Filter {
     ids: Option<Box<[[u8; 32]]>>,
     authors: Option<Box<[[u8; 32]]>>,
@@ -117,6 +117,15 @@ impl Filter {
     #[must_use]
     pub const fn until(&self) -> Option<u64> {
         self.until
+    }
+
+    /// A copy with `until` clamped to at most `until` — the earlier
+    /// of the filter's own `until` and `until` wins.
+    #[must_use]
+    pub fn with_until(&self, until: u64) -> Self {
+        let mut next = self.clone();
+        next.until = Some(next.until.map_or(until, |own| own.min(until)));
+        next
     }
 
     /// Number of `#` conditions.
@@ -503,6 +512,18 @@ mod tests {
         let filter = Filter::parse(r#"{"kinds":[1,3]}"#).expect("parse");
         assert_eq!(filter.kinds(), Some(&[1u16, 3][..]));
         assert!(!filter.is_impossible());
+    }
+
+    #[test]
+    fn with_until_keeps_the_earlier_bound() {
+        let open = Filter::parse(r#"{"kinds":[1]}"#).expect("parse");
+        assert_eq!(open.with_until(500).until(), Some(500));
+
+        let later = Filter::parse(r#"{"until":900}"#).expect("parse");
+        assert_eq!(later.with_until(500).until(), Some(500));
+
+        let earlier = Filter::parse(r#"{"until":100}"#).expect("parse");
+        assert_eq!(earlier.with_until(500).until(), Some(100));
     }
 
     #[test]
