@@ -32,6 +32,12 @@ impl RelayUrl {
         Ok(Self(host.into_boxed_str()))
     }
 
+    /// The normalized host, with port when the URL carried one.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.0
+    }
+
     /// Whether `tag_value` normalizes to this relay's host
     /// (NIP-42 `relay` tags, NIP-62 vanish targets).
     #[must_use]
