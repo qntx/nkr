@@ -5,6 +5,8 @@
 //!   that every expected delivery arrives exactly once.
 //! - `conns`: C idle subscribed connections; measures the relay's resident
 //!   memory per connection and the CPU spent establishing them.
+//! - `rtt`, `ingest`, `wake`, `subbudget`, `scan`: deployed-relay
+//!   acceptance-gate modes (see `gate.rs`).
 //!
 //! Every result is printed as one JSON line on stdout.
 
@@ -14,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod gate;
 mod soak;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -68,8 +71,10 @@ enum Cmd {
         conns: usize,
         #[arg(long)]
         deflate: bool,
+        /// Relay process id for RSS/CPU sampling; skipped when absent
+        /// (e.g. a remote or deployed relay).
         #[arg(long)]
-        pid: u32,
+        pid: Option<u32>,
         #[arg(long, default_value_t = 5)]
         hold_secs: u64,
         #[arg(long, default_value = "")]
@@ -112,6 +117,56 @@ enum Cmd {
         vanish_every_secs: u64,
         #[arg(long, default_value = "")]
         label: String,
+    },
+    /// One connection, n sequential REQ→EOSE round-trips.
+    Rtt {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value_t = 20)]
+        n: usize,
+    },
+    /// Events paced over connections; OK latency and acceptance rate.
+    Ingest {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value_t = 30)]
+        conns: usize,
+        #[arg(long, default_value_t = 3000)]
+        events: usize,
+        #[arg(long, default_value_t = 15.0)]
+        rate_per_conn: f64,
+    },
+    /// Subscribers idle through a hibernation, then fanout delivery.
+    Wake {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value_t = 1000)]
+        subs: usize,
+        #[arg(long, default_value_t = 180)]
+        idle_secs: u64,
+        #[arg(long, default_value_t = 3)]
+        rounds: usize,
+        #[arg(long, default_value_t = 10)]
+        events: usize,
+        /// Keep one NIP-42-authenticated restricted subscription alive.
+        #[arg(long)]
+        auth: bool,
+    },
+    /// Large-author-list REQs until the subscription byte budget refuses.
+    Subbudget {
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value_t = 1900)]
+        authors: usize,
+    },
+    /// n stored scans of one filter; reports the CPU-ceiling signal.
+    Scan {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        filter: String,
+        #[arg(long, default_value_t = 3)]
+        n: usize,
     },
 }
 
@@ -400,11 +455,14 @@ async fn fanout(
 ) {
     let now = unix_now();
     let authors: Vec<Author> = (0..authors_n).map(author).collect();
-    let tags = json!([["t", "nosfry-bench"]]);
+    // A per-run `t` tag: on a public relay, foreign kind-1 traffic must
+    // not count toward this run's deliveries.
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
+    let tag = format!("fanout-{nonce:x}");
+    let tags = json!([["t", tag]]);
     let mut index = HashMap::with_capacity(events);
     let mut messages = Vec::with_capacity(events);
     for i in 0..events {
@@ -426,12 +484,15 @@ async fn fanout(
     let per_author = |a: usize| events / authors_n + usize::from(a < events % authors_n);
     let plan: Vec<(usize, Value)> = (0..subs)
         .map(|j| match mode {
-            Mode::Broadcast => (events, json!({"kinds": [1], "since": now})),
+            Mode::Broadcast => (
+                events,
+                json!({"kinds": [1], "#t": [tag], "since": now}),
+            ),
             Mode::Selective => {
                 let a = j % authors_n;
                 (
                     per_author(a),
-                    json!({"kinds": [1], "authors": [authors[a].pk_hex], "since": now}),
+                    json!({"kinds": [1], "#t": [tag], "authors": [authors[a].pk_hex], "since": now}),
                 )
             }
         })
@@ -561,14 +622,16 @@ async fn fanout(
         "rate": rate,
         "ok_accepted": accepted,
         "ok_rejected": rejected,
-        "expected_deliveries": expected_total,
-        "received": received,
+        "expected": expected_total,
+        "delivered": received,
         "missing": expected_total.saturating_sub(received),
         "duplicates": duplicates,
         "unknown": unknown,
         "subscriber_errors": errors,
         "publish_secs": publish_secs,
         "elapsed_secs": elapsed_secs,
+        "latency_p50_ms": percentile(&latencies, 50.0),
+        "latency_p99_ms": percentile(&latencies, 99.0),
         "latency_ms": {
             "p50": percentile(&latencies, 50.0),
             "p90": percentile(&latencies, 90.0),
@@ -583,19 +646,28 @@ async fn fanout(
     println!("{result}");
 }
 
-async fn conns(url: url::Url, n: usize, deflate: bool, pid: u32, hold_secs: u64, label: String) {
-    let before = proc_stats(pid).expect("relay pid is alive");
+async fn conns(
+    url: url::Url,
+    n: usize,
+    deflate: bool,
+    pid: Option<u32>,
+    hold_secs: u64,
+    label: String,
+) {
+    let before = pid.and_then(proc_stats);
     let (stop_tx, stop_rx) = watch::channel(false);
     let ready = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
     let gate = Arc::new(Semaphore::new(HANDSHAKE_CONCURRENCY));
     let start = Instant::now();
     let mut tasks = Vec::with_capacity(n);
     for j in 0..n {
-        let (url, ready, failed, gate, mut stop) = (
+        let (url, ready, failed, dropped, gate, mut stop) = (
             url.clone(),
             Arc::clone(&ready),
             Arc::clone(&failed),
+            Arc::clone(&dropped),
             Arc::clone(&gate),
             stop_rx.clone(),
         );
@@ -623,7 +695,16 @@ async fn conns(url: url::Url, n: usize, deflate: bool, pid: u32, hold_secs: u64,
             ready.fetch_add(1, Ordering::Relaxed);
             loop {
                 tokio::select! {
-                    frame = ws.next() => if frame.is_none() { break },
+                    frame = ws.next() => {
+                        if frame.is_none() {
+                            // A socket that ended before the hold was
+                            // released dropped during the hold.
+                            if !*stop.borrow() {
+                                dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            break;
+                        }
+                    },
                     _ = stop.changed() => break,
                 }
             }
@@ -636,31 +717,43 @@ async fn conns(url: url::Url, n: usize, deflate: bool, pid: u32, hold_secs: u64,
     }
     let setup_secs = start.elapsed().as_secs_f64();
     tokio::time::sleep(Duration::from_secs(hold_secs)).await;
-    let held = proc_stats(pid).expect("relay pid is alive");
+    let held = pid.and_then(proc_stats);
     let opened = ready.load(Ordering::Relaxed);
     stop_tx.send_replace(true);
     for task in tasks {
         let _ = task.await;
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
-    let released = proc_stats(pid);
+    let released = pid.and_then(proc_stats);
+    let mem = |a: Option<ProcStats>| a.map(ProcStats::mem_kib);
     let result = json!({
         "scenario": "conns",
         "label": label,
         "deflate": deflate,
         "requested": n,
-        "opened": opened,
+        "accepted": opened,
         "failed": failed.load(Ordering::Relaxed),
+        "dropped_during_hold": dropped.load(Ordering::Relaxed),
         "setup_secs": setup_secs,
-        "rss_kib_before": before.rss_kib,
-        "rss_kib_held": held.rss_kib,
+        "rss_kib_before": before.map(|b| b.rss_kib),
+        "rss_kib_held": held.map(|h| h.rss_kib),
         "rss_kib_after_close": released.map(|r| r.rss_kib),
-        "rss_anon_kib_before": before.rss_anon_kib,
-        "rss_anon_kib_held": held.rss_anon_kib,
+        "rss_anon_kib_before": before.and_then(|b| b.rss_anon_kib),
+        "rss_anon_kib_held": held.and_then(|h| h.rss_anon_kib),
         "rss_anon_kib_after_close": released.and_then(|r| r.rss_anon_kib),
-        "mem_metric": if held.rss_anon_kib.is_some() { "RssAnon" } else { "RSS" },
-        "kib_per_conn": if opened > 0 { json!((held.mem_kib() as f64 - before.mem_kib() as f64) / opened as f64) } else { Value::Null },
-        "relay_cpu_secs_setup": held.cpu_secs - before.cpu_secs,
+        "mem_metric": match held {
+            Some(h) if h.rss_anon_kib.is_some() => json!("RssAnon"),
+            Some(_) => json!("RSS"),
+            None => Value::Null,
+        },
+        "kib_per_conn": match (mem(before), mem(held)) {
+            (Some(b), Some(h)) if opened > 0 => json!((h as f64 - b as f64) / opened as f64),
+            _ => Value::Null,
+        },
+        "relay_cpu_secs_setup": match (before, held) {
+            (Some(b), Some(h)) => json!(h.cpu_secs - b.cpu_secs),
+            _ => Value::Null,
+        },
     });
     println!("{result}");
 }
@@ -703,6 +796,38 @@ async fn main() {
         } => {
             let url = url.parse().expect("valid ws url");
             conns(url, n, deflate, pid, hold_secs, label).await;
+        }
+        Cmd::Rtt { url, n } => {
+            let url = url.parse().expect("valid ws(s) url");
+            gate::rtt(url, n).await;
+        }
+        Cmd::Ingest {
+            url,
+            conns,
+            events,
+            rate_per_conn,
+        } => {
+            let url = url.parse().expect("valid ws(s) url");
+            gate::ingest(url, conns, events, rate_per_conn).await;
+        }
+        Cmd::Wake {
+            url,
+            subs,
+            idle_secs,
+            rounds,
+            events,
+            auth,
+        } => {
+            let url = url.parse().expect("valid ws(s) url");
+            gate::wake(url, subs, idle_secs, rounds, events, auth).await;
+        }
+        Cmd::Subbudget { url, authors } => {
+            let url = url.parse().expect("valid ws(s) url");
+            gate::subbudget(url, authors).await;
+        }
+        Cmd::Scan { url, filter, n } => {
+            let url = url.parse().expect("valid ws(s) url");
+            gate::scan(url, &filter, n).await;
         }
         Cmd::Soak {
             url,

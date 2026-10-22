@@ -951,7 +951,8 @@ fn sample_line(
     );
     obj.insert(
         "subscription_bytes".into(),
-        m.as_ref().map_or(Value::Null, |m| opt(m.subscription_bytes)),
+        m.as_ref()
+            .map_or(Value::Null, |m| opt(m.subscription_bytes)),
     );
     line
 }
