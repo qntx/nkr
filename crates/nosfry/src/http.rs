@@ -47,13 +47,16 @@ pub(crate) struct AppState {
 /// `[relay] metrics` is enabled — otherwise it falls through to the
 /// default 404 like any unknown path.
 pub(crate) fn router(state: AppState) -> Router {
-    let router = Router::new().route(
-        "/",
-        get(root)
-            .post(management::handle)
-            .on(MethodFilter::OPTIONS, preflight)
-            .route_layer(DefaultBodyLimit::max(management::BODY_LIMIT)),
-    );
+    let router = Router::new()
+        .route(
+            "/",
+            get(root)
+                .post(management::handle)
+                .on(MethodFilter::OPTIONS, preflight)
+                .route_layer(DefaultBodyLimit::max(management::BODY_LIMIT)),
+        )
+        .route("/.well-known/nodeinfo", get(nodeinfo_links))
+        .route("/nodeinfo/2.1", get(nodeinfo));
     let router = if state.live.borrow().config.relay.metrics {
         router.route("/metrics", get(metrics))
     } else {
@@ -99,6 +102,30 @@ async fn preflight() -> Response {
     with_cors(StatusCode::NO_CONTENT.into_response())
 }
 
+/// `/.well-known/nodeinfo`: discovery pointing at `/nodeinfo/2.1` on
+/// the configured `service_url` host — 404 when it is unset.
+async fn nodeinfo_links(State(state): State<AppState>) -> Response {
+    let service_url = state.live.borrow().config.relay.service_url.clone();
+    let Some(body) = nosfry_core::site::nodeinfo_links(&service_url) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    with_cors(([(header::CONTENT_TYPE, "application/json")], body).into_response())
+}
+
+/// `/nodeinfo/2.1`: the `NodeInfo` 2.1 document.
+async fn nodeinfo() -> Response {
+    with_cors(
+        (
+            [(
+                header::CONTENT_TYPE,
+                "application/json; profile=\"http://nodeinfo.diaspora.software/ns/schema/2.1#\"",
+            )],
+            nosfry_core::site::nodeinfo(),
+        )
+            .into_response(),
+    )
+}
+
 async fn root(State(state): State<AppState>, request: Request) -> Response {
     let (mut parts, _body) = request.into_parts();
     // The accept loop always inserts `ConnectInfo`; missing means a
@@ -137,10 +164,8 @@ async fn root(State(state): State<AppState>, request: Request) -> Response {
     }
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Body::from(
-            "nosfry: a nostr relay. connect with a websocket client.\n",
-        ))
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(state.live.borrow().landing.clone()))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
@@ -229,29 +254,39 @@ fn client_ip(config: &Config, headers: &header::HeaderMap, peer: IpAddr) -> IpAd
     peer
 }
 
-/// The NIP-11 relay information document, serialized once at startup
-/// (it is static for the process lifetime). The NIP list follows the
-/// configured features; the NIP-86 moderation snapshot overrides
-/// `name`/`description`/`icon` through an effective [`Info`].
+/// The optional capabilities the `[relay]` configuration advertises
+/// in the NIP-11 document and on the landing page.
+const fn features(relay: &crate::config::Relay) -> nosfry_core::info::Features {
+    nosfry_core::info::Features {
+        count: relay.limits.max_filter_limit_count > 0,
+        sync: relay.limits.max_sync_events > 0,
+        auth: !relay.service_url.is_empty(),
+        management: !relay.management.admins.is_empty(),
+    }
+}
+
+/// The NIP-11 relay information document, rebuilt with the live
+/// config whenever the config or moderation snapshot changes.
 pub(crate) fn nip11(
     config: &Config,
     limits: &nosfry_core::limits::Limits,
     moderation: &Moderation,
 ) -> String {
     let relay = &config.relay;
-    let features = nosfry_core::info::Features {
-        count: relay.limits.max_filter_limit_count > 0,
-        sync: relay.limits.max_sync_events > 0,
-        auth: !relay.service_url.is_empty(),
-        management: !relay.management.admins.is_empty(),
-    };
     nosfry_core::info::document(
         &relay.info,
         moderation,
-        features,
+        features(relay),
         limits,
         relay.max_websocket_payload_size,
     )
+}
+
+/// The HTML landing page, rendered alongside [`nip11`] (same
+/// effective info, same rebuild points).
+pub(crate) fn landing(config: &Config, moderation: &Moderation) -> String {
+    let relay = &config.relay;
+    nosfry_core::site::landing_page(&relay.info, moderation, features(relay), &relay.service_url)
 }
 
 #[cfg(test)]

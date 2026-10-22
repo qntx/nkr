@@ -100,6 +100,8 @@ pub(crate) struct Live {
     pub(crate) limits: Arc<nosfry_core::limits::Limits>,
     /// Pre-serialized NIP-11 document, rebuilt on each reload.
     pub(crate) nip11: axum::body::Bytes,
+    /// Pre-rendered landing page, rebuilt with `nip11`.
+    pub(crate) landing: axum::body::Bytes,
     /// Active write-policy plugin; read at each publish so a reload
     /// applies to the next event on every connection.
     pub(crate) policy: Option<policy::WritePolicy>,
@@ -152,6 +154,7 @@ async fn reload_loop(
                 let snapshot = moderation.borrow().clone();
                 let mut updated = (*live).clone();
                 updated.nip11 = http::nip11(&updated.config, &updated.limits, &snapshot).into();
+                updated.landing = http::landing(&updated.config, &snapshot).into();
                 *current = Arc::new(updated);
             });
         }
@@ -201,7 +204,9 @@ fn log_invalid_reload(err: &ServerError) {
 
 /// Apply a validated reload: update the connection caps, replace the
 /// write-policy task only when its command or timeout changed, and
-/// build the next [`Live`].
+/// build the next [`Live`]. The cached NIP-11 document and landing
+/// page carry over; `reload_loop` re-derives both from the latest
+/// moderation snapshot at publish time.
 fn apply_reload(
     merged: Config,
     limits: nosfry_core::limits::Limits,
@@ -222,6 +227,7 @@ fn apply_reload(
     tracing::info!("configuration reloaded");
     Live {
         nip11: live.nip11.clone(),
+        landing: live.landing.clone(),
         config: Arc::new(merged),
         limits: Arc::new(limits),
         policy,
@@ -320,6 +326,7 @@ impl Server {
         let (live_tx, live_rx) = watch::channel(Arc::new(Live {
             config: Arc::clone(&config),
             nip11: http::nip11(&config, &limits, &moderation).into(),
+            landing: http::landing(&config, &moderation).into(),
             limits: Arc::new(limits),
             policy: start_policy(&config.relay.write_policy),
             admins,
