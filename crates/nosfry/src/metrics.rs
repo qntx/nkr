@@ -127,7 +127,8 @@ impl Metrics {
     /// Render the Prometheus text exposition format (0.0.4);
     /// `connections` is the live gauge read from the connection
     /// limiter, `outbound_pending` the process-wide pending
-    /// outbound bytes, and `sync_memory` the reserved sync-storage
+    /// outbound bytes, `sync_memory` the reserved sync-storage
+    /// bytes, and `subscription_bytes` the charged live-subscription
     /// bytes. Counter series at zero are omitted; the gauges are
     /// always emitted.
     pub(crate) fn render(
@@ -135,6 +136,7 @@ impl Metrics {
         connections: usize,
         outbound_pending: usize,
         sync_memory: usize,
+        subscription_bytes: usize,
     ) -> String {
         let mut out = String::with_capacity(2 * 1024);
         family(
@@ -239,6 +241,13 @@ impl Metrics {
             "gauge",
         );
         writeln!(out, "nosfry_sync_memory_bytes {sync_memory}").ok();
+        family(
+            &mut out,
+            "nosfry_subscription_bytes",
+            "Estimated live-subscription bytes charged to the budget.",
+            "gauge",
+        );
+        writeln!(out, "nosfry_subscription_bytes {subscription_bytes}").ok();
         out
     }
 }
@@ -264,10 +273,10 @@ mod tests {
 
     #[test]
     fn empty_render_has_families_and_gauge_only() {
-        let out = Metrics::new().render(0, 0, 0);
+        let out = Metrics::new().render(0, 0, 0, 0);
         assert!(out.contains("# HELP nostr_client_messages_total"));
         assert!(out.contains("# TYPE nostr_events_total counter"));
-        assert!(out.ends_with("nosfry_sync_memory_bytes 0\n"));
+        assert!(out.ends_with("nosfry_subscription_bytes 0\n"));
         assert!(!out.contains('{'), "no series while every counter is 0");
     }
 
@@ -288,7 +297,7 @@ mod tests {
         metrics.store_error(StoreOp::Scan);
         metrics.store_error(StoreOp::Scan);
         assert_eq!(
-            metrics.render(3, 512, 0),
+            metrics.render(3, 512, 0, 7),
             "# HELP nostr_client_messages_total Inbound client messages by verb.\n\
              # TYPE nostr_client_messages_total counter\n\
              nostr_client_messages_total{verb=\"EVENT\"} 2\n\
@@ -320,7 +329,10 @@ mod tests {
              nosfry_outbound_pending_bytes 512\n\
              # HELP nosfry_sync_memory_bytes Bytes reserved for sealed negentropy sync storages.\n\
              # TYPE nosfry_sync_memory_bytes gauge\n\
-             nosfry_sync_memory_bytes 0\n"
+             nosfry_sync_memory_bytes 0\n\
+             # HELP nosfry_subscription_bytes Estimated live-subscription bytes charged to the budget.\n\
+             # TYPE nosfry_subscription_bytes gauge\n\
+             nosfry_subscription_bytes 7\n"
         );
     }
 }

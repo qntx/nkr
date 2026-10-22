@@ -849,12 +849,14 @@ struct RelayMetrics {
     outbound_pending: Option<u64>,
     /// `nosfry_sync_memory_bytes`.
     sync_memory: Option<u64>,
+    /// `nosfry_subscription_bytes`.
+    subscription_bytes: Option<u64>,
 }
 
 /// `nosfry_connections`, `nosfry_connections_rejected_total`, the
 /// summed `nosfry_rate_limited_total{…}`,
-/// `nosfry_outbound_pending_bytes` and `nosfry_sync_memory_bytes`
-/// from the metrics body.
+/// `nosfry_outbound_pending_bytes`, `nosfry_sync_memory_bytes` and
+/// `nosfry_subscription_bytes` from the metrics body.
 fn parse_metrics(body: &str) -> RelayMetrics {
     // Zero-valued counters are omitted from the exposition, so a
     // fetched body starts both totals at 0.
@@ -864,6 +866,7 @@ fn parse_metrics(body: &str) -> RelayMetrics {
         limited: Some(0),
         outbound_pending: None,
         sync_memory: None,
+        subscription_bytes: None,
     };
     for line in body.lines() {
         let value = || line.rsplit(' ').next()?.parse::<u64>().ok();
@@ -879,6 +882,8 @@ fn parse_metrics(body: &str) -> RelayMetrics {
             m.outbound_pending = value();
         } else if line.starts_with("nosfry_sync_memory_bytes ") {
             m.sync_memory = value();
+        } else if line.starts_with("nosfry_subscription_bytes ") {
+            m.subscription_bytes = value();
         }
     }
     m
@@ -943,6 +948,10 @@ fn sample_line(
     obj.insert(
         "sync_memory".into(),
         m.as_ref().map_or(Value::Null, |m| opt(m.sync_memory)),
+    );
+    obj.insert(
+        "subscription_bytes".into(),
+        m.as_ref().map_or(Value::Null, |m| opt(m.subscription_bytes)),
     );
     line
 }
@@ -1071,11 +1080,13 @@ pub(crate) async fn run(
     }
 
     // Drain check: once every harness connection is closed the relay
-    // must report zero queued outbound bytes and zero reserved sync
-    // memory — a non-zero gauge means a closed connection still holds
-    // a charge or a session reservation.
+    // must report zero queued outbound bytes, zero reserved sync
+    // memory, and zero charged subscription bytes — a non-zero gauge
+    // means a closed connection still holds a charge or a session
+    // reservation.
     let mut drained = None;
     let mut sync_drained = None;
+    let mut subs_drained = None;
     if let Some(u) = &metrics_url {
         let until = Instant::now() + Duration::from_secs(10);
         while Instant::now() < until {
@@ -1083,6 +1094,7 @@ pub(crate) async fn run(
                 Some(m) if m.conns == Some(0) => {
                     drained = m.outbound_pending;
                     sync_drained = m.sync_memory;
+                    subs_drained = m.subscription_bytes;
                     break;
                 }
                 Some(_) => tokio::time::sleep(Duration::from_millis(100)).await,
@@ -1096,6 +1108,7 @@ pub(crate) async fn run(
     obj.insert("type".into(), json!("end"));
     obj.insert("outbound_pending_after_close".into(), opt(drained));
     obj.insert("sync_memory_after_close".into(), opt(sync_drained));
+    obj.insert("subscription_bytes_after_close".into(), opt(subs_drained));
     obj.insert("label".into(), json!(label));
     obj.insert("t".into(), json!(start.elapsed().as_secs()));
     let stats = pid.and_then(proc_stats);

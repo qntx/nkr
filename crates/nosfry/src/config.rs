@@ -78,6 +78,12 @@ pub struct Relay {
     /// accounted at 40 bytes per scanned record (restart-only;
     /// 0 = unlimited).
     pub max_sync_memory_bytes: usize,
+    /// Process-wide budget for live subscriptions: every REQ is
+    /// charged the `Filter::approx_bytes` sum of its filters
+    /// (compiled filters plus monitor index entries) and refused
+    /// `blocked: subscription capacity exhausted` over budget
+    /// (restart-only; 0 = unlimited).
+    pub max_subscription_bytes_total: usize,
     /// Maximum simultaneous WebSocket connections (0 = unlimited).
     pub max_connections: usize,
     /// Maximum simultaneous WebSocket connections per client IP
@@ -182,6 +188,7 @@ impl Default for Relay {
             max_pending_outbound_bytes: 33_554_432,
             max_pending_outbound_bytes_total: 1_073_741_824,
             max_sync_memory_bytes: 1_073_741_824,
+            max_subscription_bytes_total: 1_073_741_824,
             max_connections: 0,
             max_connections_per_ip: 128,
             metrics: false,
@@ -338,7 +345,8 @@ impl Config {
     /// `relay.limits.max_filter_limit_count`,
     /// `relay.limits.max_sync_events`, and
     /// `relay.max_sync_memory_bytes` (reader threads hold them),
-    /// `relay.max_pending_outbound_bytes_total` (ditto).
+    /// `relay.max_pending_outbound_bytes_total`, and
+    /// `relay.max_subscription_bytes_total` (ditto).
     #[must_use]
     pub fn reloadable_from(&self, mut new: Self) -> (Self, Vec<&'static str>) {
         let mut ignored = Vec::new();
@@ -392,6 +400,10 @@ impl Config {
         if relay.max_pending_outbound_bytes_total != running.max_pending_outbound_bytes_total {
             ignored.push("relay.max_pending_outbound_bytes_total");
             relay.max_pending_outbound_bytes_total = running.max_pending_outbound_bytes_total;
+        }
+        if relay.max_subscription_bytes_total != running.max_subscription_bytes_total {
+            ignored.push("relay.max_subscription_bytes_total");
+            relay.max_subscription_bytes_total = running.max_subscription_bytes_total;
         }
         (new, ignored)
     }

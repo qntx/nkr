@@ -41,6 +41,12 @@ impl<'de> Visitor<'de> for PairsVisitor {
     }
 }
 
+/// Estimated bytes of one live-subscription index entry — a map
+/// slot plus its `Vec` allocation in `monitor::Monitors`. Used by
+/// [`Filter::approx_bytes`]; an order-of-magnitude budget unit, not
+/// an exact RSS figure.
+const INDEX_ENTRY_BYTES: usize = 128;
+
 /// Fields inside a filter are `AND`ed.
 #[derive(Debug, Clone, Eq)]
 pub struct Filter {
@@ -163,6 +169,32 @@ impl Filter {
     #[must_use]
     pub fn tags(&self) -> &[(u8, Box<[TagValueBuf]>)] {
         &self.tags
+    }
+
+    /// An estimate of the filter's compiled size plus the live
+    /// monitor index entries a subscription holding it allocates:
+    /// each `ids`/`authors` value costs 32 bytes of key plus one
+    /// index entry, each kind 2 bytes plus an entry, each `#` value
+    /// its packed length plus an entry. A budget unit for the
+    /// subscription-byte limits, not exact RSS.
+    #[must_use]
+    pub fn approx_bytes(&self) -> usize {
+        let hexes = self
+            .ids
+            .iter()
+            .chain(&self.authors)
+            .map(|list| list.len())
+            .sum::<usize>();
+        let mut bytes = size_of::<Self>()
+            + hexes * (32 + INDEX_ENTRY_BYTES)
+            + self.kinds.as_ref().map_or(0, |kinds| kinds.len()) * (2 + INDEX_ENTRY_BYTES);
+        for (_, values) in &self.tags {
+            bytes += values
+                .iter()
+                .map(|value| value.as_bytes().len() + INDEX_ENTRY_BYTES)
+                .sum::<usize>();
+        }
+        bytes
     }
 
     /// Sorted values of the `#<letter>` condition, if present.
@@ -524,6 +556,28 @@ mod tests {
 
         let earlier = Filter::parse(r#"{"until":100}"#).expect("parse");
         assert_eq!(earlier.with_until(500).until(), Some(100));
+    }
+
+    #[test]
+    fn approx_bytes_counts_fields_and_index_entries() {
+        let base = size_of::<Filter>();
+        let empty = Filter::parse("{}").expect("parse");
+        assert_eq!(empty.approx_bytes(), base);
+
+        let id = encode_32(&[0x0A; 32]);
+        let filter = Filter::parse(&format!(r#"{{"ids":["{id}"],"authors":["{id}","{id}"]}}"#))
+            .expect("parse");
+        // Authors dedup to one; ids + authors = 2 hex keys.
+        assert_eq!(filter.approx_bytes(), base + 2 * (32 + INDEX_ENTRY_BYTES));
+
+        let kinds = Filter::parse(r#"{"kinds":[1,2,3]}"#).expect("parse");
+        assert_eq!(kinds.approx_bytes(), base + 3 * (2 + INDEX_ENTRY_BYTES));
+
+        // `p` values pack to 32 bytes, `t` keeps its UTF-8 bytes.
+        let tagged =
+            Filter::parse(&format!(r##"{{"#p":["{id}"],"#t":["ab","c"]}}"##)).expect("parse");
+        let tags = (32 + INDEX_ENTRY_BYTES) + (2 + INDEX_ENTRY_BYTES) + (1 + INDEX_ENTRY_BYTES);
+        assert_eq!(tagged.approx_bytes(), base + tags);
     }
 
     #[test]

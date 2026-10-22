@@ -1611,6 +1611,52 @@ async fn metrics_endpoint_reports_prometheus_series() {
     relay.stop().await;
 }
 
+/// `[relay] max_subscription_bytes_total`: each REQ is charged its
+/// filters' `approx_bytes`; over budget the REQ answers `CLOSED
+/// blocked: subscription capacity exhausted`, a `CLOSE` frees room,
+/// and disconnect drains the shared gauge to zero.
+#[tokio::test]
+async fn subscription_bytes_budget() {
+    let mut config = common::config();
+    config.relay.metrics = true;
+    let one = nosfry_core::filter::Filter::parse("{\"kinds\":[1]}")
+        .unwrap()
+        .approx_bytes();
+    config.relay.max_subscription_bytes_total = one * 2;
+    let relay = Relay::start_with(config).await;
+    let mut ws = relay.connect().await;
+
+    send_text(&mut ws, &req_wire("s1", "{\"kinds\":[1]}")).await;
+    assert_eq!(json(&recv_text(&mut ws, T).await)[0], "EOSE");
+    send_text(&mut ws, &req_wire("s2", "{\"kinds\":[1]}")).await;
+    assert_eq!(json(&recv_text(&mut ws, T).await)[0], "EOSE");
+
+    send_text(&mut ws, &req_wire("s3", "{\"kinds\":[1]}")).await;
+    let frame = json(&recv_text(&mut ws, T).await);
+    assert_eq!(
+        frame,
+        json!(["CLOSED", "s3", "blocked: subscription capacity exhausted"]),
+    );
+
+    // A refused sub frees its session slot by itself; CLOSE on a live
+    // sub frees the charge, so a fresh REQ now fits.
+    send_text(&mut ws, &close_wire("s1")).await;
+    send_text(&mut ws, &req_wire("s4", "{\"kinds\":[1]}")).await;
+    assert_eq!(json(&recv_text(&mut ws, T).await)[0], "EOSE");
+
+    drop(ws);
+    let deadline = Instant::now() + T;
+    loop {
+        let body = http_get(relay.addr, "/metrics").await;
+        if metric_value(&body, "nosfry_subscription_bytes") == Some(0) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "subscription charge leaked");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    relay.stop().await;
+}
+
 #[tokio::test]
 async fn metrics_endpoint_is_404_by_default() {
     let relay = Relay::start().await;
