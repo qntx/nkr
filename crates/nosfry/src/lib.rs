@@ -79,6 +79,9 @@ pub enum ServerError {
     /// Invalid `[relay.info]` value.
     #[error("config: {0}")]
     Info(#[from] nosfry_core::info::InfoError),
+    /// Invalid `[relay.filter_validation]` value.
+    #[error("config: {0}")]
+    FilterValidation(#[from] nosfry_core::limits::FilterValidationError),
     /// The worker shutdown task failed.
     #[error("worker shutdown: {0}")]
     Shutdown(#[source] tokio::task::JoinError),

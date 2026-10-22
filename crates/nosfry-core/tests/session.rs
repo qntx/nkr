@@ -1543,3 +1543,229 @@ fn close_of_resumed_sub_unsubscribes() {
     );
     assert!(!s.is_current(&key));
 }
+
+/// Session with `[relay.filter_validation]` `config` enabled over the
+/// default `Limits`; panics when the config is inconsistent.
+fn session_with_filter_validation(config: &nosfry_core::limits::FilterValidationConfig) -> Session {
+    let rules = config.limits().expect("rules").expect("enabled");
+    Session::new(
+        Arc::new(Limits {
+            req: nosfry_core::limits::ReqLimits {
+                filter_validation: Some(rules),
+                ..nosfry_core::limits::ReqLimits::default()
+            },
+            ..Limits::default()
+        }),
+        "challenge".to_owned(),
+        Arc::new(AddressBuckets::default()),
+    )
+}
+
+fn validated_session() -> Session {
+    session_with_filter_validation(&nosfry_core::limits::FilterValidationConfig {
+        enabled: true,
+        ..Default::default()
+    })
+}
+
+/// Filter-count bounds: `min`/`max` exact pass, outside refuses with
+/// `blocked: invalid number of filters: N` and drops the sub id.
+#[test]
+fn filter_validation_filter_count_bounds() {
+    let mut s = validated_session();
+    // Exactly `max_filters_per_req` passes.
+    let out = feed(&mut s, 1, "[\"REQ\",\"ok\",{},{},{}]");
+    assert!(
+        matches!(out.as_slice(), [Command::Subscribe { .. }]),
+        "{out:?}"
+    );
+    // One over the maximum refuses.
+    let out = feed(&mut s, 2, "[\"REQ\",\"over\",{},{},{},{}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"over\",\"blocked: invalid number of filters: 4\"]"],
+        "{out:?}"
+    );
+    // Under the minimum refuses too (min raised for this session).
+    let mut s = session_with_filter_validation(&nosfry_core::limits::FilterValidationConfig {
+        enabled: true,
+        min_filters_per_req: 2,
+        ..Default::default()
+    });
+    let out = feed(&mut s, 3, "[\"REQ\",\"min\",{}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"min\",\"blocked: invalid number of filters: 1\"]"],
+        "{out:?}"
+    );
+}
+
+/// Per-filter kinds bounds: exactly `max_kinds_per_filter` passes,
+/// one more answers `blocked: too many kinds in filter: N`.
+#[test]
+fn filter_validation_kinds_count_bound() {
+    let mut s = validated_session();
+    let out = feed(&mut s, 1, "[\"REQ\",\"ok\",{\"kinds\":[1,2,3]}]");
+    assert!(
+        matches!(out.as_slice(), [Command::Subscribe { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 2, "[\"REQ\",\"over\",{\"kinds\":[1,2,3,4]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"over\",\"blocked: too many kinds in filter: 4\"]"],
+        "{out:?}"
+    );
+}
+
+/// A non-empty `allowed_kinds` set refuses unlisted kinds and filters
+/// without a `kinds` key (strfry lets those match every kind).
+#[test]
+fn filter_validation_allowed_kinds() {
+    let mut s = session_with_filter_validation(&nosfry_core::limits::FilterValidationConfig {
+        enabled: true,
+        allowed_kinds: vec![1, 4],
+        ..Default::default()
+    });
+    let out = feed(&mut s, 1, "[\"REQ\",\"ok\",{\"kinds\":[1,4]}]");
+    assert!(
+        matches!(out.as_slice(), [Command::Subscribe { .. }]),
+        "{out:?}"
+    );
+    let out = feed(&mut s, 2, "[\"REQ\",\"miss\",{\"kinds\":[1,3]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"miss\",\"blocked: kind not allowed: 3\"]"],
+        "{out:?}"
+    );
+    let out = feed(&mut s, 3, "[\"REQ\",\"none\",{}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"none\",\"blocked: filter must list kinds\"]"],
+        "{out:?}"
+    );
+}
+
+/// `require_author_or_tag` accepts exactly one `authors`, `#p`, or
+/// `#e` value and refuses zero or two.
+#[test]
+fn filter_validation_author_or_tag() {
+    let mut s = session_with_filter_validation(&nosfry_core::limits::FilterValidationConfig {
+        enabled: true,
+        require_author_or_tag: true,
+        ..Default::default()
+    });
+    let a = "aa".repeat(32);
+    let b = "bb".repeat(32);
+    for (sub, filter) in [
+        ("one_author", format!("{{\"authors\":[\"{a}\"]}}")),
+        ("one_p", format!("{{\"#p\":[\"{a}\"]}}")),
+        ("one_e", format!("{{\"#e\":[\"{a}\"]}}")),
+    ] {
+        let out = feed(&mut s, 1, &format!("[\"REQ\",\"{sub}\",{filter}]"));
+        assert!(
+            matches!(out.as_slice(), [Command::Subscribe { .. }]),
+            "{filter}: {out:?}"
+        );
+    }
+    for (sub, filter) in [
+        ("two_authors", format!("{{\"authors\":[\"{a}\",\"{b}\"]}}")),
+        ("two_p", format!("{{\"#p\":[\"{a}\",\"{b}\"]}}")),
+        ("none_of_them", "{\"kinds\":[1]}".to_owned()),
+    ] {
+        let out = feed(&mut s, 2, &format!("[\"REQ\",\"{sub}\",{filter}]"));
+        let frames = sends(&out);
+        assert_eq!(
+            frames.as_slice(),
+            [format!(
+                "[\"CLOSED\",\"{sub}\",\"blocked: filter must have exactly one author, p tag, or e tag\"]"
+            )],
+            "{filter}: {out:?}"
+        );
+    }
+}
+
+/// `COUNT` shares the rules with REQ: the same violation answers the
+/// same `CLOSED blocked:` frame.
+#[test]
+fn filter_validation_applies_to_count() {
+    let mut s = validated_session();
+    let out = feed(&mut s, 1, "[\"COUNT\",\"c\",{\"kinds\":[1,2,3,4]}]");
+    let frames = sends(&out);
+    assert_eq!(
+        frames.as_slice(),
+        ["[\"CLOSED\",\"c\",\"blocked: too many kinds in filter: 4\"]"],
+        "{out:?}"
+    );
+}
+
+/// `NEG-OPEN` is exempt: a filter violating the rules still opens a
+/// sync session.
+#[test]
+fn filter_validation_neg_open_exempt() {
+    let mut s = validated_session();
+    let out = feed(
+        &mut s,
+        1,
+        "[\"NEG-OPEN\",\"n\",{\"kinds\":[1,2,3,4]},\"aabb\"]",
+    );
+    assert!(
+        matches!(out.as_slice(), [Command::NegOpen { .. }]),
+        "{out:?}"
+    );
+}
+
+/// `enabled = false` (the default) leaves REQ untouched.
+#[test]
+fn filter_validation_disabled_passes() {
+    let mut s = session();
+    let out = feed(&mut s, 1, "[\"REQ\",\"s\",{},{},{},{}]");
+    assert!(
+        matches!(out.as_slice(), [Command::Subscribe { .. }]),
+        "{out:?}"
+    );
+}
+
+/// `FilterValidationConfig::limits` refuses contradictory bounds
+/// when enabled, naming the offending key.
+#[test]
+fn filter_validation_config_bounds() {
+    use nosfry_core::limits::FilterValidationConfig;
+    assert!(
+        FilterValidationConfig::default()
+            .limits()
+            .unwrap()
+            .is_none()
+    );
+    let zero = FilterValidationConfig {
+        enabled: true,
+        max_filters_per_req: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        zero.limits().unwrap_err().to_string(),
+        "relay.filter_validation.max_filters_per_req must be at least 1"
+    );
+    let inverted = FilterValidationConfig {
+        enabled: true,
+        min_filters_per_req: 4,
+        ..Default::default()
+    };
+    assert_eq!(
+        inverted.limits().unwrap_err().to_string(),
+        "relay.filter_validation.min_filters_per_req must not exceed max_filters_per_req"
+    );
+    // Disabled sections never fail, even with bad values.
+    let disabled = FilterValidationConfig {
+        enabled: false,
+        min_filters_per_req: 9,
+        max_filters_per_req: 0,
+        ..Default::default()
+    };
+    assert!(disabled.limits().unwrap().is_none());
+}

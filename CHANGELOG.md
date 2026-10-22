@@ -12,6 +12,15 @@ The format is based on [Keep a Changelog]; this project follows
 
 ### Added
 
+- strfry `relay.filterValidation` parity on both editions: a
+  `[relay.filter_validation]` section limits REQ/COUNT filters by
+  count (`min_filters_per_req`/`max_filters_per_req`), kinds per
+  filter (`max_kinds_per_filter`), an `allowed_kinds` set (a filter
+  without `kinds` is refused when the set is non-empty — strfry lets
+  it match every kind), and `require_author_or_tag` (exactly one
+  `authors`, `#p`, or `#e` value). Violations answer `CLOSED
+blocked:`; `NEG-OPEN` is exempt. Reloads on SIGHUP for new
+  connections.
 - strfry's HTTP surface on both editions: `GET /` without
   `Accept: application/nostr+json` answers a self-contained HTML
   landing page (name, icon/banner, description, relay URL, admin

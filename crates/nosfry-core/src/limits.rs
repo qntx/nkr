@@ -1,15 +1,17 @@
 //! Relay resource limits (strfry-compatible defaults).
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::Deserialize;
 
 use crate::auth::AuthRules;
 use crate::event::EventLimits;
+use crate::filter::Filter;
 
 /// REQ-side limits: filter shape and subscription count. All fields
 /// carry strfry's defaults and unknown keys are rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReqLimits {
     /// Maximum number of filters in a single REQ.
@@ -28,6 +30,11 @@ pub struct ReqLimits {
     pub max_sync_events: u64,
     /// Maximum number of `#x` tag conditions allowed per filter.
     pub max_tags_per_filter: usize,
+    /// Effective filter-validation rules; `None` when
+    /// `[relay.filter_validation] enabled` is false. Configured via
+    /// [`FilterValidationConfig`] — it has no `[relay.limits]` key.
+    #[serde(skip)]
+    pub filter_validation: Option<FilterValidation>,
 }
 
 impl Default for ReqLimits {
@@ -39,9 +46,147 @@ impl Default for ReqLimits {
             max_filter_limit_count: 1_000_000,
             max_sync_events: 1_000_000,
             max_tags_per_filter: 3,
+            filter_validation: None,
         }
     }
 }
+
+/// `[relay.filter_validation]` — strfry `relay.filterValidation`
+/// parity. `enabled = false` disables every check;
+/// [`FilterValidationConfig::limits`] turns the section into the
+/// effective [`FilterValidation`] (or `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilterValidationConfig {
+    /// Enforce the rules on REQ and `COUNT` (`NEG-OPEN` is exempt).
+    pub enabled: bool,
+    /// Filters allowed in one REQ, inclusive.
+    pub max_filters_per_req: usize,
+    /// Filters required in one REQ, inclusive.
+    pub min_filters_per_req: usize,
+    /// Kinds allowed per filter.
+    pub max_kinds_per_filter: usize,
+    /// Kinds a filter may list; empty allows every kind. When
+    /// non-empty a filter without a `kinds` key is refused — a
+    /// deliberate deviation from strfry, which lets it match every
+    /// kind.
+    pub allowed_kinds: Vec<u16>,
+    /// Require each filter to pin exactly one `authors` entry or
+    /// exactly one `#p`/`#e` value.
+    pub require_author_or_tag: bool,
+}
+
+impl Default for FilterValidationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_filters_per_req: 3,
+            min_filters_per_req: 1,
+            max_kinds_per_filter: 3,
+            allowed_kinds: Vec::new(),
+            require_author_or_tag: false,
+        }
+    }
+}
+
+/// The effective filter-validation rules a session enforces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilterValidation {
+    /// Filters allowed in one REQ, inclusive.
+    pub max_filters_per_req: usize,
+    /// Filters required in one REQ, inclusive.
+    pub min_filters_per_req: usize,
+    /// Kinds allowed per filter.
+    pub max_kinds_per_filter: usize,
+    /// Kinds a filter may list; empty allows every kind.
+    pub allowed_kinds: BTreeSet<u16>,
+    /// Require exactly one `authors`/`#p`/`#e` value per filter.
+    pub require_author_or_tag: bool,
+}
+
+impl FilterValidationConfig {
+    /// The effective rules, or `None` when disabled.
+    ///
+    /// # Errors
+    ///
+    /// [`FilterValidationError`] naming the offending key when
+    /// `enabled` and `max_filters_per_req` is 0 or
+    /// `min_filters_per_req` exceeds it.
+    pub fn limits(&self) -> Result<Option<FilterValidation>, FilterValidationError> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        if self.max_filters_per_req == 0 {
+            return Err(FilterValidationError(
+                "max_filters_per_req must be at least 1",
+            ));
+        }
+        if self.min_filters_per_req > self.max_filters_per_req {
+            return Err(FilterValidationError(
+                "min_filters_per_req must not exceed max_filters_per_req",
+            ));
+        }
+        Ok(Some(FilterValidation {
+            max_filters_per_req: self.max_filters_per_req,
+            min_filters_per_req: self.min_filters_per_req,
+            max_kinds_per_filter: self.max_kinds_per_filter,
+            allowed_kinds: self.allowed_kinds.iter().copied().collect(),
+            require_author_or_tag: self.require_author_or_tag,
+        }))
+    }
+}
+
+impl FilterValidation {
+    /// The first violation `filters` commit — the `CLOSED` detail
+    /// after the `blocked:` prefix — or `None` when they all pass.
+    /// Enforced on REQ and `COUNT`; `NEG-OPEN` is exempt.
+    #[must_use]
+    pub fn violation(&self, filters: &[Filter]) -> Option<String> {
+        if filters.len() < self.min_filters_per_req || filters.len() > self.max_filters_per_req {
+            return Some(format!("invalid number of filters: {}", filters.len()));
+        }
+        filters
+            .iter()
+            .find_map(|filter| self.filter_violation(filter))
+    }
+
+    /// The first violation one filter commits, in strfry's check
+    /// order: kinds count, allowed kinds, author/tag requirement.
+    fn filter_violation(&self, filter: &Filter) -> Option<String> {
+        match filter.kinds() {
+            Some(kinds) => {
+                if kinds.len() > self.max_kinds_per_filter {
+                    return Some(format!("too many kinds in filter: {}", kinds.len()));
+                }
+                if !self.allowed_kinds.is_empty()
+                    && let Some(kind) = kinds.iter().find(|k| !self.allowed_kinds.contains(k))
+                {
+                    return Some(format!("kind not allowed: {kind}"));
+                }
+            }
+            None if !self.allowed_kinds.is_empty() => {
+                return Some("filter must list kinds".to_owned());
+            }
+            None => {}
+        }
+        if self.require_author_or_tag {
+            let pinned = filter.authors().is_some_and(|a| a.len() == 1)
+                || filter.tag_values(b'p').is_some_and(|v| v.len() == 1)
+                || filter.tag_values(b'e').is_some_and(|v| v.len() == 1);
+            if !pinned {
+                return Some("filter must have exactly one author, p tag, or e tag".to_owned());
+            }
+        }
+        None
+    }
+}
+
+/// `FilterValidationConfig::limits` failure. The payload completes
+/// the `relay.filter_validation.` prefix into a sentence.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+#[error("relay.filter_validation.{0}")]
+pub struct FilterValidationError(pub &'static str);
 
 /// Per-connection token-bucket rate limits for EVENT and REQ messages,
 /// plus shared per-address buckets the adapter hands to every session

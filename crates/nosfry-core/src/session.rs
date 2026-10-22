@@ -769,9 +769,10 @@ impl Session {
     }
 
     /// The validation REQ and `COUNT` share: filter count, per-filter
-    /// tag conditions, the subscription slot, and the fully
-    /// restricted group check. Every refusal drops the sub id and
-    /// answers `CLOSED`. Returns `true` to proceed.
+    /// tag conditions, the `[relay.filter_validation]` rules, the
+    /// subscription slot, and the fully restricted group check. Every
+    /// refusal drops the sub id and answers `CLOSED`. Returns `true`
+    /// to proceed.
     fn validate_read(
         &mut self,
         sub_id: &SubId,
@@ -800,6 +801,18 @@ impl Session {
                     sub_id,
                     &Reason::Invalid.message("filter has too many tag conditions"),
                 ),
+            });
+            return false;
+        }
+        // `[relay.filter_validation]` rules (strfry
+        // `relay.filterValidation` parity); `NEG-OPEN` is exempt.
+        if let Some(rules) = &self.limits.req.filter_validation
+            && let Some(violation) = rules.violation(filters)
+        {
+            self.drop_sub(sub_id, out);
+            out.push(Command::Send {
+                verb: RelayVerb::Closed,
+                text: closed_frame(sub_id, &Reason::Blocked.message(&violation)),
             });
             return false;
         }
