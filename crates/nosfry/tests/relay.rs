@@ -751,14 +751,23 @@ async fn compressed_event_round_trip() {
     relay.stop().await;
 }
 
-/// One HTTP GET returning the raw response text.
+/// One HTTP GET with the NIP-11 Accept, returning the raw response
+/// text.
 async fn http_get(addr: std::net::SocketAddr, path: &str) -> String {
+    http_get_accept(addr, path, "application/nostr+json").await
+}
+
+/// One HTTP GET without the NIP-11 Accept (a browser fetch).
+async fn http_get_browser(addr: std::net::SocketAddr, path: &str) -> String {
+    http_get_accept(addr, path, "text/html").await
+}
+
+/// One HTTP GET returning the raw response text.
+async fn http_get_accept(addr: std::net::SocketAddr, path: &str, accept: &str) -> String {
     let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     tcp.write_all(
-        format!(
-            "GET {path} HTTP/1.1\r\nHost: x\r\nAccept: application/nostr+json\r\nConnection: close\r\n\r\n"
-        )
-        .as_bytes(),
+        format!("GET {path} HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     )
     .await
     .unwrap();
@@ -813,6 +822,50 @@ async fn nip11_document() {
     assert_eq!(doc["self"], "cd".repeat(32));
     assert_eq!(doc["terms_of_service"], "https://example.com/terms");
     assert_eq!(doc["privacy_policy"], "https://example.com/privacy");
+    relay.stop().await;
+}
+
+#[tokio::test]
+async fn landing_page_and_nodeinfo() {
+    // GET / without a NIP-11 Accept is the HTML landing page.
+    let mut config = common::config();
+    config.relay.info.name = "test <relay>".to_owned();
+    config.relay.service_url = "wss://relay.example.com".to_owned();
+    let relay = Relay::start_with(config).await;
+    let text = http_get_browser(relay.addr, "/").await;
+    assert!(text.contains("content-type: text/html"));
+    let (_, body) = text.split_once("\r\n\r\n").expect("http head/body split");
+    assert!(body.contains("<!doctype html>"), "{body}");
+    assert!(body.contains("<h1>test &lt;relay&gt;</h1>"), "{body}");
+    assert!(
+        body.contains("<code>wss://relay.example.com</code>"),
+        "{body}"
+    );
+
+    // `/nodeinfo/2.1` is the NodeInfo document with its profile type.
+    let text = http_get_browser(relay.addr, "/nodeinfo/2.1").await;
+    assert!(text.contains("profile=\"http://nodeinfo.diaspora.software/ns/schema/2.1#\""));
+    let doc = nip11_body(&text);
+    assert_eq!(doc["version"], "2.1");
+    assert_eq!(doc["software"]["name"], "nosfry");
+
+    // `/.well-known/nodeinfo` links at the service_url host.
+    let text = http_get_browser(relay.addr, "/.well-known/nodeinfo").await;
+    let doc = nip11_body(&text);
+    assert_eq!(
+        doc["links"][0]["href"],
+        "https://relay.example.com/nodeinfo/2.1"
+    );
+
+    // Unknown paths stay 404.
+    let text = http_get_browser(relay.addr, "/nope").await;
+    assert!(text.starts_with("HTTP/1.1 404"), "{text}");
+    relay.stop().await;
+
+    // Without `service_url` the discovery document is 404 too.
+    let relay = Relay::start().await;
+    let text = http_get_browser(relay.addr, "/.well-known/nodeinfo").await;
+    assert!(text.starts_with("HTTP/1.1 404"), "{text}");
     relay.stop().await;
 }
 

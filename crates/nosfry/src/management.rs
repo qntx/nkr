@@ -113,10 +113,11 @@ async fn dispatch(state: &AppState, request: &Request<'_>) -> Result<Value, Stri
 }
 
 /// Send `op` to the writer thread, then rebuild the cached NIP-11
-/// document from the latest moderation snapshot. The writer already
-/// published the snapshot in commit order before replying, and
-/// `send_modify` serializes the rebuild against other publishers —
-/// ops are rare admin calls, so every one rebuilds unconditionally.
+/// document and landing page from the latest moderation snapshot.
+/// The writer already published the snapshot in commit order before
+/// replying, and `send_modify` serializes the rebuild against other
+/// publishers — ops are rare admin calls, so every one rebuilds
+/// unconditionally.
 async fn apply(state: &AppState, op: ModOp) -> Result<Value, String> {
     let (reply, rx) = oneshot::channel();
     state
@@ -132,6 +133,7 @@ async fn apply(state: &AppState, op: ModOp) -> Result<Value, String> {
         let moderation = state.moderation.borrow().clone();
         let mut next = (**live).clone();
         next.nip11 = crate::http::nip11(&next.config, &next.limits, &moderation).into();
+        next.landing = crate::http::landing(&next.config, &moderation).into();
         *live = Arc::new(next);
     });
     Ok(Value::Bool(true))
