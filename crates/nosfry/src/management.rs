@@ -112,10 +112,12 @@ async fn dispatch(state: &AppState, request: &Request<'_>) -> Result<Value, Stri
     }
 }
 
-/// Send `op` to the writer thread, publish the returned snapshot, and
-/// rebuild the NIP-11 document when an info field changed.
+/// Send `op` to the writer thread, then rebuild the cached NIP-11
+/// document from the latest moderation snapshot. The writer already
+/// published the snapshot in commit order before replying, and
+/// `send_modify` serializes the rebuild against other publishers —
+/// ops are rare admin calls, so every one rebuilds unconditionally.
 async fn apply(state: &AppState, op: ModOp) -> Result<Value, String> {
-    let is_info = matches!(op, ModOp::SetInfo { .. });
     let (reply, rx) = oneshot::channel();
     state
         .conn
@@ -123,16 +125,14 @@ async fn apply(state: &AppState, op: ModOp) -> Result<Value, String> {
         .send(WriterMsg::Moderate { op, reply })
         .await
         .map_err(|_| "error: internal error".to_owned())?;
-    let moderation = rx
-        .await
+    rx.await
         .map_err(|_| "error: internal error".to_owned())?
         .map_err(|err| format!("error: {err}"))?;
-    let moderation = Arc::new(moderation);
-    state.mod_tx.send_replace(Arc::clone(&moderation));
-    if is_info {
-        let mut next = (**state.live.borrow()).clone();
+    state.live_tx.send_modify(|live| {
+        let moderation = state.moderation.borrow().clone();
+        let mut next = (**live).clone();
         next.nip11 = crate::http::nip11(&next.config, &next.limits, &moderation).into();
-        state.live_tx.send_replace(Arc::new(next));
-    }
+        *live = Arc::new(next);
+    });
     Ok(Value::Bool(true))
 }

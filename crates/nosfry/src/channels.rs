@@ -8,7 +8,7 @@ use nosfry_core::auth::ReadGate;
 use nosfry_core::event::Event;
 use nosfry_core::filter::Filter;
 use nosfry_core::message::{RelayVerb, SubId};
-use nosfry_core::moderation::{ModOp, Moderation};
+use nosfry_core::moderation::ModOp;
 use nosfry_core::session::SubKey;
 use nosfry_lmdb::StoreError;
 use tokio::sync::{mpsc, oneshot};
@@ -38,14 +38,16 @@ pub(crate) enum WriterMsg {
     Publish(WriteRequest),
     /// Sweep expired events (NIP-40).
     Expire,
-    /// Apply a NIP-86 management op; the reply carries the rebuilt
-    /// [`Moderation`] snapshot (all `mod_*` writes go through the
-    /// single writer thread).
+    /// Apply a NIP-86 management op (all `mod_*` writes go through
+    /// the single writer thread). The writer publishes the rebuilt
+    /// snapshot on `mod_tx` *before* replying, so snapshots reach
+    /// subscribers in commit order and the reply only confirms the
+    /// commit.
     Moderate {
         /// The operation.
         op: ModOp,
         /// Result delivered to the HTTP handler.
-        reply: oneshot::Sender<Result<Moderation, StoreError>>,
+        reply: oneshot::Sender<Result<(), StoreError>>,
     },
 }
 

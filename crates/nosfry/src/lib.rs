@@ -146,10 +146,14 @@ async fn reload_loop(
 ) {
     while reload.changed().await.is_ok() {
         let incoming = reload.borrow_and_update().clone();
-        let snapshot = moderation.borrow().clone();
-        if let Some(next) = reload_once(incoming, &live, &limiter, &snapshot) {
+        if let Some(next) = reload_once(incoming, &live, &limiter) {
             live = next;
-            live_tx.send_replace(Arc::clone(&live));
+            live_tx.send_modify(|current| {
+                let snapshot = moderation.borrow().clone();
+                let mut updated = (*live).clone();
+                updated.nip11 = http::nip11(&updated.config, &updated.limits, &snapshot).into();
+                *current = Arc::new(updated);
+            });
         }
     }
 }
@@ -172,11 +176,13 @@ fn reader_tuning(config: &Config, sync_memory: &Arc<AtomicUsize>) -> reader::Tun
 /// One reload: merge, validate, then apply. Validation runs before any
 /// side effect, so a rejected reload leaves the connection caps, the
 /// write-policy task, and the limits exactly as they were (`None`).
+/// The cached NIP-11 document is seeded from the running [`Live`];
+/// `reload_loop` re-derives it from the latest moderation snapshot
+/// inside the publish's `send_modify`.
 fn reload_once(
     incoming: Config,
     live: &Live,
     limiter: &limiter::ConnectionLimiter,
-    moderation: &Moderation,
 ) -> Option<Arc<Live>> {
     let (merged, ignored) = live.config.reloadable_from(incoming);
     if !ignored.is_empty() {
@@ -185,7 +191,7 @@ fn reload_once(
     let limits = merged.limits().inspect_err(log_invalid_reload).ok()?;
     let admins = merged.admins().inspect_err(log_invalid_reload).ok()?;
     Some(Arc::new(apply_reload(
-        merged, limits, admins, live, limiter, moderation,
+        merged, limits, admins, live, limiter,
     )))
 }
 
@@ -202,7 +208,6 @@ fn apply_reload(
     admins: Arc<[PublicKey]>,
     live: &Live,
     limiter: &limiter::ConnectionLimiter,
-    moderation: &Moderation,
 ) -> Live {
     limiter.update_caps(
         merged.relay.max_connections,
@@ -216,7 +221,7 @@ fn apply_reload(
     };
     tracing::info!("configuration reloaded");
     Live {
-        nip11: http::nip11(&merged, &limits, moderation).into(),
+        nip11: live.nip11.clone(),
         config: Arc::new(merged),
         limits: Arc::new(limits),
         policy,
@@ -335,6 +340,7 @@ impl Server {
                         &writer_shards,
                         &writer_metrics,
                         &writer_live,
+                        &mod_tx,
                     );
                 })
                 .map_err(ServerError::Spawn)?,
@@ -369,7 +375,6 @@ impl Server {
                 sync_memory,
                 metrics,
                 moderation: mod_rx,
-                mod_tx,
                 live_tx: live_tx.clone(),
                 limiter: Arc::new(limiter::ConnectionLimiter::new(
                     config.relay.max_connections,
