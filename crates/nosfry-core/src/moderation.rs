@@ -154,6 +154,14 @@ impl Moderation {
         None
     }
 
+    /// Whether the allow-lists refuse unlisted writes — a non-empty
+    /// `allowed_pubkeys` or `allowed_kinds`. This is the NIP-11
+    /// `limitation.restricted_writes` flag.
+    #[must_use]
+    pub fn restricts_writes(&self) -> bool {
+        !self.allowed_pubkeys.is_empty() || !self.allowed_kinds.is_empty()
+    }
+
     /// Whether `ip` is on the block list.
     #[must_use]
     pub fn ip_blocked(&self, ip: &IpAddr) -> bool {

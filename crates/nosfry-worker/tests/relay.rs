@@ -790,6 +790,36 @@ fn nip11_lists_62() {
     assert!(nips.contains(&json!(62)), "{nips:?}");
 }
 
+/// The full NIP-11 field set is served, a configured `supported_nips`
+/// replaces the computed list, and a malformed `pubkey`/`self` is
+/// rejected at parse.
+#[test]
+fn nip11_full_fields() {
+    const HEX64: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    let r = relay(&format!(
+        "[relay.info]\n\
+         pubkey = \"{HEX64}\"\n\
+         contact = \"admin@example.com\"\n\
+         banner = \"https://example.com/banner.png\"\n\
+         self = \"{HEX64}\"\n\
+         terms_of_service = \"https://example.com/terms\"\n\
+         privacy_policy = \"https://example.com/privacy\"\n\
+         supported_nips = [1, 11]\n"
+    ));
+    let doc: serde_json::Value = serde_json::from_str(&r.nip11()).unwrap();
+    assert_eq!(doc["pubkey"], HEX64);
+    assert_eq!(doc["contact"], "admin@example.com");
+    assert_eq!(doc["banner"], "https://example.com/banner.png");
+    assert_eq!(doc["self"], HEX64);
+    assert_eq!(doc["terms_of_service"], "https://example.com/terms");
+    assert_eq!(doc["privacy_policy"], "https://example.com/privacy");
+    assert_eq!(doc["supported_nips"], json!([1, 11]));
+
+    for key in ["pubkey", "self"] {
+        assert!(Config::parse(&format!("[relay.info]\n{key} = \"npub1bad\"\n")).is_err());
+    }
+}
+
 /// NIP-86: without the RPC content type or a configured admin list the
 /// endpoint answers 405, like native.
 #[test]

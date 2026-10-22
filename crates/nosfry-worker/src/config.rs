@@ -146,6 +146,9 @@ pub enum ConfigError {
     /// A malformed `[relay.management] admins` entry.
     #[error(transparent)]
     Admins(#[from] AdminsError),
+    /// An invalid `[relay.info]` value.
+    #[error(transparent)]
+    Info(#[from] nosfry_core::info::InfoError),
 }
 
 impl Config {
@@ -157,7 +160,8 @@ impl Config {
     /// [`ConfigError::ServiceUrl`] on an invalid
     /// `[relay] service_url`, [`ConfigError::MaxScanRows`] when
     /// `[worker] max_scan_rows` is 0, [`ConfigError::Admins`] on a
-    /// malformed `[relay.management] admins` entry.
+    /// malformed `[relay.management] admins` entry,
+    /// [`ConfigError::Info`] on an invalid `[relay.info]` value.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(text)?;
         config.limits()?;
@@ -165,6 +169,7 @@ impl Config {
             return Err(ConfigError::MaxScanRows);
         }
         config.relay.management.admin_keys()?;
+        config.relay.info.validate()?;
         Ok(config)
     }
 

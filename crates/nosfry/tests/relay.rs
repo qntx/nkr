@@ -799,12 +799,20 @@ async fn nip11_document() {
     config.relay.info.pubkey = "ab".repeat(32);
     config.relay.info.contact = "admin@example.com".to_owned();
     config.relay.info.icon = "https://example.com/icon.png".to_owned();
+    config.relay.info.banner = "https://example.com/banner.png".to_owned();
+    config.relay.info.self_pubkey = "cd".repeat(32);
+    config.relay.info.terms_of_service = "https://example.com/terms".to_owned();
+    config.relay.info.privacy_policy = "https://example.com/privacy".to_owned();
     let relay = Relay::start_with(config).await;
     let doc = nip11_body(&http_get(relay.addr, "/").await);
     assert_eq!(doc["description"], "test relay");
     assert_eq!(doc["pubkey"], "ab".repeat(32));
     assert_eq!(doc["contact"], "admin@example.com");
     assert_eq!(doc["icon"], "https://example.com/icon.png");
+    assert_eq!(doc["banner"], "https://example.com/banner.png");
+    assert_eq!(doc["self"], "cd".repeat(32));
+    assert_eq!(doc["terms_of_service"], "https://example.com/terms");
+    assert_eq!(doc["privacy_policy"], "https://example.com/privacy");
     relay.stop().await;
 }
 

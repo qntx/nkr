@@ -17,5 +17,9 @@ restrict_read_to_involved = true
 admins = ["acd484e2f0c7f65309ad178a9f559abde09796974c57e714c35f110dfc27ccbe"]
 
 [relay.info]
-name        = "nosfry conformance"
-description = "edition under test"
+name             = "nosfry conformance"
+description      = "edition under test"
+banner           = "https://example.com/banner.png"
+self             = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+terms_of_service = "https://example.com/terms"
+privacy_policy   = "https://example.com/privacy"
