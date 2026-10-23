@@ -629,11 +629,25 @@ def copy_generated(entry, run_dir, unit_dir):
             shutil.copy2(f, unit_dir / f.name)
 
 
-def run_cmds(prm, unit, rep_json, rep_log):
+PID_CMDS = {"conns", "fanout", "ingest-closed", "ingest-open", "neg",
+            "query", "soak"}
+
+
+def with_pid(cmds, pid):
+    """Append the relay pid to sampler-capable harness invocations."""
+    out = []
+    for argv in cmds:
+        if len(argv) > 4 and argv[4] in PID_CMDS:
+            argv = [*argv, "--pid", str(pid)]
+        out.append(argv)
+    return out
+
+
+def run_cmds(cmds, rep_json, rep_log):
     """Run the unit's commands; stdout -> rep<k>.json, stderr -> rep<k>.log."""
     codes, outputs = [], []
     with open(rep_json, "a") as jf, open(rep_log, "ab") as log:
-        for argv in unit["cmds"]:
+        for argv in cmds:
             proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=log, text=True)
             stdout, _ = proc.communicate()
             codes.append(proc.returncode)
@@ -664,7 +678,8 @@ def run_harness_unit(prm, unit, unit_dir):
     rep_json = unit_dir / f"rep{unit['rep']}.json"
     rep_log = unit_dir / f"rep{unit['rep']}.log"
     if port_up:
-        codes, outputs = run_cmds(prm, unit, rep_json, rep_log)
+        codes, outputs = run_cmds(with_pid(unit["cmds"], proc.pid),
+                                  rep_json, rep_log)
     else:
         codes, outputs = [-1], []
     stop_relay(proc)
@@ -764,7 +779,8 @@ def run_w5ro_unit(prm, unit, unit_dir):
                        "ok": wait_port(prm.p("net", "port"), proc) and rtt_probe(prm)})
         phases.append({"phase": "cold_cache", "done": drop_caches()})
         with open(rep_json, "a") as jf:
-            for name, argv in zip(("query_cold", "query_warm"), unit["cmds"]):
+            for name, argv in zip(("query_cold", "query_warm"),
+                                  with_pid(unit["cmds"], proc.pid)):
                 t0 = time.monotonic()
                 p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=log, text=True)
                 stdout, _ = p.communicate()
@@ -795,7 +811,8 @@ def run_w5ingest_unit(prm, unit, unit_dir):
     port_up = wait_port(prm.p("net", "port"), proc)
     warm = port_up and rtt_probe(prm)
     if port_up:
-        codes, outputs = run_cmds(prm, unit, rep_json, rep_log)
+        codes, outputs = run_cmds(with_pid(unit["cmds"], proc.pid),
+                                  rep_json, rep_log)
     else:
         codes, outputs = [-1], []
     stop_relay(proc)
