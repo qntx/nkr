@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # relayBench (third-party harness) on Linux: the JVM harness runs on cores
 # 4-9; the relay wrappers re-pin every relay to cores 0-3.
-# Usage: run-relaybench.sh <nosfry-binary-name>...
-#   Each name is a binary under /bench/bin, compared side by side with
-#   pristine strfry in every run. The order of the nosfry binaries rotates
-#   between runs; strfry always runs first (a relayBench limitation).
+# Usage: run-relaybench.sh <nosfry-entry>...
+#   Each entry is a binary under /bench/bin, or bin+variant to also
+#   append /bench/variants/<variant>.toml to the generated config;
+#   entries are compared side by side with pristine strfry in every run.
+#   The order of the nosfry binaries rotates between runs; strfry always
+#   runs first (a relayBench limitation).
 set -euo pipefail
 OUT=/bench/results
 RB=/bench/relaybench/bin/relaybench
@@ -21,7 +23,13 @@ run() {
     local order=("${NAMES[@]:shift_by}" "${NAMES[@]:0:shift_by}")
     local args=()
     for relay in "${order[@]}"; do
-        args+=(--relay "$relay=$W /bench/bin/$relay {port} {dir}")
+        # bin or bin+variant; the variant is a config fragment under
+        # /bench/variants appended by nosfry-relay.sh.
+        local bin="${relay%%+*}" variant=""
+        if [ "$relay" != "$bin" ]; then
+            variant=" /bench/variants/${relay#*+}.toml"
+        fi
+        args+=(--relay "$relay=$W /bench/bin/$bin {port} {dir}$variant")
     done
     taskset -c 4-9 "$RB" --strfry-bin /bench/strfry-pinned.sh "${args[@]}" \
         --no-sync --no-color --work "/bench/work/rb-$name" --out "$OUT/$name" "$@" 2>&1 | tee "$OUT/$name.log"
