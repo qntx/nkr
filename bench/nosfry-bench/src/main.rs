@@ -11,11 +11,13 @@
 //! Every result is printed as one JSON line on stdout.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod corpus;
 mod gate;
 mod hist;
 mod sampler;
@@ -163,6 +165,28 @@ enum Cmd {
         url: String,
         #[arg(long, default_value_t = 1900)]
         authors: usize,
+    },
+    /// Generate the D2 synthetic corpus and its query sidecar.
+    Gen {
+        /// D1 template corpus: a JSON array of events, plain or gzipped.
+        #[arg(long)]
+        template: PathBuf,
+        /// N: events written to events.jsonl.
+        #[arg(long)]
+        events: usize,
+        /// H: events written to holdout.jsonl for ingest runs.
+        #[arg(long, default_value_t = 0)]
+        holdout: usize,
+        /// A: author keypairs drawn Zipf-style.
+        #[arg(long, default_value_t = 200_000)]
+        authors: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long)]
+        out: PathBuf,
+        /// Generation workers; output is independent of this.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
     /// n stored scans of one filter; reports the CPU-ceiling signal.
     Scan {
@@ -852,6 +876,37 @@ async fn main() {
         } => {
             let url = url.parse().expect("valid ws(s) url");
             gate::wake(url, subs, idle_secs, rounds, events, auth).await;
+        }
+        Cmd::Gen {
+            template,
+            events,
+            holdout,
+            authors,
+            seed,
+            out,
+            threads,
+        } => {
+            let threads = if threads == 0 {
+                std::thread::available_parallelism().map_or(1, |n| n.get())
+            } else {
+                threads
+            };
+            let opts = corpus::GenOpts {
+                template,
+                events,
+                holdout,
+                authors,
+                seed,
+                out,
+                threads,
+            };
+            match corpus::run(&opts) {
+                Ok(result) => println!("{result}"),
+                Err(e) => {
+                    eprintln!("gen failed: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
         Cmd::Subbudget { url, authors } => {
             let url = url.parse().expect("valid ws(s) url");
