@@ -165,7 +165,7 @@ def deflate_arg(on):
 # Unit schedule builders
 # ------------------------------------------------------------------
 
-def units_w1(prm, pilot, saturation):
+def units_w1(prm, pilot):
     w = prm.p("w1")
     reps = prm.reps("w1", pilot)
     secs = int(prm.p("pilot", "secs")) if pilot else w["closed_secs"]
@@ -185,11 +185,8 @@ def units_w1(prm, pilot, saturation):
                                 "--duration", str(secs), "--warmup", str(warm),
                                 "--label", f"w1-closed-c{c}-r{rep}")],
                     db="fresh"))
-            if saturation <= 0:
-                continue
-            for f in w["open_fractions"]:
-                rate = round(saturation * f)
-                scen = f"open-f{f:g}"
+            for rate in w["open_rates"].get(label, []):
+                scen = f"open-{rate}"
                 out.append(unit("w1", scen, label, rep, "harness", [
                     harness_cmd(prm, "ingest-open", "--url", ws_url(port),
                                 "--corpus", corpus, "--conns", str(w["open_conns"]),
@@ -294,7 +291,7 @@ def units_w4(prm, pilot):
     return out
 
 
-def units_w5(prm, pilot, saturation):
+def units_w5(prm, pilot):
     w = prm.p("w5")
     reps = prm.reps("w5", pilot)
     qsecs = int(prm.p("pilot", "secs")) if pilot else w["query_secs"]
@@ -303,7 +300,7 @@ def units_w5(prm, pilot, saturation):
     d2 = prm.path_of("d2")
     corpus = str(d2 / "holdout.jsonl")
     port = str(prm.p("net", "port"))
-    rate = saturation * 0.5
+    rate = w["ingest_rate"]
     out = []
     # Read-only units first, on the shared imported db: cold and warm
     # queries plus a timed restart, per rep.
@@ -417,38 +414,11 @@ def units_w8(prm, pilot):
     return out
 
 
-def derive_saturation(prm):
-    """w1.saturation, else the min closed-c32 measured rate in results."""
-    sat = float(prm.p("w1", "saturation"))
-    if sat > 0:
-        return sat
-    best = None
-    base = prm.path_of("results") / "w1" / "closed-c32"
-    if base.is_dir():
-        for rep in sorted(base.glob("*/rep*.json")):
-            v = last_json(rep.read_text())
-            if isinstance(v, dict):
-                aps = v.get("accepted_per_sec") or v.get("measured_per_sec")
-                if aps:
-                    best = min(best, aps) if best is not None else aps
-    return float(best) if best else 0.0
-
-
-BUILDERS = {"w2": units_w2, "w3": units_w3, "w4": units_w4,
-            "w6": units_w6, "w7": units_w7, "w8": units_w8}
+BUILDERS = {"w1": units_w1, "w2": units_w2, "w3": units_w3, "w4": units_w4,
+            "w5": units_w5, "w6": units_w6, "w7": units_w7, "w8": units_w8}
 
 
 def schedule(prm, workload, pilot):
-    sat = derive_saturation(prm)
-    if workload == "w1":
-        if sat <= 0 and not pilot:
-            print("run.py: w1.saturation unset — scheduling closed units only; "
-                  "run `pilot w1` first for the open phase", file=sys.stderr)
-        return units_w1(prm, pilot, sat)
-    if workload == "w5":
-        if sat <= 0:
-            sys.exit("run.py: w5 needs w1.saturation (set it or run `pilot w1` first)")
-        return units_w5(prm, pilot, sat)
     return BUILDERS[workload](prm, pilot)
 
 
@@ -1063,8 +1033,6 @@ def main():
     if pilot and workload == "w1":
         units = [u for u in units if u["scenario"].startswith("closed-")]
     run_schedule(prm, units, args.dry_run)
-    if pilot and workload == "w1" and not args.dry_run:
-        print(f"pilot: suggested w1.saturation = {derive_saturation(prm):.0f}")
 
 
 if __name__ == "__main__":
