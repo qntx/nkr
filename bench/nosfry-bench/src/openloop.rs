@@ -55,13 +55,13 @@ pub(crate) struct IngestOpts {
 
 /// One corpus line ready to send: the `["EVENT",..]` wire message
 /// plus the event's id bytes for `OK` matching.
-struct Ready {
-    id: [u8; 32],
-    msg: String,
+pub(crate) struct Ready {
+    pub(crate) id: [u8; 32],
+    pub(crate) msg: String,
 }
 
 /// Decode 64 hex chars into 32 bytes.
-fn unhex(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn unhex(s: &str) -> Option<[u8; 32]> {
     let b = s.as_bytes();
     if b.len() != 64 {
         return None;
@@ -77,7 +77,7 @@ fn unhex(s: &str) -> Option<[u8; 32]> {
 
 /// Read at most `limit` corpus lines, wrapping each in `["EVENT",]`
 /// and extracting its `id`.
-fn load_corpus(path: &Path, limit: usize) -> Result<Vec<Ready>, String> {
+pub(crate) fn load_corpus(path: &Path, limit: usize) -> Result<Vec<Ready>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{path:?}: {e}"))?;
     let mut reader = BufReader::with_capacity(1 << 20, file);
     let mut out = Vec::with_capacity(limit.min(1 << 20));
@@ -131,7 +131,7 @@ struct Pending {
 }
 
 /// Classify an `OK` frame: `["OK","<id>",<bool>,"<reason>"]`.
-fn classify_ok(text: &str) -> Option<(&str, bool, &str)> {
+pub(crate) fn classify_ok(text: &str) -> Option<(&str, bool, &str)> {
     if !text.starts_with("[\"OK\",\"") {
         return None;
     }
