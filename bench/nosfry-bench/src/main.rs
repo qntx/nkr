@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod ack;
 mod corpus;
 mod gate;
 mod hist;
@@ -241,6 +242,30 @@ enum Cmd {
         #[arg(long, default_value = "query")]
         label: String,
     },
+    /// Crash-durability ingest: paced sends, acked ids appended to a file.
+    AckIngest {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        conns: usize,
+        /// Events per second across all connections.
+        #[arg(long)]
+        rate: f64,
+        /// `acked.ids` destination, one hex id per line.
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "ack-ingest")]
+        label: String,
+    },
+    /// REQ back every id in `acked.ids` after a relay restart.
+    AckCheck {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        ids: PathBuf,
+    },
     /// NIP-77 set reconciliation against a known corpus state.
     Neg {
         #[arg(long)]
@@ -409,17 +434,55 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-async fn connect(url: &url::Url, deflate: bool) -> Result<TcpWebSocket, String> {
+fn ws_options(deflate: bool) -> Options {
     let mut options = Options::default()
         .with_max_payload_read(16 << 20)
         .with_no_delay();
     if deflate {
         options = options.with_compression_level(CompressionLevel::fast());
     }
+    options
+}
+
+async fn connect(url: &url::Url, deflate: bool) -> Result<TcpWebSocket, String> {
     WebSocket::connect(url.clone())
-        .with_options(options)
+        .with_options(ws_options(deflate))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Same connect, bound to a specific loopback address. `conns` uses it
+/// to spread 50,000 sockets over 127.0.0.2-127.0.0.9 once the kernel
+/// runs out of ports on 127.0.0.1.
+async fn connect_bound(
+    url: &url::Url,
+    deflate: bool,
+    addr: std::net::IpAddr,
+) -> Result<TcpWebSocket, String> {
+    WebSocket::connect(url.clone())
+        .with_local_address(addr)
+        .with_options(ws_options(deflate))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Connect from the default source; on failure (the kernel ran out of
+/// loopback ports) retry bound to one of 127.0.0.2-127.0.0.9. Returns
+/// `(socket, used_fallback)`.
+async fn connect_spread(
+    url: &url::Url,
+    deflate: bool,
+    j: usize,
+) -> Result<(TcpWebSocket, bool), String> {
+    match connect(url, deflate).await {
+        Ok(ws) => Ok((ws, false)),
+        Err(_) => {
+            let addr = std::net::IpAddr::from([127, 0, 0, 2 + (j % 8) as u8]);
+            connect_bound(url, deflate, addr)
+                .await
+                .map(|ws| (ws, true))
+        }
+    }
 }
 
 /// Send a REQ and read until its EOSE. Frames before EOSE are ignored.
@@ -865,27 +928,34 @@ async fn conns(
     let ready = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
+    let bind_fallbacks = Arc::new(AtomicUsize::new(0));
     let gate = Arc::new(Semaphore::new(HANDSHAKE_CONCURRENCY));
     let start = Instant::now();
     let mut tasks = Vec::with_capacity(n);
     for j in 0..n {
-        let (url, ready, failed, dropped, gate, mut stop) = (
+        let (url, ready, failed, dropped, bind_fallbacks, gate, mut stop) = (
             url.clone(),
             Arc::clone(&ready),
             Arc::clone(&failed),
             Arc::clone(&dropped),
+            Arc::clone(&bind_fallbacks),
             Arc::clone(&gate),
             stop_rx.clone(),
         );
         tasks.push(tokio::spawn(async move {
             let permit = gate.acquire_owned().await.expect("semaphore open");
-            let mut ws = match connect(&url, deflate).await {
-                Ok(ws) => ws,
+            // Primary bind is 127.0.0.1; when the kernel runs out of
+            // ports, retry spread over 127.0.0.2-127.0.0.9.
+            let (mut ws, fallback) = match connect_spread(&url, deflate, j).await {
+                Ok(pair) => pair,
                 Err(_) => {
                     failed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
             };
+            if fallback {
+                bind_fallbacks.fetch_add(1, Ordering::Relaxed);
+            }
             if subscribe(
                 &mut ws,
                 &format!("c{j}"),
@@ -939,6 +1009,7 @@ async fn conns(
         "requested": n,
         "accepted": opened,
         "failed": failed.load(Ordering::Relaxed),
+        "local_bind_fallbacks": bind_fallbacks.load(Ordering::Relaxed),
         "dropped_during_hold": dropped.load(Ordering::Relaxed),
         "setup_secs": setup_secs,
         "rss_kib_before": before.map(|b| b.rss_kib),
@@ -1107,6 +1178,25 @@ async fn main() -> Result<(), String> {
             query::query(url, opts)
                 .await
                 .map_err(|e| format!("query: {e}"))?;
+        }
+        Cmd::AckIngest {
+            url,
+            corpus,
+            conns,
+            rate,
+            out,
+            label,
+        } => {
+            let url = url.parse().expect("valid ws url");
+            ack::ack_ingest(url, corpus, conns, rate, out, label)
+                .await
+                .map_err(|e| format!("ack-ingest: {e}"))?;
+        }
+        Cmd::AckCheck { url, ids } => {
+            let url = url.parse().expect("valid ws url");
+            ack::ack_check(url, ids)
+                .await
+                .map_err(|e| format!("ack-check: {e}"))?;
         }
         Cmd::Neg {
             url,
