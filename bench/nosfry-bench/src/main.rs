@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod gate;
+mod hist;
+mod sampler;
 mod soak;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -196,6 +198,29 @@ struct Author {
     pk_hex: String,
 }
 
+/// Standard base64 with padding (for `hist_b64` and the WS probe key).
+fn b64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(char::from(T[(n >> 18) as usize & 63]));
+        out.push(char::from(T[(n >> 12) as usize & 63]));
+        out.push(if chunk.len() > 1 {
+            char::from(T[(n >> 6) as usize & 63])
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            char::from(T[n as usize & 63])
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 fn author(index: usize) -> Author {
     let mut secret = [0u8; 32];
     secret[..8].copy_from_slice(&(index as u64 + 1).to_be_bytes());
@@ -278,6 +303,8 @@ struct ProcStats {
     rss_anon_kib: Option<u64>,
     /// Cumulative user + system CPU seconds.
     cpu_secs: f64,
+    /// Live thread count (Linux `/proc/<pid>/status` only).
+    threads: Option<u64>,
 }
 
 impl ProcStats {
@@ -300,6 +327,7 @@ fn proc_stats(pid: u32) -> Option<ProcStats> {
             rss_kib,
             rss_anon_kib: None,
             cpu_secs,
+            threads: None,
         })
     }
 }
@@ -335,6 +363,7 @@ fn proc_stats_linux(pid: u32) -> Option<ProcStats> {
         rss_kib: kib("VmRSS:")?,
         rss_anon_kib: kib("RssAnon:"),
         cpu_secs: (utime + stime) / ticks_per_sec,
+        threads: kib("Threads:"),
     })
 }
 
