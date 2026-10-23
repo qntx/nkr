@@ -89,11 +89,12 @@ async fn req_outcome(
 }
 
 /// `rtt`: n sequential `REQ`→`EOSE`→`CLOSE` round-trips on one
-/// connection against a scan that always finishes empty.
+/// connection against a scan that always finishes empty. `limit: 1`
+/// not `limit: 0`: nostr-rs-relay silently drops limit-0 REQs.
 pub(crate) async fn rtt(url: url::Url, n: usize) {
     let mut ws = connect(&url, false).await.expect("connect");
     let mut micros = Vec::with_capacity(n);
-    let probe = json!({"kinds": [65535], "limit": 0});
+    let probe = json!({"kinds": [65535], "limit": 1});
     for i in 0..n {
         let sub = format!("rtt{i}");
         match req_outcome(&mut ws, &sub, &probe).await {
@@ -523,7 +524,7 @@ pub(crate) async fn wake(
         None
     };
 
-    let probe_filter = json!({"kinds": [65535], "limit": 0});
+    let probe_filter = json!({"kinds": [65535], "limit": 1});
     let mut rounds_json = Vec::with_capacity(rounds);
     for r in 0..rounds {
         // (a) warm: the object is live right now.
