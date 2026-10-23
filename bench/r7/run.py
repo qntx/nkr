@@ -376,7 +376,10 @@ def units_w8(prm, pilot):
     w = prm.p("w8")
     cycles = prm.reps("w8", pilot) if pilot else int(w["cycles"])
     rng = random.Random(w["seed"])
-    corpus = str(prm.path_of("d2") / "holdout.jsonl")
+    # Regular kinds only: a replaceable event may be ACKed and then
+    # legitimately superseded by a later corpus event, which is not a
+    # lost write.
+    corpus = str(prm.path_of("holdout_regular"))
     port = str(prm.p("net", "port"))
     out = []
     for rep in range(1, cycles + 1):
