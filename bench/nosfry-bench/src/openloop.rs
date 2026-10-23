@@ -174,7 +174,7 @@ fn count_timeouts(out: &mut ConnOut, pending: &HashMap<[u8; 32], Pending>) {
 
 /// The relay's negotiated extensions, probed before a `--deflate`
 /// measured phase. `None` when the probe could not run.
-fn server_extensions(url: &url::Url, deflate: bool) -> Value {
+pub(crate) fn server_extensions(url: &url::Url, deflate: bool) -> Value {
     if !deflate {
         return Value::Null;
     }

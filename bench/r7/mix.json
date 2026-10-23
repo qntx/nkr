@@ -1,0 +1,61 @@
+[
+  {
+    "name": "global-recent",
+    "weight": 10,
+    "template": { "kinds": [1], "limit": 500 }
+  },
+  {
+    "name": "follow-feed",
+    "weight": 25,
+    "template": { "kinds": [1, 6], "authors": "{follow}", "limit": 500 }
+  },
+  {
+    "name": "profiles",
+    "weight": 15,
+    "template": { "kinds": [0], "authors": "{authors:50}" }
+  },
+  {
+    "name": "thread",
+    "weight": 10,
+    "template": { "kinds": [1], "#e": ["{event_id}"], "limit": 500 }
+  },
+  {
+    "name": "notifications",
+    "weight": 15,
+    "template": { "kinds": [1, 6, 7, 9735], "#p": ["{author_pop}"], "limit": 500 }
+  },
+  {
+    "name": "hashtag",
+    "weight": 10,
+    "template": { "kinds": [1], "#t": ["{tag_t}"], "limit": 500 }
+  },
+  {
+    "name": "by-ids",
+    "weight": 5,
+    "template": { "ids": "{ids:100}" }
+  },
+  {
+    "name": "time-window",
+    "weight": 5,
+    "template": {
+      "kinds": [1],
+      "since": "{window:3600}.since",
+      "until": "{window:3600}.until",
+      "limit": 500
+    }
+  },
+  {
+    "name": "addressable",
+    "weight": 3,
+    "template": {
+      "kinds": ["{addr}.kind"],
+      "authors": ["{addr}.pubkey"],
+      "#d": ["{addr}.d"]
+    }
+  },
+  {
+    "name": "contact-list",
+    "weight": 2,
+    "template": { "kinds": [3], "authors": ["{author_pop}"] }
+  }
+]

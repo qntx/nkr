@@ -154,7 +154,7 @@ impl PoolSlot {
 }
 
 /// Domain-separated rng stream: `sha256(seed || domain || i)`.
-fn keyed_rng(seed: u64, domain: &[u8], i: u64) -> ChaCha20Rng {
+pub(crate) fn keyed_rng(seed: u64, domain: &[u8], i: u64) -> ChaCha20Rng {
     let mut h = Sha256::new();
     h.update(seed.to_le_bytes());
     h.update(domain);
