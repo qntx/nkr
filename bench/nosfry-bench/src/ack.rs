@@ -13,7 +13,7 @@
 //! of what the restart actually kept.
 
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -234,6 +234,23 @@ async fn ack_conn(
     }
 }
 
+/// Ids already in `--out` from earlier cycles: `ack-ingest` resumes
+/// the corpus where the last killed run left off.
+fn prior_acked(out: &std::path::Path) -> Result<HashSet<[u8; 32]>, String> {
+    let mut set = HashSet::new();
+    let Ok(file) = File::open(out) else {
+        return Ok(set);
+    };
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("{}: {e}", out.display()))?;
+        // A partially flushed tail line is not an id; skip it.
+        if let Some(id) = unhex(line.trim()) {
+            set.insert(id);
+        }
+    }
+    Ok(set)
+}
+
 /// `ack-ingest --url U --corpus F --conns C --rate R --out acked.ids`.
 pub(crate) async fn ack_ingest(
     url: url::Url,
@@ -243,11 +260,23 @@ pub(crate) async fn ack_ingest(
     out: PathBuf,
     label: String,
 ) -> Result<(), String> {
-    let corpus = Arc::new(load_corpus(&corpus_path, usize::MAX)?);
+    let prior = prior_acked(&out)?;
+    let resumed = prior.len();
+    let full = load_corpus(&corpus_path, usize::MAX)?;
+    let corpus = Arc::new(
+        full.iter()
+            .filter(|ev| !prior.contains(&ev.id))
+            .cloned()
+            .collect::<Vec<Ready>>(),
+    );
     if corpus.is_empty() {
         return Err(format!("corpus {} is empty", corpus_path.display()));
     }
-    let file = File::create(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&out)
+        .map_err(|e| format!("{}: {e}", out.display()))?;
     let acked = Arc::new(Mutex::new(AckedFile {
         writer: BufWriter::new(file),
         written: 0,
@@ -286,6 +315,7 @@ pub(crate) async fn ack_ingest(
         "conns": conns,
         "rate": rate,
         "sends": counters.sends.load(Ordering::Relaxed),
+        "resumed": resumed,
         "acked": counters.acked.load(Ordering::Relaxed),
         "rejected": counters.rejected.load(Ordering::Relaxed),
         "errors": counters.errors.load(Ordering::Relaxed),
