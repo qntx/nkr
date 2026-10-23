@@ -21,6 +21,7 @@ mod corpus;
 mod gate;
 mod hist;
 mod openloop;
+mod query;
 mod sampler;
 mod soak;
 
@@ -209,6 +210,34 @@ enum Cmd {
         #[arg(long)]
         pid: Option<u32>,
         #[arg(long, default_value = "ingest-closed")]
+        label: String,
+    },
+    /// Stored-query mix driver: closed REQ->EOSE->CLOSE loops.
+    Query {
+        #[arg(long)]
+        url: String,
+        /// `params.json` written by `gen`.
+        #[arg(long)]
+        params: PathBuf,
+        /// Weighted query mix (see `bench/r7/mix.json`).
+        #[arg(long)]
+        mix: PathBuf,
+        /// Per-query JSONL log destination.
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long)]
+        conns: usize,
+        #[arg(long)]
+        duration: u64,
+        #[arg(long, default_value_t = 0)]
+        warmup: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long)]
+        deflate: bool,
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long, default_value = "query")]
         label: String,
     },
     /// Generate the D2 synthetic corpus and its query sidecar.
@@ -975,6 +1004,36 @@ async fn main() -> Result<(), String> {
             openloop::ingest_closed(url, opts, window)
                 .await
                 .map_err(|e| format!("ingest-closed: {e}"))?;
+        }
+        Cmd::Query {
+            url,
+            params,
+            mix,
+            log,
+            conns,
+            duration,
+            warmup,
+            seed,
+            deflate,
+            pid,
+            label,
+        } => {
+            let url = url.parse().expect("valid ws url");
+            let opts = query::QueryOpts {
+                params,
+                mix,
+                log,
+                conns,
+                duration,
+                warmup,
+                seed,
+                deflate,
+                pid,
+                label,
+            };
+            query::query(url, opts)
+                .await
+                .map_err(|e| format!("query: {e}"))?;
         }
         Cmd::Gen {
             template,
