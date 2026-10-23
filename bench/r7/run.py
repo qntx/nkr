@@ -385,6 +385,7 @@ def units_w7(prm, pilot):
                     "--neg-every-secs", str(neg_every),
                     "--vanish-every-secs", str(vanish_every),
                     "--label", f"w7-soak-r{rep}")],
+                db="fresh",
                 env=env, note={"skipped": skipped} if skipped else None))
     return out
 
