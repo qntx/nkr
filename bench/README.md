@@ -99,8 +99,9 @@ cp -r /amethyst/relayBench/build/install/relaybench /bench/relaybench
 mkdir -p /bench/corpus
 cp /amethyst/quartz/src/commonTest/resources/nostr_vitor_startup_data.json.gz /bench/corpus/
 
-# drivers and relay wrappers
+# drivers, relay wrappers, and config variants
 cp /src/nosfry/bench/linux/*.sh /bench/
+cp -r /src/nosfry/bench/linux/variants /bench/variants
 ```
 
 ## Runs
@@ -108,6 +109,9 @@ cp /src/nosfry/bench/linux/*.sh /bench/
 ```bash
 /bench/run-relaybench.sh <name>...
 /bench/run-nosfry-bench.sh /bench/results/nosfry-bench <reps> <name>...
+# a name may be bin+variant: /bench/variants/<variant>.toml is appended
+# to the generated config and the full label stays in every result
+/bench/run-nosfry-bench.sh /bench/results/r6 3 nosfry-020 nosfry-main nosfry-main+sliding
 DURATION=1800 SAMPLE=30 /bench/run-soak.sh <name> [label]
 ```
 

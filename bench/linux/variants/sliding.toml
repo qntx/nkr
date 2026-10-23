@@ -1,0 +1,3 @@
+# strfry's default: per-connection deflate state for the better ratio.
+[relay.compression]
+sliding_window = true

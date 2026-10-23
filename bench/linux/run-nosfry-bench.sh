@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Complementary relay benchmarks on Linux with CPU isolation:
 # the relay runs on cores 0-3, the harness on cores 4-9.
-# Usage: run-nosfry-bench.sh <out-dir> <reps> <nosfry-binary-name>...
-#   Each name is a binary under /bench/bin, compared side by side with
-#   pristine strfry in every run; the whole list rotates every rep.
+# Usage: run-nosfry-bench.sh <out-dir> <reps> <nosfry-entry>...
+#   Each entry is a binary under /bench/bin, or bin+variant to also
+#   append /bench/variants/<variant>.toml to the generated config;
+#   entries are compared side by side with pristine strfry in every
+#   run, and the whole list rotates every rep.
 # Every scenario runs against a freshly started relay with an empty
 # database.
 set -euo pipefail
@@ -41,7 +43,14 @@ EOF
             "$BENCH/strfry-pinned.sh" --config "$dir/strfry.conf" relay > "$dir/relay.log" 2>&1 &
             ;;
         *)
-            "$BENCH/nosfry-relay.sh" "$BENCH/bin/$name" "$PORT" "$dir" > "$dir/relay.log" 2>&1 &
+            # An entry is bin or bin+variant; the variant selects a
+            # config fragment appended by nosfry-relay.sh.
+            local bin="${name%%+*}" variant=""
+            if [ "$name" != "$bin" ]; then
+                variant="$BENCH/variants/${name#*+}.toml"
+            fi
+            "$BENCH/nosfry-relay.sh" "$BENCH/bin/$bin" "$PORT" "$dir" "$variant" \
+                > "$dir/relay.log" 2>&1 &
             ;;
     esac
     RELAY_PID=$!

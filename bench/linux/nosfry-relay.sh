@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # nosfry pinned to the relay cores, configured like relayBench's strfry setup.
+# Usage: nosfry-relay.sh <binary> <port> <work-dir> [variant-toml]
+#   The optional variant file is appended to the generated nosfry.toml.
 set -euo pipefail
-bin="$1"; port="$2"; dir="$3"
+bin="$1"; port="$2"; dir="$3"; variant="${4:-}"
+if [ -n "$variant" ] && [ ! -f "$variant" ]; then
+    echo "nosfry-relay.sh: variant config '$variant' not found" >&2
+    exit 1
+fi
 mkdir -p "$dir/nosfry-db"
 cat > "$dir/nosfry.toml" <<CONF
 [db]
@@ -31,4 +37,9 @@ events_burst = 0
 reqs_per_second = 0
 reqs_burst = 0
 CONF
+# Deliberately no [relay.compression] table above: a variant file may
+# add one, and a duplicate table is a TOML error.
+if [ -n "$variant" ]; then
+    cat "$variant" >> "$dir/nosfry.toml"
+fi
 exec taskset -c 0-3 "$bin" relay --config "$dir/nosfry.toml"
