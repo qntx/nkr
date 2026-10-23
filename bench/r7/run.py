@@ -686,12 +686,12 @@ def run_relaybench_unit(prm, unit, unit_dir):
     t0 = time.time()
     with open(rep_log, "wb") as log:
         rc = subprocess.call(argv, stdout=log, stderr=subprocess.STDOUT)
-    results = out_dir / "results.json"
+    found = sorted(out_dir.glob("*/results.json"))
     rep_json = unit_dir / f"rep{unit['rep']}.json"
-    if results.exists():
-        shutil.copy2(results, rep_json)
+    if found:
+        shutil.copy2(found[-1], rep_json)
     return {"cmds_rc": [rc], "wall_secs": round(time.time() - t0, 2),
-            "valid": rc == 0 and results.exists()}
+            "valid": rc == 0 and bool(found)}
 
 
 def impl_conf(prm, entry, db):
