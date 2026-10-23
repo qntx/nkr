@@ -38,6 +38,31 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
     `sync_memory_after_close` and `subscription_bytes_after_close`,
     the gauge values once every harness connection is closed) and a
     `relay_exit` line close the JSONL.
+  - `gen` builds the D2 synthetic corpus (`--template` a gzipped JSON
+    array of real events such as the Amethyst startup dump). The
+    corpus is reproducible byte for byte: event `i` is fully
+    determined by `--seed` and `i` (`sha256(seed || "ev" || i)` seeds
+    a `ChaCha20Rng`), so `--threads` never changes the output.
+    Templates keep their kind, tag skeleton and content; events get
+    fresh authors drawn Zipf (s = 1.0) over `--authors` generated
+    keypairs, a `created_at` spread over a fixed two-year window, and
+    BIP-340 signatures with zero auxiliary randomness. Template events
+    of ephemeral kinds (20000-29999) are dropped, and so are kinds 5
+    (NIP-09 deletion) and 62 (NIP-62 request to vanish): with
+    Zipf-drawn authors one popular author's vanish would wipe a large
+    share of the corpus and deletions would make stored counts
+    relay-dependent.
+  - The e-pool: the first `P = 100,000` generated ids are the reply
+    pool. Pool members carry no `e` tags of their own (a template `e`
+    tag degrades to a `p` tag with a Zipf-drawn author); every event
+    past `P` rewrites its `e` tags to a uniformly drawn pool id, so
+    `#e` thread queries fan out to a real, shared set of parents.
+  - Outputs in `--out`: `events.jsonl` (the `--events` prefix),
+    `holdout.jsonl` (`--holdout` tail, the ingest driver's input),
+    `params.json` (query-driver sidecar: popular and random authors,
+    random ids, top `t` values, follow lists, `created_at` range,
+    kind counts, `(kind, pubkey, d)` triples and `pool_ids`) and
+    `fingerprints.txt` (sha256 of each).
 - **aggregate.py**: `python3 bench/aggregate.py <results-dir>` prints the
   median and [min, max] of every metric across repeated runs.
 - **soak_analyze.py**: `python3 bench/soak_analyze.py <run.jsonl>
