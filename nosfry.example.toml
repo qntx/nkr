@@ -176,10 +176,11 @@ monitors = 3
 enabled = true
 # Keep the LZ77 sliding window between messages. false (default) =
 # no context takeover either direction, deflate state shared from a
-# server-wide pool, a few KiB per connection, ~18-52% more bytes than
-# the sliding window buys. true = strfry's default: per-connection
-# deflate state (~370 KiB once a message was compressed) for the
-# better ratio — for bandwidth-bound relays with few connections.
+# server-wide pool, a few KiB per connection, at 18-52% more bytes and
+# ~25% more CPU per compressed message than the sliding window.
+# true = strfry's default: per-connection deflate state (~370 KiB once
+# a message was compressed) for the better ratio and lower CPU — for
+# relays bound by bandwidth or CPU rather than connection count.
 sliding_window = false
 
 [relay.info]
