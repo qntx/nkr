@@ -31,6 +31,7 @@ from pathlib import Path
 FOREIGN_PROCS = ("nosfry", "strfry", "nostr-rs", "nosfry-bench", "relaybench")
 READY_TIMEOUT_S = 60.0
 TERM_GRACE_S = 10.0
+RTT_TIMEOUT_S = 15.0
 RESTART_POLL_S = 0.05
 RESTART_DEADLINE_S = 120.0
 LMDB_MAP = 137438953472
@@ -41,6 +42,9 @@ def sh(cmd, **kw):
         return subprocess.run(cmd, text=True, capture_output=True, **kw)
     except FileNotFoundError as e:
         return subprocess.CompletedProcess(cmd, 127, "", str(e))
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(cmd, 124, e.stdout or "",
+                                           e.stderr or "")
 
 
 def sh_out(cmd, **kw):
@@ -136,7 +140,7 @@ def relay_entry(label, prm):
             "wrapper": str(wrapper), "variant": variant_path}
 
 
-def unit(workload, scenario, label, rep, kind, cmds, db="fresh",
+def unit(workload, scenario, label, rep, kind, cmds, db="main",
          cold_cache=False, env=None, note=None):
     return {"workload": workload, "scenario": scenario, "label": label,
             "rep": rep, "kind": kind, "cmds": cmds, "db": db,
@@ -179,7 +183,8 @@ def units_w1(prm, pilot, saturation):
                                 "--corpus", corpus, "--conns", str(c),
                                 "--window", str(w["window"]),
                                 "--duration", str(secs), "--warmup", str(warm),
-                                "--label", f"w1-closed-c{c}-r{rep}")]))
+                                "--label", f"w1-closed-c{c}-r{rep}")],
+                    db="fresh"))
             if saturation <= 0:
                 continue
             for f in w["open_fractions"]:
@@ -220,7 +225,7 @@ def units_w2(prm, pilot):
                                 "--duration", str(secs), "--warmup", str(warm),
                                 "--seed", str(w["seed"]), *deflate_arg(df),
                                 "--label", f"w2-{scen}-r{rep}")],
-                            db="snap:d2", cold_cache=cold))
+                            db="main", cold_cache=cold))
         # D1 continuity through relayBench (non-strfry entries only;
         # strfry is already relayBench's built-in baseline).
         for label in rotated(w["relays"], rep):
@@ -236,7 +241,7 @@ def units_w2(prm, pilot):
                     "--relay", f"{label}={tpl}",
                     "--no-sync", "--no-color",
                     "--corpus", str(prm.path_of("d1_corpus"))]],
-                    db="reuse"))
+                    db="main"))
     return out
 
 
@@ -262,7 +267,8 @@ def units_w3(prm, pilot):
                             "--subs", str(shape["subs"]), "--events", str(events),
                             "--rate", str(shape["rate"]), "--mode", mode,
                             "--authors", str(w["authors"]), *deflate_arg(df),
-                            "--label", f"w3-{scen}-r{rep}")]))
+                            "--label", f"w3-{scen}-r{rep}")],
+                        db="fresh"))
     return out
 
 
@@ -283,7 +289,8 @@ def units_w4(prm, pilot):
                         harness_cmd(prm, "conns", "--url", ws_url(port),
                                     "--conns", str(c), "--hold-secs", str(hold),
                                     *deflate_arg(df),
-                                    "--label", f"w4-{scen}-r{rep}")]))
+                                    "--label", f"w4-{scen}-r{rep}")],
+                        db="fresh"))
     return out
 
 
@@ -298,6 +305,8 @@ def units_w5(prm, pilot, saturation):
     port = str(prm.p("net", "port"))
     rate = saturation * 0.5
     out = []
+    # Read-only units first, on the shared imported db: cold and warm
+    # queries plus a timed restart, per rep.
     for rep in range(1, reps + 1):
         for label in rotated(w["relays"], rep):
             def q(cold):
@@ -308,13 +317,19 @@ def units_w5(prm, pilot, saturation):
                     "--conns", str(w["conns"]), "--duration", str(qsecs),
                     "--warmup", str(qwarm), "--seed", str(prm.p("w2", "seed")),
                     "--label", f"w5-q-{'cold' if cold else 'warm'}-r{rep}")
-            out.append(unit("w5", "import-query-ingest", label, rep, "w5", [
-                q(True), q(False),
+            out.append(unit("w5", "query-restart", label, rep, "w5ro",
+                            [q(True), q(False)]))
+    # Then ingest-on-top reps in sequence on the same db; the runner
+    # records the stored event count before each rep (the db grows by
+    # a few percent per rep — that is documented, not hidden).
+    for rep in range(1, reps + 1):
+        for label in rotated(w["relays"], rep):
+            out.append(unit("w5", "ingest", label, rep, "w5ingest", [
                 harness_cmd(prm, "ingest-open", "--url", ws_url(port),
                             "--corpus", corpus, "--conns", str(w["open_conns"]),
                             "--rate", f"{rate:g}", "--duration", str(isecs),
                             "--warmup", "0", "--label", f"w5-ingest-r{rep}")],
-                db="fresh", note={"ingest_rate": round(rate, 2)}))
+                note={"ingest_rate": round(rate, 2)}))
     return out
 
 
@@ -335,7 +350,7 @@ def units_w6(prm, pilot):
                         "--diff-pct", str(pct), "--seed", str(w["seed"]),
                         "--frame-size-limit", str(w["frame_size_limit"]),
                         "--label", f"w6-diff-{pct:g}-r{rep}")],
-                    db="snap:w6"))
+                    db="import:w6"))
     return out
 
 
@@ -355,11 +370,11 @@ def units_w7(prm, pilot):
             metrics = (["--metrics-url", f"http://127.0.0.1:{port}/metrics"]
                        if e["impl"] == "nosfry" else [])
             env = {"METRICS": "1"} if e["impl"] == "nosfry" else {}
-            db_dir = str(prm.path_of("work") / "db" / bin_of(label))
+            db_path = str(prm.path_of("work") / "db-w7" / bin_of(label))
             out.append(unit("w7", "soak", label, rep, "harness", [
                 harness_cmd(
                     prm, "soak", "--url", ws_url(port), *metrics,
-                    "--db-dir", db_dir,
+                    "--db-dir", db_path,
                     "--duration-secs", str(dur), "--sample-secs", str(w["sample_secs"]),
                     "--publishers", str(w["publishers"]), "--rate", str(w["rate"]),
                     "--subscribers", str(w["subscribers"]),
@@ -453,6 +468,8 @@ def assert_quiet():
         if pid == os.getpid():
             continue
         args = parts[1]
+        if "<defunct>" in args:
+            continue
         if any(name in args for name in FOREIGN_PROCS) and "run.py" not in args:
             bad.append(line.strip())
     if bad:
@@ -470,18 +487,26 @@ def set_sysctls():
     return values
 
 
-def db_dir(prm, label):
-    return prm.path_of("work") / "db" / bin_of(label)
+# Destructive and standalone workloads get a scratch dir under work/
+# so they can never wipe or grow the shared imported db in work/db/.
+SCRATCH_DBS = {"w1": "db-w1", "w3": "db-w3", "w4": "db-w4",
+               "w7": "db-w7", "w8": "db-w8"}
 
 
-def snap_dir(prm, name, label):
-    return prm.path_of("work") / "snap" / name / bin_of(label)
+def db_dir(prm, unit):
+    """`main` is work/db/<bin>; `import:<name>` and the scratch modes
+    live under their own work/db-<x>/<bin>."""
+    if unit["db"] == "import:w6":
+        base = "db-w6"
+    else:
+        base = SCRATCH_DBS.get(unit["workload"], "db")
+    return prm.path_of("work") / base / bin_of(unit["label"])
 
 
 def relay_env(prm, unit):
     env = dict(os.environ)
     env["RELAY_CPUS"] = str(prm.p("cores", "relay"))
-    env["DB_DIR"] = str(db_dir(prm, unit["label"]))
+    env["DB_DIR"] = str(db_dir(prm, unit))
     env.update(unit["env"])
     return env
 
@@ -511,8 +536,9 @@ def wait_port(port, proc, timeout=READY_TIMEOUT_S):
 
 
 def rtt_probe(prm):
-    """One `{"kinds":[65535],"limit":0}` REQ; True when EOSE arrives."""
-    r = sh(harness_cmd(prm, "rtt", "--url", ws_url(prm.p("net", "port")), "--n", "1"))
+    """One `{"kinds":[65535],"limit":1}` REQ; True when EOSE arrives."""
+    r = sh(harness_cmd(prm, "rtt", "--url", ws_url(prm.p("net", "port")),
+                     "--n", "1"), timeout=RTT_TIMEOUT_S)
     v = last_json(r.stdout)
     return r.returncode == 0 and isinstance(v, dict) and v.get("n", 0) >= 1
 
@@ -554,36 +580,33 @@ def drop_caches():
         return False
 
 
-def snap_sentinel(prm, label):
-    return prm.path_of("work") / "db" / f"{bin_of(label)}.snapset"
-
-
 def prepare_db(prm, unit):
-    """`fresh` wipes, `snap:<name>` restores only when the db is not
-    already that snapshot — read-only units then reuse it."""
+    """`main`/`reuse` leave the db alone, `fresh` wipes the workload's
+    scratch dir, `import:w6` imports the regular corpus into its own
+    dir once per rep. Returns import stats or None."""
     mode = unit["db"]
-    d = db_dir(prm, unit["label"])
-    sentinel = snap_sentinel(prm, unit["label"])
-    if mode == "reuse":
-        return
+    d = db_dir(prm, unit)
+    if mode in ("main", "reuse"):
+        return None
     if mode == "fresh":
         if d.exists():
             shutil.rmtree(d)
         d.mkdir(parents=True)
-        sentinel.unlink(missing_ok=True)
-        return
-    if mode.startswith("snap:"):
-        name = mode.split(":", 1)[1]
-        if sentinel.exists() and sentinel.read_text().strip() == name:
-            return
-        src = snap_dir(prm, name, unit["label"])
-        if not src.exists():
-            sys.exit(f"run.py: snapshot {src} missing — run `prep` first")
+        return None
+    if mode == "import:w6":
+        marker = d.parent / f".imported-{bin_of(unit['label'])}-r{unit['rep']}"
+        if marker.exists():
+            return None
         if d.exists():
             shutil.rmtree(d)
-        shutil.copytree(src, d, symlinks=True)
-        sentinel.write_text(name + "\n")
-        return
+        d.mkdir(parents=True)
+        entry = relay_entry(unit["label"], prm)
+        log_path = d.parent / f"import-w6-{bin_of(unit['label'])}-r{unit['rep']}.log"
+        with open(log_path, "wb") as log:
+            stats = timed_import(prm, entry, str(d),
+                                 prm.path_of("regular"), log)
+        marker.touch()
+        return {"import": stats}
     sys.exit(f"run.py: unknown db mode {mode}")
 
 
@@ -631,7 +654,9 @@ def run_dir_for(prm, unit, unit_dir):
 def run_harness_unit(prm, unit, unit_dir):
     entry = relay_entry(unit["label"], prm)
     run_dir = run_dir_for(prm, unit, unit_dir)
-    prepare_db(prm, unit)
+    prep = prepare_db(prm, unit)
+    if prep:
+        (unit_dir / f"rep{unit['rep']}.import.json").write_text(json.dumps(prep))
     proc = start_relay(prm, unit, entry, run_dir)
     port_up = wait_port(prm.p("net", "port"), proc)
     warm = port_up and rtt_probe(prm)
@@ -650,7 +675,7 @@ def run_harness_unit(prm, unit, unit_dir):
             valid = valid and bool(o["valid"])
     return {"cmds_rc": codes, "relay_rc": proc.returncode, "port_up": port_up,
             "warmup_req": warm, "cold_cache": cold_done,
-            "db_bytes": du_bytes(db_dir(prm, unit["label"])), "valid": valid}
+            "db_bytes": du_bytes(db_dir(prm, unit)), "valid": valid}
 
 
 def run_relaybench_unit(prm, unit, unit_dir):
@@ -669,17 +694,42 @@ def run_relaybench_unit(prm, unit, unit_dir):
             "valid": rc == 0 and results.exists()}
 
 
-def import_argv(prm, entry, db):
-    """The relay's bulk-import command (JSONL on stdin, verify on)."""
+def impl_conf(prm, entry, db):
+    """Minimal offline config pointing the impl at `db`."""
     conf = prm.path_of("work") / "import" / f"{entry['impl']}-{bin_of(entry['label'])}.conf"
     conf.parent.mkdir(parents=True, exist_ok=True)
     if entry["impl"] == "nosfry":
         conf.write_text(f'[db]\npath = "{db}"\nmap_size = {LMDB_MAP}\n')
+    elif entry["impl"] == "strfry":
+        conf.write_text(f'db = "{db}"\ndbParams {{\n    mapsize = {LMDB_MAP}\n}}\n')
+    return conf
+
+
+def import_argv(prm, entry, db):
+    """The relay's bulk-import command (JSONL on stdin, verify on)."""
+    conf = impl_conf(prm, entry, db)
+    if entry["impl"] == "nosfry":
         return [entry["binary"], "import", "--config", str(conf)]
     if entry["impl"] == "strfry":
-        conf.write_text(f'db = "{db}"\ndbParams {{\n    mapsize = {LMDB_MAP}\n}}\n')
         return [entry["binary"], "--config", str(conf), "import"]
     sys.exit(f"run.py: {entry['label']} has no bulk import path")
+
+
+def count_events(prm, entry, db):
+    """Stored event count of an offline db, or None on failure."""
+    conf = impl_conf(prm, entry, db)
+    if entry["impl"] == "nosfry":
+        r = sh([entry["binary"], "scan", "--config", str(conf),
+                "--count", "{}"])
+    elif entry["impl"] == "strfry":
+        r = sh([entry["binary"], "--config", str(conf),
+                "scan", "--count", "{}"])
+    else:
+        return None
+    try:
+        return int(r.stdout.strip()) if r.returncode == 0 else None
+    except ValueError:
+        return None
 
 
 def timed_import(prm, entry, db, stdin_path, log):
@@ -699,11 +749,9 @@ def timed_import(prm, entry, db, stdin_path, log):
             "db_bytes": du_bytes(db)}
 
 
-def run_w5_unit(prm, unit, unit_dir):
-    """import -> start -> cold query -> warm query -> ingest -> restart."""
+def run_w5ro_unit(prm, unit, unit_dir):
+    """start -> drop_caches -> cold query -> warm query -> timed restart."""
     entry = relay_entry(unit["label"], prm)
-    label = unit["label"]
-    db = db_dir(prm, label)
     run_dir = run_dir_for(prm, unit, unit_dir)
     rep_json = unit_dir / f"rep{unit['rep']}.json"
     rep_log = unit_dir / f"rep{unit['rep']}.log"
@@ -711,16 +759,12 @@ def run_w5_unit(prm, unit, unit_dir):
     ms = None
     prepare_db(prm, unit)
     with open(rep_log, "ab") as log:
-        stats = timed_import(prm, entry, str(db),
-                             prm.path_of("d2") / "events.jsonl", log)
-        phases.append({"phase": "import", **stats})
         proc = start_relay(prm, unit, entry, run_dir)
         phases.append({"phase": "start",
                        "ok": wait_port(prm.p("net", "port"), proc) and rtt_probe(prm)})
         phases.append({"phase": "cold_cache", "done": drop_caches()})
         with open(rep_json, "a") as jf:
-            for name, argv in zip(("query_cold", "query_warm", "ingest_open"),
-                                  unit["cmds"]):
+            for name, argv in zip(("query_cold", "query_warm"), unit["cmds"]):
                 t0 = time.monotonic()
                 p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=log, text=True)
                 stdout, _ = p.communicate()
@@ -733,15 +777,42 @@ def run_w5_unit(prm, unit, unit_dir):
         stop_relay(proc)
         copy_generated(entry, run_dir, unit_dir)
     valid = all(p.get("rc", 0) == 0 for p in phases) and ms is not None
-    return {"phases": phases, "restart_ms": ms, "db_bytes": du_bytes(db),
+    return {"phases": phases, "restart_ms": ms,
+            "db_bytes": du_bytes(db_dir(prm, unit)),
             "cmds_rc": [p["rc"] for p in phases if "rc" in p], "valid": valid}
+
+
+def run_w5ingest_unit(prm, unit, unit_dir):
+    """record the stored count -> start -> ingest-open -> stop."""
+    entry = relay_entry(unit["label"], prm)
+    db = db_dir(prm, unit)
+    run_dir = run_dir_for(prm, unit, unit_dir)
+    rep_json = unit_dir / f"rep{unit['rep']}.json"
+    rep_log = unit_dir / f"rep{unit['rep']}.log"
+    prepare_db(prm, unit)
+    events_before = count_events(prm, entry, db)
+    proc = start_relay(prm, unit, entry, run_dir)
+    port_up = wait_port(prm.p("net", "port"), proc)
+    warm = port_up and rtt_probe(prm)
+    if port_up:
+        codes, outputs = run_cmds(prm, unit, rep_json, rep_log)
+    else:
+        codes, outputs = [-1], []
+    stop_relay(proc)
+    copy_generated(entry, run_dir, unit_dir)
+    valid = port_up and warm and all(c == 0 for c in codes)
+    for o in outputs:
+        if isinstance(o, dict) and "valid" in o:
+            valid = valid and bool(o["valid"])
+    return {"cmds_rc": codes, "relay_rc": proc.returncode, "port_up": port_up,
+            "warmup_req": warm, "events_before": events_before,
+            "db_bytes": du_bytes(db), "valid": valid}
 
 
 def run_w8_unit(prm, unit, unit_dir):
     """start -> ack-ingest (bg) -> sleep -> KILL -> restart -> ack-check."""
     entry = relay_entry(unit["label"], prm)
-    label = unit["label"]
-    db = db_dir(prm, label)
+    db = db_dir(prm, unit)
     run_dir = run_dir_for(prm, unit, unit_dir)
     rep_json = unit_dir / f"rep{unit['rep']}.json"
     rep_log = unit_dir / f"rep{unit['rep']}.log"
@@ -785,7 +856,8 @@ def run_w8_unit(prm, unit, unit_dir):
 
 
 RUNNERS = {"harness": run_harness_unit, "relaybench": run_relaybench_unit,
-           "w5": run_w5_unit, "w8": run_w8_unit}
+           "w5ro": run_w5ro_unit, "w5ingest": run_w5ingest_unit,
+           "w8": run_w8_unit}
 
 
 # ------------------------------------------------------------------
@@ -839,9 +911,9 @@ def cmd_prep(prm):
     harness = str(prm.path_of("harness"))
     work = prm.path_of("work")
 
-    # regular.jsonl = exactly the first w6.n regular events the w6
-    # snapshot imports. holdout-regular.jsonl = the next slice, sized
-    # for w6's additions plus w8's worst-case ingest.
+    # regular.jsonl = exactly the first w6.n regular events each w6
+    # rep imports into its own dir. holdout-regular.jsonl = the next
+    # slice, sized for w6's additions plus w8's worst-case ingest.
     n = int(prm.p("w6", "n"))
     w8 = prm.p("w8")
     max_diff = max(prm.p("w6", "diff")) / 100.0
@@ -858,39 +930,32 @@ def cmd_prep(prm):
         if r.returncode != 0:
             sys.exit("run.py: corpus-filter failed")
 
-    # Per-relay imports into db/<bin>, then snap/<set>/<bin>.
-    # d2 = events.jsonl (w2/w5), w6 = first N lines of regular.jsonl.
+    # One events.jsonl import per relay into work/db/<bin> — the
+    # shared db every read-only unit uses; there are no snapshots.
+    # A populated db is left in place and only counted.
     bins = sorted({bin_of(l) for wl in ("w2", "w5", "w6") for l in prm.p(wl, "relays")
                    if not bin_of(l).startswith("nostr-rs")})
-    n_file = work / f"first-{n}-regular.jsonl"
-    with open(prm.path_of("regular"), "rb") as fin, open(n_file, "wb") as fout:
-        for i, line in enumerate(fin):
-            if i >= n:
-                break
-            fout.write(line)
     import_log = prm.path_of("results") / "prep-imports.jsonl"
     import_log.parent.mkdir(parents=True, exist_ok=True)
     with open(import_log, "a") as jf:
-        for snapset, corpus in (("d2", events), ("w6", n_file)):
-            for bin_name in bins:
-                label = bin_name if snapset == "d2" else f"{bin_name} (w6)"
-                entry = relay_entry(bin_name, prm)
-                db = work / "db" / bin_name
+        for bin_name in bins:
+            entry = relay_entry(bin_name, prm)
+            db = work / "db" / bin_name
+            stored = count_events(prm, entry, db)
+            if stored:
+                stats = {"skipped": f"db already imported ({stored} events)",
+                         "db_bytes": du_bytes(db)}
+            else:
                 if db.exists():
                     shutil.rmtree(db)
                 db.mkdir(parents=True)
-                with open(work / f"import-{snapset}-{bin_name}.log", "wb") as log:
-                    stats = timed_import(prm, entry, str(db), corpus, log)
-                dst = snap_dir(prm, snapset, bin_name)
-                if dst.exists():
-                    shutil.rmtree(dst)
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(db, dst, symlinks=True)
-                snap_sentinel(prm, bin_name).write_text(snapset + "\n")
-                jf.write(json.dumps({"snapshot": snapset, "label": bin_name,
-                                     "corpus": str(corpus), **stats}) + "\n")
-                print(f"prep: {snapset}/{label}: {stats['wall_secs']}s, "
-                      f"{stats['db_bytes']} bytes, rc={stats['rc']}")
+                with open(work / f"import-d2-{bin_name}.log", "wb") as log:
+                    stats = timed_import(prm, entry, str(db), events, log)
+                stored = count_events(prm, entry, db)
+            jf.write(json.dumps({"corpus": "d2", "label": bin_name,
+                                 "stored": stored, **stats}) + "\n")
+            print(f"prep: {bin_name}: stored={stored}, "
+                  f"{stats['db_bytes']} bytes")
     print("prep: done")
 
 
@@ -962,7 +1027,7 @@ def main():
         if not args.dry_run:
             cmd_prep(prm)
         else:
-            print("[dry] prep: corpus-filter + per-relay imports + snapshots")
+            print("[dry] prep: corpus-filter + per-relay d2 import")
         return
     if args.cmd == "status":
         cmd_status(prm)
