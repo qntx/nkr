@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod corpus;
 mod gate;
 mod hist;
+mod openloop;
 mod sampler;
 mod soak;
 
@@ -166,6 +167,50 @@ enum Cmd {
         #[arg(long, default_value_t = 1900)]
         authors: usize,
     },
+    /// Open-loop ingest: C connections at a fixed scheduled rate.
+    IngestOpen {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        conns: usize,
+        /// Events per second across all connections.
+        #[arg(long)]
+        rate: f64,
+        #[arg(long)]
+        duration: u64,
+        #[arg(long, default_value_t = 0)]
+        warmup: u64,
+        #[arg(long)]
+        deflate: bool,
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long, default_value = "ingest-open")]
+        label: String,
+    },
+    /// Closed-loop ingest: K outstanding events per connection.
+    IngestClosed {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        conns: usize,
+        /// Outstanding events per connection.
+        #[arg(long)]
+        window: usize,
+        #[arg(long)]
+        duration: u64,
+        #[arg(long, default_value_t = 0)]
+        warmup: u64,
+        #[arg(long)]
+        deflate: bool,
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long, default_value = "ingest-closed")]
+        label: String,
+    },
     /// Generate the D2 synthetic corpus and its query sidecar.
     Gen {
         /// D1 template corpus: a JSON array of events, plain or gzipped.
@@ -227,7 +272,11 @@ fn b64(bytes: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(char::from(T[(n >> 18) as usize & 63]));
         out.push(char::from(T[(n >> 12) as usize & 63]));
@@ -815,7 +864,7 @@ async fn conns(
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), String> {
     match Cli::parse().cmd {
         Cmd::Fanout {
             url,
@@ -877,6 +926,56 @@ async fn main() {
             let url = url.parse().expect("valid ws(s) url");
             gate::wake(url, subs, idle_secs, rounds, events, auth).await;
         }
+        Cmd::IngestOpen {
+            url,
+            corpus,
+            conns,
+            rate,
+            duration,
+            warmup,
+            deflate,
+            pid,
+            label,
+        } => {
+            let url = url.parse().expect("valid ws url");
+            let opts = openloop::IngestOpts {
+                corpus,
+                conns,
+                duration,
+                warmup,
+                deflate,
+                pid,
+                label,
+            };
+            openloop::ingest_open(url, opts, rate)
+                .await
+                .map_err(|e| format!("ingest-open: {e}"))?;
+        }
+        Cmd::IngestClosed {
+            url,
+            corpus,
+            conns,
+            window,
+            duration,
+            warmup,
+            deflate,
+            pid,
+            label,
+        } => {
+            let url = url.parse().expect("valid ws url");
+            let opts = openloop::IngestOpts {
+                corpus,
+                conns,
+                duration,
+                warmup,
+                deflate,
+                pid,
+                label,
+            };
+            openloop::ingest_closed(url, opts, window)
+                .await
+                .map_err(|e| format!("ingest-closed: {e}"))?;
+        }
         Cmd::Gen {
             template,
             events,
@@ -900,13 +999,8 @@ async fn main() {
                 out,
                 threads,
             };
-            match corpus::run(&opts) {
-                Ok(result) => println!("{result}"),
-                Err(e) => {
-                    eprintln!("gen failed: {e}");
-                    std::process::exit(1);
-                }
-            }
+            let result = corpus::run(&opts).map_err(|e| format!("gen: {e}"))?;
+            println!("{result}");
         }
         Cmd::Subbudget { url, authors } => {
             let url = url.parse().expect("valid ws(s) url");
@@ -955,4 +1049,5 @@ async fn main() {
             .await;
         }
     }
+    Ok(())
 }
