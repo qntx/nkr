@@ -254,7 +254,9 @@ pub(crate) async fn neg(
                     Some(msg) => {
                         let wire = neg_msg_wire(SUB, &msg);
                         bytes.sent(&wire, msg.len());
-                        ws.send(Frame::text(wire)).await.map_err(|e| e.to_string())?;
+                        ws.send(Frame::text(wire))
+                            .await
+                            .map_err(|e| e.to_string())?;
                     }
                     // Final empty response: the measured phase ends.
                     None => break t0.elapsed().as_secs_f64() * 1000.0,

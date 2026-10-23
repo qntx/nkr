@@ -956,7 +956,11 @@ pub(crate) fn run(opts: &GenOpts) -> Result<Value, String> {
 pub(crate) fn u64_field(text: &str, name: &str) -> Option<u64> {
     let key = format!("\"{name}\"");
     let pos = text.find(&key)? + key.len();
-    let rest = text.get(pos..)?.trim_start().strip_prefix(':')?.trim_start();
+    let rest = text
+        .get(pos..)?
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
     rest.get(..digits)?.parse().ok()
 }

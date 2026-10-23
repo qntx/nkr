@@ -185,8 +185,7 @@ async fn ack_conn(
             let Some(ev) = corpus.get(slot) else {
                 break;
             };
-            let scheduled =
-                SETTLE + Duration::from_nanos((slot as f64 / rate * 1e9) as u64);
+            let scheduled = SETTLE + Duration::from_nanos((slot as f64 / rate * 1e9) as u64);
             tokio::select! {
                 _ = tokio::time::sleep_until((base + scheduled).into()) => {}
                 _ = stop.changed() => return Ok::<(), String>(()),

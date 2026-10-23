@@ -478,9 +478,7 @@ async fn connect_spread(
         Ok(ws) => Ok((ws, false)),
         Err(_) => {
             let addr = std::net::IpAddr::from([127, 0, 0, 2 + (j % 8) as u8]);
-            connect_bound(url, deflate, addr)
-                .await
-                .map(|ws| (ws, true))
+            connect_bound(url, deflate, addr).await.map(|ws| (ws, true))
         }
     }
 }
