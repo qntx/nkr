@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod corpus;
 mod gate;
 mod hist;
+mod neg;
 mod openloop;
 mod query;
 mod sampler;
@@ -239,6 +240,51 @@ enum Cmd {
         pid: Option<u32>,
         #[arg(long, default_value = "query")]
         label: String,
+    },
+    /// NIP-77 set reconciliation against a known corpus state.
+    Neg {
+        #[arg(long)]
+        url: String,
+        /// regular.jsonl: the relay holds exactly its first `--base` lines.
+        #[arg(long)]
+        corpus: PathBuf,
+        /// First N corpus lines the relay holds.
+        #[arg(long)]
+        base: usize,
+        /// holdout-regular.jsonl: additions the relay does not hold.
+        #[arg(long)]
+        holdout_corpus: PathBuf,
+        /// Percentage of `--base` split evenly between removals and
+        /// holdout additions.
+        #[arg(long)]
+        diff_pct: f64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Per-frame negentropy payload cap in bytes.
+        #[arg(long, default_value_t = 60_000)]
+        frame_size_limit: u64,
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long, default_value = "neg")]
+        label: String,
+    },
+    /// Filter corpus JSONL to the regular-kind set every relay stores.
+    CorpusFilter {
+        /// Keep only regular kinds (1, 2, 4-44, 1000-9999).
+        #[arg(long)]
+        regular: bool,
+        /// Keep at most N items after filtering and skipping.
+        #[arg(long)]
+        first: Option<usize>,
+        /// Skip this many kept items first (the holdout split).
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// Input JSONL corpus.
+        #[arg(long = "in")]
+        input: PathBuf,
+        /// Output JSONL corpus.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Generate the D2 synthetic corpus and its query sidecar.
     Gen {
@@ -1061,6 +1107,42 @@ async fn main() -> Result<(), String> {
             query::query(url, opts)
                 .await
                 .map_err(|e| format!("query: {e}"))?;
+        }
+        Cmd::Neg {
+            url,
+            corpus,
+            base,
+            holdout_corpus,
+            diff_pct,
+            seed,
+            frame_size_limit,
+            pid,
+            label,
+        } => {
+            let url = url.parse().expect("valid ws url");
+            neg::neg(
+                url,
+                corpus,
+                holdout_corpus,
+                base,
+                diff_pct,
+                seed,
+                frame_size_limit,
+                pid,
+                label,
+            )
+            .await
+            .map_err(|e| format!("neg: {e}"))?;
+        }
+        Cmd::CorpusFilter {
+            regular,
+            first,
+            skip,
+            input,
+            out,
+        } => {
+            corpus::corpus_filter(regular, first, skip, &input, &out)
+                .map_err(|e| format!("corpus-filter: {e}"))?;
         }
         Cmd::Gen {
             template,

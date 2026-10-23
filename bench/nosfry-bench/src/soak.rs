@@ -23,6 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use yawc::{Frame, OpCode, TcpWebSocket};
 
+use crate::neg::{neg_err, neg_msg_wire, neg_open_wire, neg_recv, recv_json, unhex};
 use crate::{Author, author, connect, hex, proc_stats, sign_event, unix_now};
 
 const AUTHORS: usize = 64;
@@ -161,19 +162,6 @@ fn mix(
         ]);
         (key, 1, tags, format!("soak note {n}"), now)
     }
-}
-
-/// Next text frame parsed as JSON; `None` when the socket dies.
-async fn recv_json(ws: &mut TcpWebSocket) -> Option<Value> {
-    while let Some(frame) = ws.next().await {
-        if frame.opcode() != OpCode::Text {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(frame.as_str()) {
-            return Some(v);
-        }
-    }
-    None
 }
 
 /// Await the `OK` for `id`, skipping other frames; `None` when the
@@ -506,53 +494,6 @@ async fn slow_spawner(
             drop(ws);
         });
     }
-}
-
-/// `["NEG-OPEN",sub,filter,"<hex>"]`.
-fn neg_open_wire(sub: &str, filter: &str, msg: &[u8]) -> String {
-    format!("[\"NEG-OPEN\",\"{sub}\",{filter},\"{}\"]", hex(msg))
-}
-
-/// `["NEG-MSG",sub,"<hex>"]`.
-fn neg_msg_wire(sub: &str, msg: &[u8]) -> String {
-    format!("[\"NEG-MSG\",\"{sub}\",\"{}\"]", hex(msg))
-}
-
-/// Hex-decode a wire payload.
-fn unhex(text: &str) -> Result<Vec<u8>, String> {
-    if !text.len().is_multiple_of(2) {
-        return Err("odd hex".to_owned());
-    }
-    (0..text.len() / 2)
-        .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).map_err(|e| e.to_string()))
-        .collect()
-}
-
-/// Read until a `NEG-MSG` or `NEG-ERR` for `sub` and return it.
-async fn neg_recv(ws: &mut TcpWebSocket, sub: &str) -> Result<Value, String> {
-    while let Some(v) = recv_json(ws).await {
-        if v.get(1).and_then(Value::as_str) != Some(sub) {
-            match v.get(0).and_then(Value::as_str) {
-                Some("CLOSED") | Some("NOTICE") => return Err(v.to_string()),
-                _ => continue,
-            }
-        }
-        if matches!(
-            v.get(0).and_then(Value::as_str),
-            Some("NEG-MSG" | "NEG-ERR")
-        ) {
-            return Ok(v);
-        }
-    }
-    Err("connection closed".to_owned())
-}
-
-/// The message of a `NEG-ERR` frame as an error.
-fn neg_err(v: &Value) -> String {
-    v.get(2)
-        .and_then(Value::as_str)
-        .unwrap_or("NEG-ERR")
-        .to_owned()
 }
 
 /// Reconcile until the client is done, then `NEG-CLOSE`.
