@@ -357,7 +357,9 @@ def units_w6(prm, pilot):
 def units_w7(prm, pilot):
     w = prm.p("w7")
     reps = prm.reps("w7", pilot)
-    dur = int(prm.p("pilot", "secs")) if pilot else w["duration_secs"]
+    # The soak's duration lives in [w7] itself — a pilot file sets a
+    # few minutes, the real one 24 h; pilot.secs is too short to soak.
+    dur = int(w["duration_secs"])
     port = str(prm.p("net", "port"))
     out = []
     for rep in range(1, reps + 1):
