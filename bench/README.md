@@ -123,7 +123,10 @@ per 10 s, one vanish round per minute; `DURATION` and `SAMPLE`
 (seconds between samples) plus every workload knob
 (`PUBLISHERS`, `RATE`, `SUBSCRIBERS`, `CHURN_RATE`, `SLOW_EVERY`,
 `NEG_EVERY`, `VANISH_EVERY`)
-are environment-overridable.
+are environment-overridable. `DEFLATE=1` makes every harness
+connection negotiate permessage-deflate; `PORT`, `RELAY_CPUS`, and
+`HARNESS_CPUS` move the soak off the default port and cores — a soak
+can share the box with a benchmark run this way.
 
 Each `<name>` is a binary in `/bench/bin`; strfry always runs alongside.
 

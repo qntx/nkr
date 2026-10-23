@@ -210,6 +210,7 @@ async fn publisher(
     owned: Vec<Author>,
     authors: Arc<Vec<String>>,
     each_per_sec: f64,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -217,7 +218,7 @@ async fn publisher(
     let mut recent: VecDeque<(usize, String)> = VecDeque::with_capacity(100);
     let mut replaceable = BTreeMap::new();
     while !*stop.borrow() {
-        let mut ws = match connect(&url, false).await {
+        let mut ws = match connect(&url, deflate).await {
             Ok(ws) => ws,
             Err(_) => {
                 counters.errors.fetch_add(1, Ordering::Relaxed);
@@ -275,12 +276,13 @@ async fn publisher(
 async fn subscriber(
     url: url::Url,
     filter: Value,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
     let req = json!(["REQ", "soak", filter]).to_string();
     while !*stop.borrow() {
-        let mut ws = match connect(&url, false).await {
+        let mut ws = match connect(&url, deflate).await {
             Ok(ws) => ws,
             Err(_) => {
                 counters.sub_reconnects.fetch_add(1, Ordering::Relaxed);
@@ -316,6 +318,7 @@ async fn churn_once(
     url: url::Url,
     index: usize,
     authors: Arc<Vec<String>>,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -327,7 +330,7 @@ async fn churn_once(
     ];
     let filter = &filters[index % filters.len()];
     let result = async {
-        let mut ws = connect(&url, false).await?;
+        let mut ws = connect(&url, deflate).await?;
         ws.send(Frame::text(json!(["REQ", "churn", filter]).to_string()))
             .await
             .map_err(|e| e.to_string())?;
@@ -366,6 +369,7 @@ async fn count_once(
     url: url::Url,
     index: usize,
     authors: Arc<Vec<String>>,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -376,7 +380,7 @@ async fn count_once(
     ];
     let filter = &filters[index % filters.len()];
     let result = async {
-        let mut ws = connect(&url, false).await?;
+        let mut ws = connect(&url, deflate).await?;
         ws.send(Frame::text(json!(["COUNT", "churn", filter]).to_string()))
             .await
             .map_err(|e| e.to_string())?;
@@ -417,6 +421,7 @@ async fn churner(
     url: url::Url,
     rate_per_sec: f64,
     authors: Arc<Vec<String>>,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -437,6 +442,7 @@ async fn churner(
                 url.clone(),
                 index,
                 Arc::clone(&authors),
+                deflate,
                 Arc::clone(&counters),
                 stop.clone(),
             ));
@@ -445,6 +451,7 @@ async fn churner(
                 url.clone(),
                 index,
                 Arc::clone(&authors),
+                deflate,
                 Arc::clone(&counters),
                 stop.clone(),
             ));
@@ -460,6 +467,7 @@ async fn churner(
 async fn slow_spawner(
     url: url::Url,
     every: Duration,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -477,7 +485,7 @@ async fn slow_spawner(
         let counters = Arc::clone(&counters);
         let mut held = stop.clone();
         tokio::spawn(async move {
-            let Ok(mut ws) = connect(&url, false).await else {
+            let Ok(mut ws) = connect(&url, deflate).await else {
                 return;
             };
             if ws
@@ -600,12 +608,13 @@ async fn neg_once(
     url: url::Url,
     index: usize,
     authors: Arc<Vec<String>>,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
     let variant = index % 3;
     let result = async {
-        let mut ws = connect(&url, false).await?;
+        let mut ws = connect(&url, deflate).await?;
         let mut storage = NegentropyStorageVector::new();
         storage.seal().map_err(|e| e.to_string())?;
         let mut neg = Negentropy::borrowed(&storage, 500_000).map_err(|e| e.to_string())?;
@@ -660,6 +669,7 @@ async fn neg_spawner(
     url: url::Url,
     every: Duration,
     authors: Arc<Vec<String>>,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -678,6 +688,7 @@ async fn neg_spawner(
             url.clone(),
             index,
             Arc::clone(&authors),
+            deflate,
             Arc::clone(&counters),
             stop.clone(),
         ));
@@ -707,11 +718,12 @@ fn random_author(round: u64) -> Author {
 async fn vanish_once(
     url: url::Url,
     round: u64,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
     let result = async {
-        let mut ws = connect(&url, false).await?;
+        let mut ws = connect(&url, deflate).await?;
         let author = random_author(round);
         for n in 0..VANISH_EVENTS {
             let (id, event) = sign_event(
@@ -794,6 +806,7 @@ async fn req_kinds(ws: &mut TcpWebSocket, filter: Value) -> Result<Vec<Option<u6
 async fn vanish_spawner(
     url: url::Url,
     every: Duration,
+    deflate: bool,
     counters: Arc<Counters>,
     mut stop: watch::Receiver<bool>,
 ) {
@@ -811,6 +824,7 @@ async fn vanish_spawner(
         tokio::spawn(vanish_once(
             url.clone(),
             round,
+            deflate,
             Arc::clone(&counters),
             stop.clone(),
         ));
@@ -904,11 +918,13 @@ fn sample_line(
     db_dir: &Option<PathBuf>,
     metrics: Option<&str>,
     counters: &Counters,
+    deflate: bool,
 ) -> Value {
     let m = metrics.map(parse_metrics);
     let mut line = counters.snapshot();
     let obj = line.as_object_mut().expect("snapshot is an object");
     obj.insert("type".into(), json!("sample"));
+    obj.insert("deflate".into(), json!(deflate));
     obj.insert("t".into(), json!(t));
     let stats = pid.and_then(proc_stats);
     obj.insert(
@@ -978,6 +994,7 @@ pub(crate) async fn run(
     neg_every_secs: u64,
     vanish_every_secs: u64,
     label: String,
+    deflate: bool,
 ) {
     let counters = Arc::new(Counters::default());
     let authors = Arc::new(
@@ -1000,6 +1017,7 @@ pub(crate) async fn run(
             owned,
             Arc::clone(&authors),
             rate / publishers.max(1) as f64,
+            deflate,
             Arc::clone(&counters),
             stop_rx.clone(),
         )));
@@ -1014,6 +1032,7 @@ pub(crate) async fn run(
         tasks.push(tokio::spawn(subscriber(
             url.clone(),
             filter,
+            deflate,
             Arc::clone(&counters),
             stop_rx.clone(),
         )));
@@ -1023,6 +1042,7 @@ pub(crate) async fn run(
         url.clone(),
         churn_rate,
         Arc::clone(&authors),
+        deflate,
         Arc::clone(&counters),
         stop_rx.clone(),
     )));
@@ -1031,6 +1051,7 @@ pub(crate) async fn run(
         tasks.push(tokio::spawn(slow_spawner(
             url.clone(),
             Duration::from_secs(slow_every_secs),
+            deflate,
             Arc::clone(&counters),
             stop_rx.clone(),
         )));
@@ -1041,6 +1062,7 @@ pub(crate) async fn run(
             url.clone(),
             Duration::from_secs(neg_every_secs),
             Arc::clone(&authors),
+            deflate,
             Arc::clone(&counters),
             stop_rx.clone(),
         )));
@@ -1050,6 +1072,7 @@ pub(crate) async fn run(
         tasks.push(tokio::spawn(vanish_spawner(
             url.clone(),
             Duration::from_secs(vanish_every_secs),
+            deflate,
             Arc::clone(&counters),
             stop_rx.clone(),
         )));
@@ -1068,7 +1091,7 @@ pub(crate) async fn run(
         };
         println!(
             "{}",
-            sample_line(t, pid, &db_dir, body.as_deref(), &counters)
+            sample_line(t, pid, &db_dir, body.as_deref(), &counters, deflate)
         );
         if start.elapsed() >= deadline {
             break;
@@ -1111,6 +1134,7 @@ pub(crate) async fn run(
     obj.insert("sync_memory_after_close".into(), opt(sync_drained));
     obj.insert("subscription_bytes_after_close".into(), opt(subs_drained));
     obj.insert("label".into(), json!(label));
+    obj.insert("deflate".into(), json!(deflate));
     obj.insert("t".into(), json!(start.elapsed().as_secs()));
     let stats = pid.and_then(proc_stats);
     obj.insert(

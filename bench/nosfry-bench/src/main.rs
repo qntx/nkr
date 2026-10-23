@@ -117,6 +117,9 @@ enum Cmd {
         vanish_every_secs: u64,
         #[arg(long, default_value = "")]
         label: String,
+        /// Negotiate permessage-deflate on every connection.
+        #[arg(long)]
+        deflate: bool,
     },
     /// One connection, n sequential REQ→EOSE round-trips.
     Rtt {
@@ -844,6 +847,7 @@ async fn main() {
             neg_every_secs,
             vanish_every_secs,
             label,
+            deflate,
         } => {
             let url = url.parse().expect("valid ws url");
             let metrics_url = metrics_url.map(|u| u.parse().expect("valid metrics url"));
@@ -862,6 +866,7 @@ async fn main() {
                 neg_every_secs,
                 vanish_every_secs,
                 label,
+                deflate,
             )
             .await;
         }
