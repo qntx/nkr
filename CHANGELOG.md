@@ -10,6 +10,15 @@ The format is based on [Keep a Changelog]; this project follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-23
+
+### Added
+
+- A `restored <conns> connections, <subs> subscriptions (<n> rows
+dropped)` line in the Workers edition's log whenever the Durable
+  Object is constructed, proving a hibernation wake restored the
+  still-attached sockets and subscriptions.
+
 ### Changed
 
 - yawc 0.5.0 on the native edition: lazy deflate state, a shared
@@ -64,7 +73,7 @@ The format is based on [Keep a Changelog]; this project follows
   `Filter::approx_bytes` sum of its filters — an estimate of the
   compiled filters plus their monitor index entries — and a REQ
   that would cross the budget answers `CLOSED blocked:
-  subscription capacity exhausted`; `CLOSE`, disconnects, and
+subscription capacity exhausted`; `CLOSE`, disconnects, and
   relay-side closes release the charge. New gauge
   `nosfry_subscription_bytes` reports the shared total, and the
   soak harness asserts it drains to zero once every connection
@@ -500,6 +509,7 @@ down`; CLOSE is never charged.
   - relayBench and nosfry-bench drivers;
   - the `aggregate.py` summary script.
 
-[Unreleased]: https://github.com/qntx/nosfry/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/qntx/nosfry/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/qntx/nosfry/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/qntx/nosfry/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/qntx/nosfry/releases/tag/v0.1.0

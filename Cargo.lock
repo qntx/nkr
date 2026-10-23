@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "base64",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-conformance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "faster-hex",
@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "criterion",
@@ -1335,7 +1335,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-lmdb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "foldhash",
@@ -1349,7 +1349,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-sql"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "faster-hex",
  "nosfry-core",
@@ -1360,7 +1360,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nosfry-core",
  "nosfry-lmdb",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "nosfry-worker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "console_error_panic_hook",
