@@ -135,8 +135,8 @@ fn classify_ok(text: &str) -> Option<(&str, bool, &str)> {
     if !text.starts_with("[\"OK\",\"") {
         return None;
     }
-    let id = text.get(6..70)?;
-    let rest = &text[70..];
+    let id = text.get(7..71)?;
+    let rest = &text[72..];
     let accepted = rest.starts_with(",true");
     let reason = rest
         .split(',')
@@ -623,3 +623,33 @@ pub(crate) async fn ingest_closed(
     Ok(())
 }
 // marker-1792749036
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_ok_parses_the_wire_shape() {
+        let id = "ab".repeat(32);
+        let frame = format!("[\"OK\",\"{id}\",true,\"\"]");
+        let (got, accepted, reason) = classify_ok(&frame).unwrap();
+        assert_eq!(got, id);
+        assert!(accepted);
+        assert_eq!(reason, "");
+
+        let frame = format!("[\"OK\",\"{id}\",false,\"duplicate: already have this event\"]");
+        let (_, accepted, reason) = classify_ok(&frame).unwrap();
+        assert!(!accepted);
+        assert_eq!(reason, "duplicate: already have this event");
+
+        assert!(classify_ok(r#"["EVENT","s",{}]"#).is_none());
+    }
+
+    #[test]
+    fn unhex_roundtrips() {
+        let id = "ab".repeat(32);
+        assert_eq!(unhex(&id), Some([0xab; 32]));
+        assert_eq!(unhex(&id[..63]), None);
+        assert_eq!(unhex(&format!("z{}", &id[..63])), None);
+    }
+}
