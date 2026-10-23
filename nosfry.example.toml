@@ -172,12 +172,15 @@ monitors = 3
 
 [relay.compression]
 # Negotiate permessage-deflate. On by default: yawc bounds the
-# inflated size of an inbound message by max_websocket_payload_size
-# since 0.4.4.
+# inflated size of an inbound message by max_websocket_payload_size.
 enabled = true
-# Keep the LZ77 sliding window between messages (false = no context
-# takeover either direction).
-sliding_window = true
+# Keep the LZ77 sliding window between messages. false (default) =
+# no context takeover either direction, deflate state shared from a
+# server-wide pool, a few KiB per connection, ~18-52% more bytes than
+# the sliding window buys. true = strfry's default: per-connection
+# deflate state (~370 KiB once a message was compressed) for the
+# better ratio — for bandwidth-bound relays with few connections.
+sliding_window = false
 
 [relay.info]
 # NIP-11 relay information fields. `pubkey` and `self` must be

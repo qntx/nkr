@@ -540,9 +540,13 @@ async fn oversized_frame_closes_connection() {
 /// differs from the inflated size, which a library client hides.
 struct DeflateSocket {
     stream: tokio::net::TcpStream,
-    /// Inflate state persists across frames: with the sliding window
-    /// negotiated the compressor may back-reference earlier messages.
+    /// Inflate state persists across messages when the negotiation
+    /// kept context takeover; otherwise it resets per message.
     inflater: flate2::Decompress,
+    /// The server's `Sec-WebSocket-Extensions` value, lowercased.
+    extensions: String,
+    /// Whether the server kept the sliding window for its sender.
+    takeover: bool,
 }
 
 impl DeflateSocket {
@@ -567,14 +571,22 @@ impl DeflateSocket {
         }
         let head = String::from_utf8(head).unwrap();
         assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+        let extensions = head
+            .to_ascii_lowercase()
+            .lines()
+            .find_map(|line| line.strip_prefix("sec-websocket-extensions:"))
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_owned();
         assert!(
-            head.to_ascii_lowercase()
-                .contains("sec-websocket-extensions: permessage-deflate"),
+            extensions.contains("permessage-deflate"),
             "deflate was not negotiated: {head}"
         );
         Self {
             stream,
             inflater: flate2::Decompress::new(false),
+            takeover: !extensions.contains("server_no_context_takeover"),
+            extensions,
         }
     }
 
@@ -622,8 +634,12 @@ impl DeflateSocket {
         Some((rsv1, opcode, payload))
     }
 
-    /// Decompress one message through the persistent window.
+    /// Decompress one message. Without context takeover each message
+    /// is a fresh deflate stream, so the inflater resets first.
     fn inflate(&mut self, data: &[u8]) -> Vec<u8> {
+        if !self.takeover {
+            self.inflater.reset(false);
+        }
         let mut wire = data.to_vec();
         wire.extend_from_slice(&[0, 0, 0xff, 0xff]);
         let mut out = Vec::with_capacity(wire.len() * 4 + 64);
@@ -663,12 +679,6 @@ fn deflate(text: &[u8]) -> Vec<u8> {
     out
 }
 
-/// One server frame, decompressed when RSV1 is set.
-async fn recv_deflated(ws: &mut DeflateSocket) -> Option<(u8, Vec<u8>)> {
-    let (_rsv1, opcode, payload) = ws.read_data().await?;
-    Some((opcode, payload))
-}
-
 /// A frame whose wire size is tiny but whose inflated size exceeds
 /// `max_websocket_payload_size` must close the connection with 1009
 /// without delivering anything (yawc#55, fixed by 0.4.4).
@@ -702,20 +712,25 @@ async fn compressed_inflation_over_limit_closes_1009() {
     relay.stop().await;
 }
 
-/// With deflate negotiated, a compressed EVENT under the limit is
-/// accepted and replies (OK, EVENT, EOSE) come back compressed.
+/// Default compression negotiates no context takeover in both
+/// directions; replies under the threshold (OK, EOSE) leave
+/// uncompressed while an EVENT delivery keeps RSV1 and inflates to
+/// the right JSON.
 #[tokio::test]
 async fn compressed_event_round_trip() {
     let mut config = common::config();
     config.relay.compression.enabled = true;
     let relay = Relay::start_with(config).await;
     let mut ws = DeflateSocket::connect(relay.addr).await;
+    assert!(ws.extensions.contains("server_no_context_takeover"));
+    assert!(ws.extensions.contains("client_no_context_takeover"));
 
     let ev = common::event(&key(7), 1, now(), &json!([]), "compressed");
     let id = json(ev.json())["id"].as_str().unwrap().to_owned();
     ws.send_frame(true, 0x1, &deflate(event_wire(&ev).as_bytes()))
         .await;
-    let (opcode, payload) = recv_deflated(&mut ws).await.unwrap();
+    let (rsv1, opcode, payload) = ws.read_data().await.unwrap();
+    assert!(!rsv1, "an OK is under the compression threshold");
     assert_eq!(opcode, 0x1);
     let ok = json(std::str::from_utf8(&payload).unwrap());
     assert_eq!(ok[0], "OK");
@@ -732,15 +747,18 @@ async fn compressed_event_round_trip() {
     let mut saw_eose = false;
     for _ in 0..4 {
         let (rsv1, opcode, payload) = ws.read_data().await.unwrap();
-        assert!(rsv1, "relayed frames must be compressed once negotiated");
         assert_eq!(opcode, 0x1);
         let frame = json(std::str::from_utf8(&payload).unwrap());
         match frame[0].as_str().unwrap() {
             "EVENT" => {
+                assert!(rsv1, "an event message is over the threshold");
                 assert_eq!(frame[2]["id"], id);
                 saw_event = true;
             }
-            "EOSE" => saw_eose = true,
+            "EOSE" => {
+                assert!(!rsv1, "an EOSE is under the compression threshold");
+                saw_eose = true;
+            }
             other => panic!("unexpected frame: {other}"),
         }
         if saw_event && saw_eose {
@@ -748,6 +766,47 @@ async fn compressed_event_round_trip() {
         }
     }
     assert!(saw_event && saw_eose);
+    relay.stop().await;
+}
+
+/// With `sliding_window` the negotiation offers neither
+/// no-context-takeover parameter and one persistent inflater decodes
+/// consecutive compressed EVENTs (the second may back-reference the
+/// first).
+#[tokio::test]
+async fn sliding_window_decodes_with_one_inflater() {
+    let mut config = common::config();
+    config.relay.compression.sliding_window = true;
+    let relay = Relay::start_with(config).await;
+    let mut ws = DeflateSocket::connect(relay.addr).await;
+    assert!(!ws.extensions.contains("no_context_takeover"));
+
+    ws.send_frame(
+        true,
+        0x1,
+        &deflate(req_wire("s", "{\"kinds\":[1],\"#t\":[\"sw-x\"],\"limit\":0}").as_bytes()),
+    )
+    .await;
+    let (_, opcode, _) = ws.read_data().await.unwrap();
+    assert_eq!(opcode, 0x1, "EOSE expected");
+
+    let mut publisher = relay.connect().await;
+    let mut ids = Vec::new();
+    for content in ["first", "second"] {
+        let ev = common::event(&key(7), 1, now(), &json!([["t", "sw-x"]]), content);
+        ids.push(json(ev.json())["id"].as_str().unwrap().to_owned());
+        send_text(&mut publisher, &event_wire(&ev)).await;
+        let ok = json(&recv_text(&mut publisher, T).await);
+        assert_eq!(ok[0], "OK");
+    }
+    for want in &ids {
+        let (rsv1, opcode, payload) = ws.read_data().await.unwrap();
+        assert!(rsv1, "an event message is over the threshold");
+        assert_eq!(opcode, 0x1);
+        let frame = json(std::str::from_utf8(&payload).unwrap());
+        assert_eq!(frame[0], "EVENT");
+        assert_eq!(frame[2]["id"], *want);
+    }
     relay.stop().await;
 }
 

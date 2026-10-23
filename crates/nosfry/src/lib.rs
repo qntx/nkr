@@ -268,6 +268,13 @@ fn apply_reload(
     }
 }
 
+/// The shared deflate state pool, sized for the messages compressed
+/// at the same moment — the runtime's worker count, not the
+/// connection count. Must run inside the runtime.
+fn deflate_pool() -> yawc::DeflatePool {
+    yawc::DeflatePool::new(tokio::runtime::Handle::current().metrics().num_workers())
+}
+
 /// A running server: router state plus the worker threads.
 #[derive(Debug)]
 pub struct Server {
@@ -289,6 +296,11 @@ impl Server {
     ///
     /// [`ServerError::Store`] when the store fails to open,
     /// [`ServerError::Spawn`] when a worker thread cannot start.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime: the deflate pool is sized from the
+    /// current runtime's worker count.
     pub fn new(config: Config) -> Result<Self, ServerError> {
         let config = Arc::new(config);
         let store = Arc::new(Store::open(&config.db.path, &config.store_options())?);
@@ -415,6 +427,7 @@ impl Server {
                 sync_memory,
                 subscription_bytes,
                 metrics,
+                deflate_pool: deflate_pool(),
                 moderation: mod_rx,
                 live_tx: live_tx.clone(),
                 limiter: Arc::new(limiter::ConnectionLimiter::new(

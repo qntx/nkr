@@ -133,9 +133,14 @@ pub struct Threads {
 pub struct Compression {
     /// Negotiate permessage-deflate. On by default: yawc bounds the
     /// inflated size of an inbound message by
-    /// `max_websocket_payload_size` (0.4.4).
+    /// `max_websocket_payload_size`.
     pub enabled: bool,
-    /// Keep the LZ77 sliding window between messages.
+    /// Keep the LZ77 sliding window between messages (context
+    /// takeover). Off by default: deflate state then comes from a
+    /// server-wide pool and an idle connection costs only its socket
+    /// buffers, at 18–52% more bytes than the sliding window buys.
+    /// `true` is strfry's default and keeps ~370 KiB of per-connection
+    /// state once a message was compressed.
     pub sliding_window: bool,
 }
 
@@ -219,7 +224,7 @@ impl Default for Compression {
     fn default() -> Self {
         Self {
             enabled: true,
-            sliding_window: true,
+            sliding_window: false,
         }
     }
 }
