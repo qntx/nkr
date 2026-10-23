@@ -22,7 +22,7 @@ use crate::management;
 use crate::metrics::Metrics;
 
 /// Everything a connection handler needs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct AppState {
     /// Live-reloadable state (config, limits, NIP-11, policy).
     pub(crate) live: watch::Receiver<Arc<Live>>,
@@ -32,6 +32,10 @@ pub(crate) struct AppState {
     pub(crate) metrics: Arc<Metrics>,
     /// Simultaneous-connection caps.
     pub(crate) limiter: Arc<ConnectionLimiter>,
+    /// Server-wide deflate state for connections that negotiate no
+    /// context takeover; sized for the messages compressed at the same
+    /// moment, not for connections.
+    pub(crate) deflate_pool: yawc::DeflatePool,
     /// Process-wide reserved sync-storage bytes (the
     /// `nosfry_sync_memory_bytes` gauge).
     pub(crate) sync_memory: Arc<std::sync::atomic::AtomicUsize>,
@@ -44,6 +48,22 @@ pub(crate) struct AppState {
     pub(crate) moderation: watch::Receiver<Arc<Moderation>>,
     /// [`Live`] sender — `changerelay*` ops rebuild `nip11`.
     pub(crate) live_tx: watch::Sender<Arc<Live>>,
+}
+
+/// `DeflatePool` has no `Debug`; every other field does.
+impl std::fmt::Debug for AppState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppState")
+            .field("live", &self.live)
+            .field("conn", &self.conn)
+            .field("metrics", &self.metrics)
+            .field("limiter", &self.limiter)
+            .field("sync_memory", &self.sync_memory)
+            .field("subscription_bytes", &self.subscription_bytes)
+            .field("moderation", &self.moderation)
+            .field("live_tx", &self.live_tx)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Build the application router. `/metrics` exists only when
@@ -181,11 +201,54 @@ pub(crate) fn ip_blocked(state: &AppState, headers: &header::HeaderMap, peer: Ip
     state.moderation.borrow().ip_blocked(&ip)
 }
 
-/// WebSocket upgrade branch of `root`; `None` when the upgrade headers
-/// were malformed and the request falls through to NIP-11/plain text.
+/// Initial capacity of each socket's read buffer. 71% of corpus
+/// events serialize under 1 KiB and 99.5% under 4 KiB, and yawc
+/// returns a grown buffer to this size after a large frame — a bigger
+/// start would be per-connection memory spent on nothing.
+const READ_BUFFER_CAPACITY: usize = 2 * 1024;
+
+/// Initial capacity of each socket's write buffer, for the same
+/// corpus reason as [`READ_BUFFER_CAPACITY`].
+const WRITE_BUFFER_CAPACITY: usize = 2 * 1024;
+
+/// Outbound payloads shorter than this are sent uncompressed: every
+/// reply type (OK, EOSE, CLOSED, NOTICE, AUTH, COUNT) is shorter and
+/// gains nothing, while every event message is longer.
+const COMPRESSION_THRESHOLD: usize = 128;
+
+/// WebSocket options for one upgrade, from the live config snapshot.
 /// The deflate level is fixed at `fast()` (level 1, strfry's
 /// `deflateInit2` level) — query responses dominate and level 6 costs
-/// CPU without buying meaningful bytes at these message sizes.
+/// CPU without buying meaningful bytes at these message sizes. Without
+/// context takeover the deflate state comes from `pool`, so an idle
+/// connection costs only its socket buffers; with `sliding_window`
+/// each connection keeps its own (~370 KiB once used).
+fn upgrade_options(relay: &crate::config::Relay, pool: &yawc::DeflatePool) -> Options {
+    let options = Options::default()
+        .with_max_payload_read(relay.max_websocket_payload_size)
+        .with_read_buffer_capacity(READ_BUFFER_CAPACITY)
+        .with_write_buffer_capacity(WRITE_BUFFER_CAPACITY);
+    if !relay.compression.enabled {
+        return options;
+    }
+    Options {
+        compression: Some(yawc::DeflateOptions {
+            level: yawc::CompressionLevel::fast(),
+            server_no_context_takeover: !relay.compression.sliding_window,
+            client_no_context_takeover: !relay.compression.sliding_window,
+            compression_threshold: COMPRESSION_THRESHOLD,
+            // Context takeover pins per-connection state and must not
+            // borrow from the pool.
+            pool: (!relay.compression.sliding_window).then(|| pool.clone()),
+        }),
+        ..options
+    }
+}
+
+/// WebSocket upgrade branch of `root`; `None` when the upgrade headers
+/// were malformed and the request falls through to NIP-11/plain text.
+/// Options come from [`upgrade_options`] on a per-upgrade config
+/// snapshot, so a reload only affects connections opened afterwards.
 async fn websocket(state: &AppState, parts: &mut Parts, peer: SocketAddr) -> Option<Response> {
     let Ok(upgrade) = IncomingUpgrade::from_request_parts(parts, &()).await else {
         return None;
@@ -193,21 +256,7 @@ async fn websocket(state: &AppState, parts: &mut Parts, peer: SocketAddr) -> Opt
     // One snapshot per upgrade: existing connections keep the
     // options they started with.
     let live = state.live.borrow().clone();
-    let compression = &live.config.relay.compression;
-    let options =
-        Options::default().with_max_payload_read(live.config.relay.max_websocket_payload_size);
-    let options = if compression.enabled {
-        Options {
-            compression: Some(yawc::DeflateOptions {
-                level: yawc::CompressionLevel::fast(),
-                server_no_context_takeover: !compression.sliding_window,
-                client_no_context_takeover: !compression.sliding_window,
-            }),
-            ..options
-        }
-    } else {
-        options
-    };
+    let options = upgrade_options(&live.config.relay, &state.deflate_pool);
     // The cap is charged before the upgrade. Rejections log at
     // debug: a hostile peer may hammer the cap and must not flood
     // the log.
@@ -309,6 +358,69 @@ mod tests {
             header::HeaderValue::from_str(value).unwrap(),
         );
         map
+    }
+
+    /// Compression off: no `DeflateOptions`, but the payload limit and
+    /// the socket buffer capacities still apply.
+    #[test]
+    fn upgrade_options_without_compression() {
+        let config = Config {
+            relay: crate::config::Relay {
+                compression: crate::config::Compression {
+                    enabled: false,
+                    sliding_window: false,
+                },
+                ..Config::default().relay
+            },
+            ..Config::default()
+        };
+        let pool = yawc::DeflatePool::new(1);
+        let options = upgrade_options(&config.relay, &pool);
+        assert!(options.compression.is_none());
+        assert_eq!(
+            options.max_payload_read,
+            Some(config.relay.max_websocket_payload_size)
+        );
+        assert_eq!(options.read_buffer_capacity, Some(READ_BUFFER_CAPACITY));
+        assert_eq!(options.write_buffer_capacity, Some(WRITE_BUFFER_CAPACITY));
+    }
+
+    /// Default (no context takeover): both directions reset per
+    /// message, the pool carries deflate state, small replies go out
+    /// uncompressed.
+    #[test]
+    fn upgrade_options_pooled() {
+        let config = Config::default();
+        let pool = yawc::DeflatePool::new(1);
+        let options = upgrade_options(&config.relay, &pool);
+        let deflate = options.compression.expect("deflate negotiated");
+        assert!(deflate.server_no_context_takeover);
+        assert!(deflate.client_no_context_takeover);
+        assert_eq!(deflate.compression_threshold, COMPRESSION_THRESHOLD);
+        assert!(deflate.pool.is_some());
+    }
+
+    /// `sliding_window` keeps context both ways and must not touch the
+    /// pool — its state would pin the shared objects.
+    #[test]
+    fn upgrade_options_sliding_window() {
+        let config = Config {
+            relay: crate::config::Relay {
+                compression: crate::config::Compression {
+                    enabled: true,
+                    sliding_window: true,
+                },
+                ..Config::default().relay
+            },
+            ..Config::default()
+        };
+        let pool = yawc::DeflatePool::new(1);
+        let options = upgrade_options(&config.relay, &pool);
+        let deflate = options.compression.expect("deflate negotiated");
+        assert!(!deflate.server_no_context_takeover);
+        assert!(!deflate.client_no_context_takeover);
+        assert_eq!(deflate.compression_threshold, COMPRESSION_THRESHOLD);
+        assert!(deflate.pool.is_none());
     }
 
     #[test]

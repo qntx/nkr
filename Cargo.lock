@@ -2695,13 +2695,14 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "yawc"
-version = "0.4.4"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01553844ceca7b3cd42f69754e3f4ee99cd2f42a21f0a638ad9630e110ed445e"
+checksum = "d7b69940f68e6cbe7d7f85350b81e51fafe62786d812b92c263727addc13a272"
 dependencies = [
  "axum-core",
  "base64",
  "bytes",
+ "crossbeam-queue",
  "flate2",
  "futures",
  "getrandom 0.2.17",

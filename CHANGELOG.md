@@ -10,6 +10,23 @@ The format is based on [Keep a Changelog]; this project follows
 
 ## [Unreleased]
 
+### Changed
+
+- yawc 0.5.0 on the native edition: lazy deflate state, a shared
+  `DeflatePool` for no-context-takeover connections, and exact socket
+  buffer capacities.
+- `[relay.compression] sliding_window` now defaults to `false`: both
+  directions negotiate no context takeover and deflate state comes
+  from a server-wide pool, so an idle connection costs a few KiB
+  instead of ~370 KiB, at ~18-52% more bytes than the sliding
+  window buys. `true` keeps strfry's behaviour for bandwidth-bound
+  relays with few connections.
+- Socket read and write buffers start at 2 KiB each (was 8 KiB);
+  they still grow for large frames and shrink back afterwards.
+- Outbound messages under 128 bytes go out uncompressed: every reply
+  type (OK, EOSE, CLOSED, NOTICE, AUTH, COUNT) is shorter and gains
+  nothing, while every event message is longer.
+
 ## [0.2.0] - 2026-10-22
 
 ### Added

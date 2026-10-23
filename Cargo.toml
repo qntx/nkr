@@ -58,7 +58,7 @@ axum               = "0.8.9"
 hyper              = { version = "1.12", default-features = false, features = ["http1", "server"] }
 hyper-util         = { version = "0.1.21", default-features = false, features = ["service", "tokio"] }
 tower              = { version = "0.5.3", features = ["util"] }
-yawc               = { version = "0.4.4", default-features = false, features = ["axum"] }
+yawc               = { version = "0.5.0", default-features = false, features = ["axum"] }
 futures-util       = "0.3.34"
 clap               = { version = "4.6", features = ["derive", "env"] }
 toml               = "1.1.6"
