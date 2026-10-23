@@ -491,6 +491,7 @@ fn proc_stats_ps(pid: u32) -> Option<(u64, f64)> {
     Some((rss, seconds))
 }
 
+/// Nearest-rank percentile of `sorted` microseconds, in milliseconds.
 fn percentile(sorted: &[u32], p: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
@@ -586,7 +587,7 @@ async fn fanout(
     deflate: bool,
     pid: Option<u32>,
     label: String,
-) {
+) -> Result<(), String> {
     let now = unix_now();
     let authors: Vec<Author> = (0..authors_n).map(author).collect();
     // A per-run `t` tag: on a public relay, foreign kind-1 traffic must
@@ -675,19 +676,22 @@ async fn fanout(
             run_subscriber(ws, expected, index, sent, base, done, stop).await
         }));
     }
+    let extensions = openloop::server_extensions(&url, deflate);
     let ready_deadline = Instant::now() + READY_TIMEOUT;
     while ready.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) < subs {
-        assert!(
-            Instant::now() < ready_deadline,
-            "subscribers not ready in time"
-        );
+        if Instant::now() >= ready_deadline {
+            return Err(format!(
+                "subscribers not ready in {}s",
+                READY_TIMEOUT.as_secs()
+            ));
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let subs_ready = ready.load(Ordering::Relaxed);
     let subs_failed = failed.load(Ordering::Relaxed);
 
     // Publisher.
-    let publisher = connect(&url, deflate).await.expect("publisher connects");
+    let publisher = connect(&url, deflate).await?;
     let (mut sink, mut stream) = publisher.split();
     let oks = tokio::spawn(async move {
         let (mut accepted, mut rejected) = (0usize, 0usize);
@@ -711,13 +715,25 @@ async fn fanout(
         (accepted, rejected)
     });
 
+    let meter = sampler::HarnessMeter::begin();
+    let sampler = pid.map(sampler::Sampler::start);
     let before = pid.and_then(proc_stats);
     let publish_start = Instant::now();
+    // `sent[i]` carries the scheduled target, not the actual send
+    // time: delivery latency then measures the relay, not the
+    // harness's send lag, which goes to its own histogram.
+    let publish_offset_ns = publish_start.duration_since(base).as_nanos() as u64;
+    let mut send_lag = hist::Hist::new();
     for (i, message) in messages.into_iter().enumerate() {
-        let target = publish_start + Duration::from_secs_f64(i as f64 / rate);
+        let scheduled_ns = publish_offset_ns + (i as f64 / rate * 1e9) as u64;
+        let target = publish_start + Duration::from_nanos(scheduled_ns - publish_offset_ns);
         tokio::time::sleep_until(target.into()).await;
-        sent[i].store(base.elapsed().as_nanos() as u64 + 1, Ordering::Release);
-        sink.send(Frame::text(message)).await.expect("publish send");
+        let now = base.elapsed().as_nanos() as u64;
+        sent[i].store(scheduled_ns + 1, Ordering::Release);
+        send_lag.record_us(now.saturating_sub(scheduled_ns) / 1000);
+        sink.send(Frame::text(message))
+            .await
+            .map_err(|e| format!("publish send: {e}"))?;
     }
     let publish_secs = publish_start.elapsed().as_secs_f64();
     let drain_deadline = Instant::now() + DRAIN_TIMEOUT;
@@ -725,6 +741,8 @@ async fn fanout(
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let elapsed_secs = publish_start.elapsed().as_secs_f64();
+    let sampler_json = sampler.map(sampler::Sampler::finish);
+    let meter_json = meter.finish();
     let after = pid.and_then(proc_stats);
     let (accepted, rejected) = tokio::time::timeout(DRAIN_TIMEOUT, oks)
         .await
@@ -733,7 +751,7 @@ async fn fanout(
         .unwrap_or((0, 0));
     stop_tx.send_replace(true);
 
-    let mut latencies = Vec::with_capacity(expected_total);
+    let mut latencies = hist::Hist::new();
     let (mut received, mut duplicates, mut unknown, mut errors) = (0, 0, 0, 0);
     for task in tasks {
         let outcome = task.await.unwrap_or_default();
@@ -741,9 +759,11 @@ async fn fanout(
         duplicates += outcome.duplicates;
         unknown += outcome.unknown;
         errors += usize::from(outcome.error.is_some());
-        latencies.extend(outcome.latencies_us);
+        for us in outcome.latencies_us {
+            latencies.record_us(u64::from(us));
+        }
     }
-    latencies.sort_unstable();
+    let latency_ms = latencies.json();
     let result = json!({
         "scenario": "fanout",
         "label": label,
@@ -764,20 +784,26 @@ async fn fanout(
         "subscriber_errors": errors,
         "publish_secs": publish_secs,
         "elapsed_secs": elapsed_secs,
-        "latency_p50_ms": percentile(&latencies, 50.0),
-        "latency_p99_ms": percentile(&latencies, 99.0),
+        "latency_p50_ms": latency_ms["p50_ms"],
+        "latency_p99_ms": latency_ms["p99_ms"],
         "latency_ms": {
-            "p50": percentile(&latencies, 50.0),
-            "p90": percentile(&latencies, 90.0),
-            "p99": percentile(&latencies, 99.0),
-            "p999": percentile(&latencies, 99.9),
-            "max": latencies.last().map_or(f64::NAN, |v| f64::from(*v) / 1000.0),
+            "p50": latency_ms["p50_ms"],
+            "p90": latency_ms["p90_ms"],
+            "p99": latency_ms["p99_ms"],
+            "p999": latency_ms["p999_ms"],
+            "max": latency_ms["max_ms"],
         },
+        "latency_hist": latency_ms,
+        "send_lag": send_lag.json(),
+        "server_extensions": extensions,
+        "sampler": sampler_json,
+        "harness": meter_json,
         "relay_cpu_secs": match (before, after) { (Some(b), Some(a)) => json!(a.cpu_secs - b.cpu_secs), _ => Value::Null },
         "relay_rss_kib_after": after.map(|a| a.rss_kib),
         "relay_rss_anon_kib_after": after.and_then(|a| a.rss_anon_kib),
     });
     println!("{result}");
+    Ok(())
 }
 
 async fn conns(
@@ -918,7 +944,8 @@ async fn main() -> Result<(), String> {
                 pid,
                 label,
             )
-            .await;
+            .await
+            .map_err(|e| format!("fanout: {e}"))?;
         }
         Cmd::Conns {
             url,
