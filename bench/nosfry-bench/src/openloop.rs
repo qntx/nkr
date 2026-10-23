@@ -55,6 +55,7 @@ pub(crate) struct IngestOpts {
 
 /// One corpus line ready to send: the `["EVENT",..]` wire message
 /// plus the event's id bytes for `OK` matching.
+#[derive(Clone)]
 pub(crate) struct Ready {
     pub(crate) id: [u8; 32],
     pub(crate) msg: String,

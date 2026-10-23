@@ -385,7 +385,9 @@ def units_w8(prm, pilot):
     for rep in range(1, cycles + 1):
         for label in rotated(w["relays"], rep):
             kill_after = rng.uniform(w["kill_min"], w["kill_max"])
-            ids = str(prm.path_of("work") / "ack" / label / f"cycle{rep}.ids")
+            # One file per relay, appended across cycles: ack-ingest
+            # resumes the corpus past the ids it already recorded.
+            ids = str(prm.path_of("work") / "ack" / label / "acked.ids")
             out.append(unit("w8", "cycle", label, rep, "w8", [
                 harness_cmd(prm, "ack-ingest", "--url", ws_url(port),
                             "--corpus", corpus, "--conns", str(w["conns"]),
@@ -837,12 +839,19 @@ def cmd_prep(prm):
     harness = str(prm.path_of("harness"))
     work = prm.path_of("work")
 
-    # regular.jsonl (full) and holdout-regular.jsonl (everything past N).
+    # regular.jsonl = exactly the first w6.n regular events the w6
+    # snapshot imports. holdout-regular.jsonl = the next slice, sized
+    # for w6's additions plus w8's worst-case ingest.
     n = int(prm.p("w6", "n"))
+    w8 = prm.p("w8")
+    max_diff = max(prm.p("w6", "diff")) / 100.0
+    holdout_need = (int(n * max_diff / 2)
+                    + int(w8["cycles"] * w8["kill_max"] * w8["rate"]))
     for argv in (
-        [harness, "corpus-filter", "--regular", "--in", str(events),
-         "--out", str(prm.path_of("regular"))],
+        [harness, "corpus-filter", "--regular", "--first", str(n),
+         "--in", str(events), "--out", str(prm.path_of("regular"))],
         [harness, "corpus-filter", "--regular", "--skip", str(n),
+         "--first", str(holdout_need),
          "--in", str(events), "--out", str(prm.path_of("holdout_regular"))],
     ):
         r = subprocess.run(argv)
