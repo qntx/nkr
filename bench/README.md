@@ -51,7 +51,10 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
     (NIP-09 deletion) and 62 (NIP-62 request to vanish): with
     Zipf-drawn authors one popular author's vanish would wipe a large
     share of the corpus and deletions would make stored counts
-    relay-dependent.
+    relay-dependent. Templates carrying an `expiration` tag or a tag
+    element over 1,024 bytes are dropped for the same reason: they
+    would expire by ingest time or be rejected by the relays' size
+    limits. Every drop reason is counted in the final JSON.
   - The e-pool: the first `P = 100,000` generated ids are the reply
     pool. Pool members carry no `e` tags of their own (a template `e`
     tag degrades to a `p` tag with a Zipf-drawn author); every event

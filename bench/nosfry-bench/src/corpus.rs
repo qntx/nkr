@@ -87,6 +87,8 @@ struct Templates {
     dropped_ephemeral: usize,
     dropped_kind5: usize,
     dropped_kind62: usize,
+    dropped_expiration: usize,
+    dropped_oversize_tag: usize,
     malformed: usize,
     /// sha256 of the template file as given.
     fingerprint: String,
@@ -376,10 +378,14 @@ impl<R: BufRead> Iterator for ArrayElements<R> {
     }
 }
 
-/// Parse and filter the template file. Kind 20000-29999 (ephemeral),
-/// 5 (NIP-09 deletion) and 62 (NIP-62 request to vanish) are dropped:
-/// with Zipf-drawn authors one popular author's deletion or vanish
-/// would wipe a large, relay-dependent share of the corpus.
+/// Parse and filter the template file. Dropped templates:
+/// kind 20000-29999 (ephemeral), 5 (NIP-09 deletion) and 62 (NIP-62
+/// request to vanish): with Zipf-drawn authors one popular author's
+/// deletion or vanish would wipe a large, relay-dependent share of
+/// the corpus. Templates with an `expiration` tag or a tag element
+/// over 1024 bytes are also dropped: the former expire by ingest
+/// time, the latter are rejected by nosfry's size limits, and both
+/// would leave relay-dependent holes in the stored set.
 fn load_templates(path: &Path) -> Result<Templates, String> {
     let fingerprint = file_sha256(path)?;
     let reader = template_reader(path)?;
@@ -389,6 +395,8 @@ fn load_templates(path: &Path) -> Result<Templates, String> {
         dropped_ephemeral: 0,
         dropped_kind5: 0,
         dropped_kind62: 0,
+        dropped_expiration: 0,
+        dropped_oversize_tag: 0,
         malformed: 0,
         fingerprint,
     };
@@ -407,6 +415,30 @@ fn load_templates(path: &Path) -> Result<Templates, String> {
         }
         if kind == 62 {
             out.dropped_kind62 += 1;
+            continue;
+        }
+        let mut expired = false;
+        let mut oversize = false;
+        if let Some(tags) = v.get("tags").and_then(Value::as_array) {
+            for tag in tags.iter().filter_map(Value::as_array) {
+                if tag.first().and_then(Value::as_str) == Some("expiration") {
+                    expired = true;
+                }
+                if tag
+                    .iter()
+                    .skip(1)
+                    .any(|e| e.as_str().is_none_or(|s| s.len() > 1024))
+                {
+                    oversize = true;
+                }
+            }
+        }
+        if expired {
+            out.dropped_expiration += 1;
+            continue;
+        }
+        if oversize {
+            out.dropped_oversize_tag += 1;
             continue;
         }
         let (Some(tags), Some(content)) = (
@@ -759,12 +791,14 @@ pub(crate) fn run(opts: &GenOpts) -> Result<Value, String> {
     std::fs::create_dir_all(&opts.out).map_err(|e| format!("{:?}: {e}", opts.out))?;
     let templates = load_templates(&opts.template)?;
     eprintln!(
-        "gen: {} templates ({} dropped: ephemeral {}, kind5 {}, kind62 {}, malformed {})",
+        "gen: {} templates ({} dropped: ephemeral {}, kind5 {}, kind62 {}, expiration {}, oversize-tag {}, malformed {})",
         templates.list.len(),
         templates.total - templates.list.len(),
         templates.dropped_ephemeral,
         templates.dropped_kind5,
         templates.dropped_kind62,
+        templates.dropped_expiration,
+        templates.dropped_oversize_tag,
         templates.malformed,
     );
     let threads = opts.threads.max(1);
@@ -855,6 +889,8 @@ pub(crate) fn run(opts: &GenOpts) -> Result<Value, String> {
         "dropped_ephemeral": templates.dropped_ephemeral,
         "dropped_kind5": templates.dropped_kind5,
         "dropped_kind62": templates.dropped_kind62,
+        "dropped_expiration": templates.dropped_expiration,
+        "dropped_oversize_tag": templates.dropped_oversize_tag,
         "dropped_malformed": templates.malformed,
         "out": {
             "events.jsonl": writer_out.events_sha,
@@ -900,7 +936,8 @@ mod tests {
                 "sig": "22".repeat(64),
             }));
         }
-        // Dropped kinds: a deletion, a vanish request, an ephemeral.
+        // Dropped: a deletion, a vanish request, an ephemeral, an
+        // expiring event, an oversized tag value.
         for kind in [5u16, 62, 20001] {
             events.push(json!({
                 "id": "33".repeat(32), "pubkey": "44".repeat(32),
@@ -908,6 +945,18 @@ mod tests {
                 "content": "", "sig": "55".repeat(64),
             }));
         }
+        events.push(json!({
+            "id": "66".repeat(32), "pubkey": "77".repeat(32),
+            "created_at": 1, "kind": 1,
+            "tags": [["expiration", "1700000000"]],
+            "content": "", "sig": "88".repeat(64),
+        }));
+        events.push(json!({
+            "id": "99".repeat(32), "pubkey": "aa".repeat(32),
+            "created_at": 1, "kind": 1,
+            "tags": [["imeta", "x".repeat(2000)]],
+            "content": "", "sig": "bb".repeat(64),
+        }));
         std::fs::write(path, Value::Array(events).to_string()).unwrap();
     }
 
@@ -941,6 +990,8 @@ mod tests {
         assert_eq!(t.dropped_ephemeral, 1);
         assert_eq!(t.dropped_kind5, 1);
         assert_eq!(t.dropped_kind62, 1);
+        assert_eq!(t.dropped_expiration, 1);
+        assert_eq!(t.dropped_oversize_tag, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
