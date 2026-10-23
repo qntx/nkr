@@ -253,7 +253,7 @@ impl Drop for Gunzip {
 /// Open `path` as a byte stream of its JSON content: through
 /// `gunzip -c` when the file carries the gzip magic, directly
 /// otherwise (the plain path keeps tests and unpacked inputs working).
-fn template_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, String> {
+fn template_reader(path: &Path) -> Result<Box<dyn Read + Send>, String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("{path:?}: {e}"))?;
     let mut magic = [0u8; 2];
     let n = file.read(&mut magic).map_err(|e| e.to_string())?;
@@ -283,6 +283,9 @@ fn template_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, String> {
 struct ArrayElements<R> {
     r: R,
     cur: Vec<u8>,
+    /// Bytes read ahead but not yet fed to [`ArrayElements::step`]:
+    /// an element can end mid-buffer.
+    pending: std::collections::VecDeque<u8>,
     depth: u32,
     in_elem: bool,
     in_str: bool,
@@ -290,11 +293,12 @@ struct ArrayElements<R> {
     done: bool,
 }
 
-impl<R: BufRead> ArrayElements<R> {
+impl<R: Read> ArrayElements<R> {
     fn new(r: R) -> Self {
         Self {
             r,
             cur: Vec::with_capacity(4096),
+            pending: std::collections::VecDeque::new(),
             depth: 0,
             in_elem: false,
             in_str: false,
@@ -302,80 +306,105 @@ impl<R: BufRead> ArrayElements<R> {
             done: false,
         }
     }
+
+    /// Drain the read-ahead buffer; `true` when a byte closed an element.
+    fn scan_pending(&mut self) -> bool {
+        while let Some(b) = self.pending.pop_front() {
+            if self.step(b) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Feed one byte; `true` when it closed the current element.
+    fn step(&mut self, b: u8) -> bool {
+        if !self.in_elem {
+            match b {
+                b'[' => self.depth = 1,
+                b'{' if self.depth == 1 => {
+                    self.in_elem = true;
+                    self.depth = 2;
+                    self.cur.clear();
+                    self.cur.push(b);
+                }
+                b']' if self.depth == 1 => self.done = true,
+                _ => {}
+            }
+            return false;
+        }
+        self.cur.push(b);
+        if self.in_str {
+            if self.esc {
+                self.esc = false;
+            } else if b == b'\\' {
+                self.esc = true;
+            } else if b == b'"' {
+                self.in_str = false;
+            }
+            return false;
+        }
+        match b {
+            b'"' => self.in_str = true,
+            b'{' | b'[' => self.depth += 1,
+            b'}' | b']' => {
+                self.depth -= 1;
+                if self.depth == 1 {
+                    self.in_elem = false;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
 }
 
-impl<R: BufRead> Iterator for ArrayElements<R> {
+impl<R: Read> Iterator for ArrayElements<R> {
     type Item = std::io::Result<Vec<u8>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while !self.done {
-            let mut emit = false;
-            let consumed = {
-                let buf = match self.r.fill_buf() {
-                    Ok(b) if b.is_empty() => {
-                        self.done = true;
-                        return None;
-                    }
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.done = true;
-                        return Some(Err(e));
-                    }
-                };
-                let mut consumed = 0;
-                for &b in buf {
-                    consumed += 1;
-                    if self.in_elem {
-                        self.cur.push(b);
-                        if self.in_str {
-                            if self.esc {
-                                self.esc = false;
-                            } else if b == b'\\' {
-                                self.esc = true;
-                            } else if b == b'"' {
-                                self.in_str = false;
-                            }
-                            continue;
-                        }
-                        match b {
-                            b'"' => self.in_str = true,
-                            b'{' | b'[' => self.depth += 1,
-                            b'}' | b']' => {
-                                self.depth -= 1;
-                                if self.depth == 1 {
-                                    emit = true;
-                                    break;
-                                }
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        match b {
-                            b'[' => self.depth = 1,
-                            b'{' if self.depth == 1 => {
-                                self.in_elem = true;
-                                self.depth = 2;
-                                self.cur.clear();
-                                self.cur.push(b);
-                            }
-                            b']' if self.depth == 1 => {
-                                self.done = true;
-                                break;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                consumed
-            };
-            self.r.consume(consumed);
-            if emit {
-                self.in_elem = false;
+        let mut buf = [0u8; 1 << 16];
+        loop {
+            if self.scan_pending() {
                 return Some(Ok(std::mem::take(&mut self.cur)));
             }
+            if self.done {
+                return None;
+            }
+            match self.r.read(&mut buf) {
+                Ok(0) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(n) => self.pending.extend(&buf[..n]),
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
         }
-        None
     }
+}
+
+/// Scan one template's tags for the two shape drops: an `expiration`
+/// tag, or a non-string / >1024-byte tag element.
+fn template_flags(tags: &[Value]) -> (bool, bool) {
+    let mut expired = false;
+    let mut oversize = false;
+    for tag in tags.iter().filter_map(Value::as_array) {
+        if tag.first().and_then(Value::as_str) == Some("expiration") {
+            expired = true;
+        }
+        if tag
+            .iter()
+            .skip(1)
+            .any(|e| e.as_str().is_none_or(|s| s.len() > 1024))
+        {
+            oversize = true;
+        }
+    }
+    (expired, oversize)
 }
 
 /// Parse and filter the template file. Dropped templates:
@@ -417,22 +446,8 @@ fn load_templates(path: &Path) -> Result<Templates, String> {
             out.dropped_kind62 += 1;
             continue;
         }
-        let mut expired = false;
-        let mut oversize = false;
-        if let Some(tags) = v.get("tags").and_then(Value::as_array) {
-            for tag in tags.iter().filter_map(Value::as_array) {
-                if tag.first().and_then(Value::as_str) == Some("expiration") {
-                    expired = true;
-                }
-                if tag
-                    .iter()
-                    .skip(1)
-                    .any(|e| e.as_str().is_none_or(|s| s.len() > 1024))
-                {
-                    oversize = true;
-                }
-            }
-        }
+        let tags_val = v.get("tags").and_then(Value::as_array);
+        let (expired, oversize) = tags_val.map_or((false, false), |t| template_flags(t));
         if expired {
             out.dropped_expiration += 1;
             continue;
@@ -464,6 +479,15 @@ fn load_templates(path: &Path) -> Result<Templates, String> {
     Ok(out)
 }
 
+/// Fill `slots` with keypairs `base..base+slots.len()`.
+fn fill_authors(seed: u64, base: usize, slots: &mut [Option<Author>]) {
+    for (j, slot) in slots.iter_mut().enumerate() {
+        let keypair = author_keypair(seed, (base + j) as u64);
+        let pk_hex = hex(&keypair.x_only_public_key().0.to_byte_array());
+        *slot = Some(Author { keypair, pk_hex });
+    }
+}
+
 /// Generate the `a` author keypairs, partitioned over `threads`.
 fn authors(seed: u64, a: usize, threads: usize) -> Vec<Author> {
     let mut out: Vec<Option<Author>> = (0..a).map(|_| None).collect();
@@ -471,14 +495,7 @@ fn authors(seed: u64, a: usize, threads: usize) -> Vec<Author> {
     let span = a.div_ceil(threads);
     std::thread::scope(|s| {
         for (w, slots) in out.chunks_mut(span).enumerate() {
-            s.spawn(move || {
-                for (j, slot) in slots.iter_mut().enumerate() {
-                    let i = w * span + j;
-                    let keypair = author_keypair(seed, i as u64);
-                    let pk_hex = hex(&keypair.x_only_public_key().0.to_byte_array());
-                    *slot = Some(Author { keypair, pk_hex });
-                }
-            });
+            s.spawn(move || fill_authors(seed, w * span, slots));
         }
     });
     out.into_iter().map(Option::unwrap).collect()
@@ -499,7 +516,9 @@ fn rewrite_tag(tag: &[Value], pool: Option<&[String]>, ctx: &Ctx, rng: &mut ChaC
             }
         }
         "e" => {
-            if out.len() > 1 && let Some(pool) = pool.filter(|p| !p.is_empty()) {
+            if out.len() > 1
+                && let Some(pool) = pool.filter(|p| !p.is_empty())
+            {
                 out[1] = json!(pool[rng.random_range(0..pool.len())]);
             }
         }
@@ -562,6 +581,28 @@ struct Event {
     tags: Vec<Value>,
 }
 
+/// Fold one generated event into the chunk's sidecars and stats:
+/// kind counts, `t` values, `d` triples, pool ids, wanted ids.
+fn sidecar(ev: &Event, i: usize, ctx: &Ctx, out: &mut ChunkOut, stats: &mut Stats) {
+    *stats.kinds.entry(ev.kind).or_insert(0) += 1;
+    for tag in &ev.tags {
+        let name = tag.get(0).and_then(Value::as_str).unwrap_or("");
+        match (name, tag.get(1).and_then(Value::as_str)) {
+            ("t", Some(v)) => *stats.t_counts.entry(v.to_owned()).or_insert(0) += 1,
+            ("d", Some(d)) if (30_000..40_000).contains(&ev.kind) => {
+                out.triples.push((ev.kind, ev.pubkey.clone(), d.to_owned()));
+            }
+            _ => {}
+        }
+    }
+    if i < POOL.min(ctx.total) {
+        out.pool_ids.push(ev.id.clone());
+    }
+    if ctx.wanted.contains(&(i as u64)) {
+        out.wanted.push((i as u64, ev.id.clone()));
+    }
+}
+
 /// One worker: draw chunk indices until exhausted and send finished
 /// chunks to the writer; merge local stats once at the end.
 fn worker(
@@ -600,31 +641,10 @@ fn worker(
             triples: Vec::new(),
         };
         for i in start..end {
-            let i = i as u64;
             // The pool never references itself even once ids exist.
-            let eff_pool = if (i as usize) < pool_n {
-                None
-            } else {
-                pool.as_deref()
-            };
-            let ev = gen_event(i, eff_pool.map(Vec::as_slice), ctx, seed, &mut local);
-            *local.kinds.entry(ev.kind).or_insert(0) += 1;
-            for tag in &ev.tags {
-                let name = tag.get(0).and_then(Value::as_str).unwrap_or("");
-                match (name, tag.get(1).and_then(Value::as_str)) {
-                    ("t", Some(v)) => *local.t_counts.entry(v.to_owned()).or_insert(0) += 1,
-                    ("d", Some(d)) if (30_000..40_000).contains(&ev.kind) => {
-                        out.triples.push((ev.kind, ev.pubkey.clone(), d.to_owned()));
-                    }
-                    _ => {}
-                }
-            }
-            if (i as usize) < pool_n {
-                out.pool_ids.push(ev.id.clone());
-            }
-            if ctx.wanted.contains(&i) {
-                out.wanted.push((i, ev.id));
-            }
+            let eff_pool = if i < pool_n { None } else { pool.as_deref() };
+            let ev = gen_event(i as u64, eff_pool.map(Vec::as_slice), ctx, seed, &mut local);
+            sidecar(&ev, i, ctx, &mut out, &mut local);
             out.lines.push(ev.line);
         }
         tx.send(out).map_err(|e| format!("writer channel: {e}"))?;
@@ -640,6 +660,35 @@ fn worker(
         *shared.t_counts.entry(t).or_insert(0) += n;
     }
     Ok(())
+}
+
+/// The two output files plus their running hashes; `write` routes
+/// each line of a chunk by its global index.
+struct Files {
+    events_file: BufWriter<std::fs::File>,
+    holdout_file: BufWriter<std::fs::File>,
+    events_hash: Sha256,
+    holdout_hash: Sha256,
+    events: usize,
+}
+
+impl Files {
+    fn write(&mut self, chunk: &ChunkOut) -> Result<(), String> {
+        let base = chunk.idx * CHUNK;
+        for (j, line) in chunk.lines.iter().enumerate() {
+            let (file, h) = if base + j < self.events {
+                (&mut self.events_file, &mut self.events_hash)
+            } else {
+                (&mut self.holdout_file, &mut self.holdout_hash)
+            };
+            file.write_all(line.as_bytes())
+                .and_then(|()| file.write_all(b"\n"))
+                .map_err(|e| e.to_string())?;
+            h.update(line.as_bytes());
+            h.update(b"\n");
+        }
+        Ok(())
+    }
 }
 
 struct WriterOut {
@@ -661,38 +710,32 @@ fn writer(
     pool: &PoolSlot,
     out: &Path,
 ) -> Result<WriterOut, String> {
-    let mut events_file = BufWriter::with_capacity(
+    let events_file = BufWriter::with_capacity(
         1 << 20,
         std::fs::File::create(out.join("events.jsonl")).map_err(|e| e.to_string())?,
     );
-    let mut holdout_file = BufWriter::with_capacity(
+    let holdout_file = BufWriter::with_capacity(
         1 << 20,
         std::fs::File::create(out.join("holdout.jsonl")).map_err(|e| e.to_string())?,
     );
-    let (mut eh, mut hh) = (Sha256::new(), Sha256::new());
+    let (eh, hh) = (Sha256::new(), Sha256::new());
     let mut pool_ids = Vec::new();
     let mut wanted = Vec::new();
     let mut triples = Vec::new();
     let mut pending: BTreeMap<usize, ChunkOut> = BTreeMap::new();
     let mut expect = 0usize;
+    let mut files = Files {
+        events_file,
+        holdout_file,
+        events_hash: eh,
+        holdout_hash: hh,
+        events,
+    };
     while expect < chunks {
         let chunk = rx.recv().map_err(|_| "writer channel closed early")?;
         pending.insert(chunk.idx, chunk);
         while let Some(chunk) = pending.remove(&expect) {
-            let base = chunk.idx * CHUNK;
-            for (j, line) in chunk.lines.iter().enumerate() {
-                let i = base + j;
-                let (file, h) = if i < events {
-                    (&mut events_file, &mut eh)
-                } else {
-                    (&mut holdout_file, &mut hh)
-                };
-                file.write_all(line.as_bytes())
-                    .and_then(|()| file.write_all(b"\n"))
-                    .map_err(|e| e.to_string())?;
-                h.update(line.as_bytes());
-                h.update(b"\n");
-            }
+            files.write(&chunk)?;
             pool_ids.extend(chunk.pool_ids);
             wanted.extend(chunk.wanted);
             triples.extend(chunk.triples);
@@ -702,6 +745,13 @@ fn writer(
             }
         }
     }
+    let Files {
+        mut events_file,
+        mut holdout_file,
+        events_hash: eh,
+        holdout_hash: hh,
+        ..
+    } = files;
     events_file.flush().map_err(|e| e.to_string())?;
     holdout_file.flush().map_err(|e| e.to_string())?;
     Ok(WriterOut {
@@ -848,9 +898,9 @@ pub(crate) fn run(opts: &GenOpts) -> Result<Value, String> {
         for _ in 0..threads {
             let (next, ctx, stats) = (&next, &ctx, &stats);
             let tx = tx.clone();
-            handles.push(s.spawn(move || {
-                worker(next, chunks, pool_chunks, ctx, opts.seed, &tx, stats)
-            }));
+            handles.push(
+                s.spawn(move || worker(next, chunks, pool_chunks, ctx, opts.seed, &tx, stats)),
+            );
         }
         drop(tx);
         for h in handles {
@@ -870,8 +920,7 @@ pub(crate) fn run(opts: &GenOpts) -> Result<Value, String> {
     ] {
         fingerprints.push_str(&format!("{sha}  {name}\n"));
     }
-    std::fs::write(opts.out.join("fingerprints.txt"), &fingerprints)
-        .map_err(|e| e.to_string())?;
+    std::fs::write(opts.out.join("fingerprints.txt"), &fingerprints).map_err(|e| e.to_string())?;
 
     Ok(json!({
         "scenario": "gen",
@@ -909,23 +958,23 @@ mod tests {
     /// A small D1-shaped template corpus covering every tag rewrite
     /// path and every dropped kind.
     fn write_template(path: &Path) {
+        let tags_for = |kind: u16, i: usize| match kind {
+            1 | 6 => vec![
+                json!(["e", "ab".repeat(32), "", "reply"]),
+                json!(["p", "cd".repeat(32)]),
+                json!(["t", format!("tag{}", i % 20)]),
+            ],
+            30023 => vec![
+                json!(["d", format!("article-{i}")]),
+                json!(["a", "30023:".to_owned() + &"ef".repeat(32) + ":x"]),
+                json!(["t", "longform"]),
+            ],
+            _ => vec![],
+        };
         let mut events = Vec::new();
         for i in 0..300 {
             let kind = [0u16, 1, 3, 6, 7, 9735, 30023][i % 7];
-            let mut tags = Vec::new();
-            match kind {
-                1 | 6 => {
-                    tags.push(json!(["e", "ab".repeat(32), "", "reply"]));
-                    tags.push(json!(["p", "cd".repeat(32)]));
-                    tags.push(json!(["t", format!("tag{}", i % 20)]));
-                }
-                30023 => {
-                    tags.push(json!(["d", format!("article-{i}")]));
-                    tags.push(json!(["a", "30023:".to_owned() + &"ef".repeat(32) + ":x"]));
-                    tags.push(json!(["t", "longform"]));
-                }
-                _ => {}
-            }
+            let tags = tags_for(kind, i);
             events.push(json!({
                 "id": "00".repeat(32),
                 "pubkey": "11".repeat(32),
@@ -961,13 +1010,20 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("nosfry-bench-corpus-{name}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("nosfry-bench-corpus-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn run_gen(dir: &Path, template: &Path, events: usize, holdout: usize, threads: usize) -> Value {
+    fn run_gen(
+        dir: &Path,
+        template: &Path,
+        events: usize,
+        holdout: usize,
+        threads: usize,
+    ) -> Value {
         let opts = GenOpts {
             template: template.to_owned(),
             events,
@@ -1067,10 +1123,9 @@ mod tests {
         let template = dir.join("d1.json");
         write_template(&template);
         run_gen(&dir, &template, POOL + 2_000, 0, 4);
-        let params: Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("params.json")).unwrap(),
-        )
-        .unwrap();
+        let params: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("params.json")).unwrap())
+                .unwrap();
         let pool: HashSet<String> = params["pool_ids"]
             .as_array()
             .unwrap()
@@ -1081,14 +1136,18 @@ mod tests {
         let events = std::fs::read_to_string(dir.join("events.jsonl")).unwrap();
         for (i, line) in events.lines().enumerate() {
             let ev: Value = serde_json::from_str(line).unwrap();
-            for tag in ev["tags"].as_array().unwrap() {
-                if tag[0].as_str() == Some("e") {
-                    assert!(i >= POOL, "e tag survived inside the pool at i={i}");
-                    assert!(
-                        pool.contains(tag[1].as_str().unwrap()),
-                        "e tag at i={i} references a non-pool id"
-                    );
-                }
+            let e_tags: Vec<&Value> = ev["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|t| t[0].as_str() == Some("e"))
+                .collect();
+            for tag in e_tags {
+                assert!(i >= POOL, "e tag survived inside the pool at i={i}");
+                assert!(
+                    pool.contains(tag[1].as_str().unwrap()),
+                    "e tag at i={i} references a non-pool id"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
