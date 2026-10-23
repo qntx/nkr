@@ -12,6 +12,13 @@ use serde_json::{Value, json};
 const MAX_US: u64 = 120_000_000;
 
 /// A latency histogram with 3 significant digits over `1µs..=120s`.
+impl Default for Hist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A latency histogram with 3 significant digits over `1µs..=120s`.
 pub(crate) struct Hist {
     h: Histogram<u64>,
     /// Samples beyond the histogram's range; reported separately so an
@@ -20,6 +27,7 @@ pub(crate) struct Hist {
 }
 
 impl Hist {
+    /// `1µs..=120s` at 3 significant digits.
     pub(crate) fn new() -> Self {
         Self {
             h: Histogram::new_with_bounds(1, MAX_US, 3).expect("static bounds are valid"),

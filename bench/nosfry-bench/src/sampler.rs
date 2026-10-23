@@ -31,6 +31,25 @@ struct Sample {
     threads: Option<u64>,
 }
 
+/// Take and store one reading of `pid`.
+fn push_sample(shared: &Mutex<Vec<Sample>>, pid: u32, started: Instant) {
+    if let Some(sample) = take_sample(pid, started) {
+        shared.lock().expect("mutex").push(sample);
+    }
+}
+
+/// One `/proc` reading of `pid`, `started` seconds in.
+fn take_sample(pid: u32, started: Instant) -> Option<Sample> {
+    let stats = crate::proc_stats(pid)?;
+    Some(Sample {
+        t_s: started.elapsed().as_secs_f64(),
+        cpu_s: stats.cpu_secs,
+        rss_kib: stats.rss_kib,
+        rss_anon_kib: stats.rss_anon_kib,
+        threads: stats.threads,
+    })
+}
+
 /// Samples `pid` once per second until [`Sampler::finish`]. On
 /// non-Linux hosts the reads degrade to `ps` and the JSON says so.
 pub(crate) struct Sampler {
@@ -48,16 +67,7 @@ impl Sampler {
         let started = Instant::now();
         let task = tokio::spawn(async move {
             loop {
-                let sample = crate::proc_stats(pid).map(|stats| Sample {
-                    t_s: started.elapsed().as_secs_f64(),
-                    cpu_s: stats.cpu_secs,
-                    rss_kib: stats.rss_kib,
-                    rss_anon_kib: stats.rss_anon_kib,
-                    threads: stats.threads,
-                });
-                if let Some(sample) = sample {
-                    shared.lock().expect("mutex").push(sample);
-                }
+                push_sample(&shared, pid, started);
                 tokio::time::sleep(SAMPLE_INTERVAL).await;
             }
         });
@@ -188,7 +198,10 @@ pub(crate) fn probe_extensions(
     offer_deflate: bool,
 ) -> Result<Option<String>, String> {
     if url.scheme() != "ws" {
-        return Err(format!("extension probe only supports ws:// ({})", url.scheme()));
+        return Err(format!(
+            "extension probe only supports ws:// ({})",
+            url.scheme()
+        ));
     }
     let host = url.host_str().ok_or("url has no host")?;
     let port = url.port_or_known_default().unwrap_or(80);
@@ -210,7 +223,9 @@ pub(crate) fn probe_extensions(
         req.push_str("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n");
     }
     req.push_str("\r\n");
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(req.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut lines = BufReader::new(stream).lines();
     let status = lines
         .next()
