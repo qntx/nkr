@@ -33,35 +33,12 @@ DIR="$BENCH/work/soak-$LABEL"
 
 mkdir -p "$OUT"
 ulimit -n 65536
-rm -rf "$DIR"; mkdir -p "$DIR/nosfry-db"
+rm -rf "$DIR"; mkdir -p "$DIR"
 
-# Same shape as nosfry-relay.sh's config plus `metrics = true` for the
-# sampler; everything not listed stays at the default.
-cat > "$DIR/nosfry.toml" <<CONF
-[db]
-path = "$DIR/nosfry-db"
-
-[relay]
-bind = "127.0.0.1"
-port = $PORT
-metrics = true
-# The soak opens hundreds of connections from one IP.
-max_connections_per_ip = 0
-
-[relay.rate_limits]
-events_per_second = 0
-events_burst = 0
-reqs_per_second = 0
-reqs_burst = 0
-# Per-address buckets would throttle the single-IP publishers;
-# the soak measures growth, not throttling.
-ip_events_per_second = 0
-ip_events_burst = 0
-ip_reqs_per_second = 0
-ip_reqs_burst = 0
-CONF
-
-taskset -c "$RELAY_CPUS" "$BENCH/bin/$BIN" relay --config "$DIR/nosfry.toml" > "$DIR/relay.log" 2>&1 &
+# The shared nosfry wrapper's config plus METRICS=1 for the sampler.
+RELAY_CPUS="$RELAY_CPUS" METRICS=1 "$BENCH/relays/nosfry.sh" \
+    "$BENCH/bin/$BIN" "$PORT" "$DIR" \
+    > "$DIR/relay.log" 2>&1 &
 RELAY_PID=$!
 
 stop_relay() {
@@ -89,7 +66,7 @@ taskset -c "$HARNESS_CPUS" "$HARNESS" soak \
     --url "ws://127.0.0.1:$PORT" \
     --metrics-url "http://127.0.0.1:$PORT/metrics" \
     --pid "$RELAY_PID" \
-    --db-dir "$DIR/nosfry-db" \
+    --db-dir "$DIR/db" \
     --duration-secs "$DURATION" \
     --sample-secs "$SAMPLE" \
     --publishers "$PUBLISHERS" \
