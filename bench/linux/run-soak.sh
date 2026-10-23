@@ -6,9 +6,10 @@
 # Env: DURATION (default 1800 s), SAMPLE (default 60 s),
 #      PUBLISHERS 8, RATE 200 events/s total, SUBSCRIBERS 200,
 #      CHURN_RATE 10 conns/s, SLOW_EVERY 60 s, NEG_EVERY 10 s,
-#      VANISH_EVERY 60 s.
-# The relay is pinned to cores 0-3 and the harness to cores 4-9, like
-# every other bench script on this box.
+#      VANISH_EVERY 60 s, DEFLATE 0 (1 = every harness connection
+#      negotiates permessage-deflate), PORT 17777,
+#      RELAY_CPUS 0-3, HARNESS_CPUS 4-9 (a soak can share the box with
+#      a benchmark run by moving to its own port and cores).
 set -euo pipefail
 
 BENCH=/bench
@@ -24,7 +25,10 @@ CHURN_RATE="${CHURN_RATE:-10}"
 SLOW_EVERY="${SLOW_EVERY:-60}"
 NEG_EVERY="${NEG_EVERY:-10}"
 VANISH_EVERY="${VANISH_EVERY:-60}"
-PORT=17777
+DEFLATE="${DEFLATE:-0}"
+PORT="${PORT:-17777}"
+RELAY_CPUS="${RELAY_CPUS:-0-3}"
+HARNESS_CPUS="${HARNESS_CPUS:-4-9}"
 DIR="$BENCH/work/soak-$LABEL"
 
 mkdir -p "$OUT"
@@ -57,7 +61,7 @@ ip_reqs_per_second = 0
 ip_reqs_burst = 0
 CONF
 
-taskset -c 0-3 "$BENCH/bin/$BIN" relay --config "$DIR/nosfry.toml" > "$DIR/relay.log" 2>&1 &
+taskset -c "$RELAY_CPUS" "$BENCH/bin/$BIN" relay --config "$DIR/nosfry.toml" > "$DIR/relay.log" 2>&1 &
 RELAY_PID=$!
 
 stop_relay() {
@@ -79,7 +83,9 @@ done
 nc -z 127.0.0.1 "$PORT" 2>/dev/null || { echo "relay did not start" >&2; tail -20 "$DIR/relay.log" >&2; exit 1; }
 
 echo "== soak $LABEL: $DURATION s, sampling every $SAMPLE s" >&2
-taskset -c 4-9 "$HARNESS" soak \
+DEFLATE_FLAG=()
+[ "$DEFLATE" = "1" ] && DEFLATE_FLAG=(--deflate)
+taskset -c "$HARNESS_CPUS" "$HARNESS" soak \
     --url "ws://127.0.0.1:$PORT" \
     --metrics-url "http://127.0.0.1:$PORT/metrics" \
     --pid "$RELAY_PID" \
@@ -94,6 +100,7 @@ taskset -c 4-9 "$HARNESS" soak \
     --neg-every-secs "$NEG_EVERY" \
     --vanish-every-secs "$VANISH_EVERY" \
     --label "$LABEL" \
+    "${DEFLATE_FLAG[@]}" \
     > "$OUT/soak-$LABEL.jsonl" \
     2> "$DIR/harness.log" || true
 
