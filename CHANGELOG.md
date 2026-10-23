@@ -18,9 +18,12 @@ The format is based on [Keep a Changelog]; this project follows
 - `[relay.compression] sliding_window` now defaults to `false`: both
   directions negotiate no context takeover and deflate state comes
   from a server-wide pool, so an idle connection costs a few KiB
-  instead of ~370 KiB, at ~18-52% more bytes than the sliding
-  window buys. `true` keeps strfry's behaviour for bandwidth-bound
-  relays with few connections.
+  instead of ~370 KiB. The price, against the sliding window: 18-52%
+  more bytes and about 25% more CPU per compressed message (1,000
+  subscribers: 26 MB relay RSS against 217 MB, 11.2 against 9.0 us
+  of CPU per delivery; strfry: 235 MB, 11.7 us). `true` keeps strfry's
+  behaviour for relays bound by bandwidth or CPU rather than
+  connection count.
 - Socket read and write buffers start at 2 KiB each (was 8 KiB);
   they still grow for large frames and shrink back afterwards.
 - Outbound messages under 128 bytes go out uncompressed: every reply
