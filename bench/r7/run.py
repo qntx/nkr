@@ -911,6 +911,9 @@ def manifest_line(prm, unit, result, t0, t1, unit_dir):
         "load_avg_before": result.pop("load_avg", None),
         "exit_codes": result.get("cmds_rc"),
         "relay_rc": result.get("relay_rc"),
+        "db_bytes": result.get("db_bytes"),
+        "events_before": result.get("events_before"),
+        "restart_ms": result.get("restart_ms"),
         "valid": result.get("valid"),
         "note": unit["note"],
         "path": str(unit_dir),
@@ -1021,6 +1024,8 @@ def run_schedule(prm, units, dry_run):
         t0 = time.time()
         result.update(RUNNERS[u["kind"]](prm, u, unit_dir))
         t1 = time.time()
+        (unit_dir / f"rep{u['rep']}.result.json").write_text(
+            json.dumps(result, indent=2))
         manifest_line(prm, u, result, t0, t1, unit_dir)
         print(f"     valid={result.get('valid')}")
 
