@@ -66,6 +66,29 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
     random ids, top `t` values, follow lists, `created_at` range,
     kind counts, `(kind, pubkey, d)` triples and `pool_ids`) and
     `fingerprints.txt` (sha256 of each).
+  - `ingest-open` paces `--corpus` events at a fixed `--rate` over
+    `--conns` connections for `--duration` seconds; `ingest-closed`
+    keeps a `--window` of outstanding events per connection. Both
+    report `accepted`, `rejected`, `timeouts`, `late_acks`, send-lag
+    and OK-latency histograms, and `valid` when no timeouts occurred.
+  - `query` replays the `mix.json` REQ templates against `params.json`
+    as closed REQ→EOSE→CLOSE loops; per-query stats land in `--log`
+    and the summary reports per-template EOSE latency histograms and
+    event counts.
+  - `corpus-filter --regular [--skip N] [--first N]` keeps only regular
+    kinds (1, 2, 4-44, 1000-9999) and reports scanned/kept/dropped.
+  - `neg` runs one NIP-77 session over filter `{}`: the relay must
+    hold the first `--base` lines of `--corpus`; the client drops a
+    seeded `diff-pct/2` percent of them and adds the same share from
+    `--holdout-corpus`, then checks the reconciled `have`/`need`
+    against those expected sets and reports `correct`, rounds, wall
+    time, and payload vs overhead bytes.
+  - `ack-ingest` paces `--corpus` like `ingest-open` with no warm-up
+    and appends every accepted id (`duplicate:` included) to `--out`,
+    flushed every 100 lines and on exit; a dropped connection flushes
+    and exits 0. `ack-check` REQs the file back in `{"ids":[500]}`
+    batches and reports `acked`, `found`, `missing` and up to 20
+    sample ids; `valid` means the queries ran without errors.
 - **aggregate.py**: `python3 bench/aggregate.py <results-dir>` prints the
   median and [min, max] of every metric across repeated runs.
 - **soak_analyze.py**: `python3 bench/soak_analyze.py <run.jsonl>
@@ -78,7 +101,7 @@ is part of the cargo workspace: `bench/nosfry-bench` is excluded in the root
 
 The scripts run inside the Linux container built from `linux/Dockerfile`:
 Ubuntu 24.04, JDK 21, Rust, and strfry's build dependencies. Relays are
-pinned to cores 0-3 (`strfry-pinned.sh`, `nosfry-relay.sh`) and harnesses to
+pinned to cores 0-3 (`strfry-pinned.sh`, `linux/relays/nosfry.sh`) and harnesses to
 cores 4-9, so a 10-core machine is expected. Check `nproc` first; the
 scripts do not.
 
@@ -167,10 +190,46 @@ Each `<name>` is a binary in `/bench/bin`; strfry always runs alongside.
   5,000 idle connections (plain and deflate). Each scenario starts against
   a fresh relay and database, and the relay order rotates on every rep.
 
-`nosfry-relay.sh` disables the rate limits and the per-IP connection cap
+`linux/relays/nosfry.sh` disables the rate limits and the per-IP connection cap
 in the generated config: the scenarios run thousands of subscribers from
 one IP and flood ingest over a single connection, and the benchmark
 measures the engine, not the limiter.
+
+## Round 7
+
+`r7/run.py` is the orchestrator: Python 3.12, standard library only,
+driven entirely by `r7/params.toml` (`tomllib`).
+
+```bash
+python3 r7/run.py prep            # corpus-filter + per-relay imports + snapshots
+python3 r7/run.py pilot w1        # one short rep; suggests w1.saturation
+python3 r7/run.py w1              # … w2 w3 w4 w5 w6 w7 w8
+python3 r7/run.py status          # units done / valid per workload
+python3 r7/run.py --dry-run w4    # print the schedule, start nothing
+```
+
+Every measured unit checks no other relay or harness process is
+running, records the load average, starts the relay through its
+`linux/relays/<relay>.sh` wrapper (`<binary> <port> <dir>
+[variant]`, `RELAY_CPUS`/`DB_DIR`/`METRICS` env), waits for the port,
+does one warm-up REQ, captures stdout to `rep<k>.json` and stderr to
+`rep<k>.log`, stops the relay with TERM then KILL after 10 s, and
+copies `relay.log` and the generated config next to the results.
+Relay order rotates per rep. Results land at
+`/bench/results/r7/<workload>/<scenario>/<relay-label>/` plus
+`manifest.jsonl`; `run-meta.json` records the build info, sysctls,
+ulimit, affinity masks, and the params content and sha256.
+
+Workloads: w1 ingest saturation (closed conns × window, then open
+loop at fractions of the pilot-derived saturation); w2 the D2 query
+mix, warm and cold (drop_caches), plus D1 relayBench continuity; w3
+fanout broadcast and selective; w4 connection scale up to 50,000
+(harness binds spread over 127.0.0.2-127.0.0.9 when ports run out);
+w5 timed import → cold and warm queries → ingest on top → restart
+time to first REQ→EOSE; w6 NIP-77 `neg` over a 1M-event snapshot at
+0.1/1/10% diffs; w7 the 24 h soak profile per relay (negentropy and
+vanish skipped where unsupported); w8 crash durability: ack-ingest,
+kill the relay at a seeded-random 2-20 s, restart, ack-check.
 
 The durability comparison adds a measurement-only build, never shipped,
 that opens LMDB with `EnvFlags::NO_META_SYNC` in `Store::open`. This
