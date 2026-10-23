@@ -36,6 +36,12 @@ events_per_second = 0
 events_burst = 0
 reqs_per_second = 0
 reqs_burst = 0
+# Same for the per-address buckets: every benchmark connection shares
+# one IP and would otherwise hit the default 500-REQ burst.
+ip_events_per_second = 0
+ip_events_burst = 0
+ip_reqs_per_second = 0
+ip_reqs_burst = 0
 CONF
 # Deliberately no [relay.compression] table above: a variant file may
 # add one, and a duplicate table is a TOML error.
