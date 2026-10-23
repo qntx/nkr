@@ -549,21 +549,35 @@ def drop_caches():
         return False
 
 
+def snap_sentinel(prm, label):
+    return prm.path_of("work") / "db" / f"{bin_of(label)}.snapset"
+
+
 def prepare_db(prm, unit):
+    """`fresh` wipes, `snap:<name>` restores only when the db is not
+    already that snapshot — read-only units then reuse it."""
     mode = unit["db"]
+    d = db_dir(prm, unit["label"])
+    sentinel = snap_sentinel(prm, unit["label"])
     if mode == "reuse":
         return
-    d = db_dir(prm, unit["label"])
-    if d.exists():
-        shutil.rmtree(d)
     if mode == "fresh":
+        if d.exists():
+            shutil.rmtree(d)
         d.mkdir(parents=True)
+        sentinel.unlink(missing_ok=True)
         return
     if mode.startswith("snap:"):
-        src = snap_dir(prm, mode.split(":", 1)[1], unit["label"])
+        name = mode.split(":", 1)[1]
+        if sentinel.exists() and sentinel.read_text().strip() == name:
+            return
+        src = snap_dir(prm, name, unit["label"])
         if not src.exists():
             sys.exit(f"run.py: snapshot {src} missing — run `prep` first")
+        if d.exists():
+            shutil.rmtree(d)
         shutil.copytree(src, d, symlinks=True)
+        sentinel.write_text(name + "\n")
         return
     sys.exit(f"run.py: unknown db mode {mode}")
 
@@ -860,6 +874,7 @@ def cmd_prep(prm):
                     shutil.rmtree(dst)
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(db, dst, symlinks=True)
+                snap_sentinel(prm, bin_name).write_text(snapset + "\n")
                 jf.write(json.dumps({"snapshot": snapset, "label": bin_name,
                                      "corpus": str(corpus), **stats}) + "\n")
                 print(f"prep: {snapset}/{label}: {stats['wall_secs']}s, "
