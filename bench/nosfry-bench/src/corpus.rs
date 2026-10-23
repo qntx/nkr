@@ -951,6 +951,76 @@ pub(crate) fn run(opts: &GenOpts) -> Result<Value, String> {
     }))
 }
 
+/// Parse `"<name>": <digits>` out of one compact JSON event line;
+/// `None` when the field is absent or non-numeric.
+pub(crate) fn u64_field(text: &str, name: &str) -> Option<u64> {
+    let key = format!("\"{name}\"");
+    let pos = text.find(&key)? + key.len();
+    let rest = text.get(pos..)?.trim_start().strip_prefix(':')?.trim_start();
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    rest.get(..digits)?.parse().ok()
+}
+
+/// `corpus-filter`: stream `--in` JSONL to `--out`. With `--regular`,
+/// only the regular kinds every relay in the lineup stores and
+/// NEG-syncs identically are kept (kinds 1, 2, 4-44 and 1000-9999;
+/// kinds 0, 3, 5, 62, the 10000-39999 range and ephemerals are
+/// dropped). `--skip` then `--first` window the kept items.
+pub(crate) fn corpus_filter(
+    regular: bool,
+    first: Option<usize>,
+    skip: usize,
+    input: &Path,
+    output: &Path,
+) -> Result<(), String> {
+    let file = std::fs::File::open(input).map_err(|e| format!("{}: {e}", input.display()))?;
+    let mut out = BufWriter::new(
+        std::fs::File::create(output).map_err(|e| format!("{}: {e}", output.display()))?,
+    );
+    let (mut scanned, mut kept, mut dropped, mut skipped) = (0u64, 0u64, 0u64, 0u64);
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|e| format!("{}: {e}", input.display()))?;
+        if line.is_empty() {
+            continue;
+        }
+        scanned += 1;
+        if regular {
+            let kind = u64_field(&line, "kind")
+                .ok_or_else(|| format!("{}: line without a numeric kind", input.display()))?;
+            if !matches!(kind, 1 | 2 | 4..=44 | 1000..=9999) {
+                dropped += 1;
+                continue;
+            }
+        }
+        if skipped < skip as u64 {
+            skipped += 1;
+            continue;
+        }
+        if first.is_some_and(|n| kept >= n as u64) {
+            break;
+        }
+        out.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+        out.write_all(b"\n").map_err(|e| e.to_string())?;
+        kept += 1;
+    }
+    out.flush().map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        json!({
+            "scenario": "corpus-filter",
+            "harness_sha": env!("GIT_SHA"),
+            "in": input.display().to_string(),
+            "out": output.display().to_string(),
+            "regular": regular,
+            "scanned": scanned,
+            "kept": kept,
+            "dropped": dropped,
+            "skipped": skipped,
+        })
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
