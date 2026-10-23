@@ -1,6 +1,5 @@
 # Round 7 workload parameters — the single source of truth for run.py.
-# Values below are the spec's draft; the pilot tunes `w1.saturation`,
-# then this file is frozen by commit and hashed into run-meta.json.
+# Frozen after the pilot; hashed into run-meta.json for every run.
 
 [paths]
 bench      = "/bench"
@@ -30,22 +29,24 @@ harness = "4-9"
 port = 17777
 
 [reps]
-default = 5
+# 6 reps make [min, max] a >=96.9% distribution-free CI for the median.
+default = 6
 
 [w1]
-relays         = ["nosfry-030", "nosfry-030+sliding", "strfry", "nostr-rs-0100"]
-closed_conns   = [1, 8, 32]
-window         = 64
-closed_secs    = 30
-warmup_secs    = 10
-open_fractions = [0.25, 0.5, 0.75, 0.9]
-open_conns     = 32
-open_secs      = 60
-# The slowest relay's closed-loop accepted events/s at 32 conns;
-# open-loop rates are the fractions above times this. Filled by the
-# pilot — 0 means "derive from the closed-c32 reps in the results
-# tree, or abort asking for a pilot".
-saturation = 0.0
+relays       = ["nosfry-030", "nosfry-030+sliding", "strfry", "nostr-rs-0100"]
+closed_conns = [1, 8, 32]
+window       = 64
+closed_secs  = 30
+warmup_secs  = 10
+open_conns   = 32
+open_secs    = 60
+# Absolute open-loop send rates per relay. Pilot closed-loop c32
+# accepted/s: nosfry-030 7779, nosfry-030+sliding 6449, strfry 5973,
+# nostr-rs-0100 1253. The shared rates are 0.25/0.5/0.75/0.9 x
+# strfry's 5973 (the slower of the two primary systems) rounded down
+# to 100; nostr-rs gets the same fractions of its own 1253 and is not
+# compared at absolute rates.
+open_rates = { "nosfry-030" = [1500, 3000, 4500, 5400], "nosfry-030+sliding" = [1500, 3000, 4500, 5400], "strfry" = [1500, 3000, 4500, 5400], "nostr-rs-0100" = [300, 600, 900, 1100] }
 
 [w2]
 relays  = ["nosfry-030", "strfry"]
@@ -79,6 +80,7 @@ query_secs  = 60
 query_warm  = 15
 open_conns  = 32
 ingest_secs = 60
+ingest_rate = 3000
 
 [w6]
 relays           = ["nosfry-030", "strfry"]
@@ -89,7 +91,7 @@ seed             = 1
 
 [w7]
 reps              = 1
-relays            = ["nosfry-030", "nosfry-030+sliding", "strfry", "nostr-rs-0100"]
+relays            = ["nosfry-030", "strfry", "nostr-rs-0100"]
 duration_secs     = 86400
 sample_secs       = 60
 publishers        = 8
@@ -108,6 +110,20 @@ conns    = 8
 seed     = 1
 kill_min = 2.0
 kill_max = 20.0
+
+# Pre-registered nosfry-030 vs strfry comparisons. `metric` is the
+# JSON path in the harness result written to rep<k>.json; `better`
+# is the winning direction.
+[primary]
+P1 = { id = "P1", workload = "w1", scenario = "closed-c32", metric = "accepted_per_sec", better = "higher" }
+P2 = { id = "P2", workload = "w1", scenario = "open-4500", metric = "ok_latency.p99_ms", better = "lower" }
+P3 = { id = "P3", workload = "w2", scenario = "q-c8-plain-warm", metric = "queries.overall.latency.p50_ms", better = "lower" }
+P4 = { id = "P4", workload = "w2", scenario = "q-c64-plain-warm", metric = "events_per_sec", better = "higher" }
+P5 = { id = "P5", workload = "w3", scenario = "broadcast-5000-plain", metric = "latency_p50_ms", better = "lower" }
+# Derived: relay_cpu_us_per_delivery = relay_cpu_secs / delivered * 1e6.
+P6 = { id = "P6", workload = "w3", scenario = "broadcast-5000-plain", metric = "relay_cpu_us_per_delivery", better = "lower" }
+P7 = { id = "P7", workload = "w4", scenario = "conns-10000-plain", metric = "kib_per_conn", better = "lower" }
+P8 = { id = "P8", workload = "w4", scenario = "conns-10000-deflate", metric = "kib_per_conn", better = "lower" }
 
 [pilot]
 # `pilot wN`: one rep with these shortened timings.

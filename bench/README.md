@@ -120,7 +120,10 @@ Start the container, mounting this repository and the amethyst checkout:
 ```bash
 docker build -t nosfry-bench:linux bench/linux
 docker volume create nosfry-bench-work
-docker run -d --name nosfry-bench --ulimit nofile=65536:65536 \
+# --init reaps the zombie relay/harness children that a wrapper or a
+# killed unit leaves behind; --privileged is needed for drop_caches.
+docker run -d --name nosfry-bench --init --privileged \
+    --ulimit nofile=1048576:1048576 \
     -v nosfry-bench-work:/bench/work \
     -v "$PWD/results:/bench/results" \
     -v "$PWD:/src/nosfry:ro" \
@@ -201,8 +204,8 @@ measures the engine, not the limiter.
 driven entirely by `r7/params.toml` (`tomllib`).
 
 ```bash
-python3 r7/run.py prep            # corpus-filter + per-relay imports + snapshots
-python3 r7/run.py pilot w1        # one short rep; suggests w1.saturation
+python3 r7/run.py prep            # corpus-filter + one d2 import per relay
+python3 r7/run.py pilot w1        # one short rep per relay
 python3 r7/run.py w1              # … w2 w3 w4 w5 w6 w7 w8
 python3 r7/run.py status          # units done / valid per workload
 python3 r7/run.py --dry-run w4    # print the schedule, start nothing
@@ -220,15 +223,26 @@ Relay order rotates per rep. Results land at
 `manifest.jsonl`; `run-meta.json` records the build info, sysctls,
 ulimit, affinity masks, and the params content and sha256.
 
+Databases: `prep` imports `events.jsonl` once per relay into
+`work/db/<bin>` — the one imported db every read-only unit shares;
+there are no snapshots to restore. Workloads that write or need a
+clean slate get a scratch dir under `work/db-<wl>/<bin>` (w1/w3/w4
+wiped per unit, w7 per rep, w8 wiped once then accumulating across
+cycles), and w6 imports `regular.jsonl` into `work/db-w6/<bin>` once
+per rep.
+
 Workloads: w1 ingest saturation (closed conns × window, then open
-loop at fractions of the pilot-derived saturation); w2 the D2 query
-mix, warm and cold (drop_caches), plus D1 relayBench continuity; w3
+loop at the frozen per-relay `open_rates`); w2 the D2 query mix,
+warm and cold (drop_caches), plus D1 relayBench continuity; w3
 fanout broadcast and selective; w4 connection scale up to 50,000
 (harness binds spread over 127.0.0.2-127.0.0.9 when ports run out);
-w5 timed import → cold and warm queries → ingest on top → restart
-time to first REQ→EOSE; w6 NIP-77 `neg` over a 1M-event snapshot at
-0.1/1/10% diffs; w7 the 24 h soak profile per relay (negentropy and
-vanish skipped where unsupported); w8 crash durability: ack-ingest,
+w5 read-only query and restart-timing reps on the shared db, then
+ingest-on-top reps in sequence on the same db — the stored event
+count is recorded before each rep because the db grows a few
+percent per rep (the d2 import itself is timed by `prep`); w6
+NIP-77 `neg` over its freshly imported 1M-event db at 0.1/1/10%
+diffs; w7 the 24 h soak profile per relay (negentropy and vanish
+skipped where unsupported); w8 crash durability: ack-ingest,
 kill the relay at a seeded-random 2-20 s, restart, ack-check.
 
 The durability comparison adds a measurement-only build, never shipped,
