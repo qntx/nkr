@@ -1,0 +1,3 @@
+# Disable permessage-deflate negotiation entirely.
+[relay.compression]
+enabled = false

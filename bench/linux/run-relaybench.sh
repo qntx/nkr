@@ -10,7 +10,7 @@
 set -euo pipefail
 OUT=/bench/results
 RB=/bench/relaybench/bin/relaybench
-W=/bench/nosfry-relay.sh
+W=/bench/relays/nosfry.sh
 CORPUS=/bench/corpus/nostr_vitor_startup_data.json.gz
 mkdir -p "$OUT"
 ulimit -n 65536
@@ -24,7 +24,7 @@ run() {
     local args=()
     for relay in "${order[@]}"; do
         # bin or bin+variant; the variant is a config fragment under
-        # /bench/variants appended by nosfry-relay.sh.
+        # /bench/variants appended by relays/nosfry.sh.
         local bin="${relay%%+*}" variant=""
         if [ "$relay" != "$bin" ]; then
             variant=" /bench/variants/${relay#*+}.toml"

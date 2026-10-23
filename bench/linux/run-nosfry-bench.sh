@@ -23,33 +23,24 @@ RELAYS=(strfry "$@")
 start_relay() {
     local name="$1" dir="$2"
     rm -rf "$dir"; mkdir -p "$dir"
+    # An entry is bin or bin+variant; the variant selects a config
+    # fragment the relay's wrapper appends to the generated config
+    # (.toml for nosfry/nostr-rs, strfry syntax .conf for strfry).
+    local bin="${name%%+*}" variant=""
     case "$name" in
-        strfry)
-            mkdir -p "$dir/strfry-db"
-            cat > "$dir/strfry.conf" <<EOF
-db = "$dir/strfry-db"
-events {
-    maxEventSize = 65536
-    rejectEventsOlderThanSeconds = 3155760000
-    maxNumTags = 2000
-}
-relay {
-    bind = "127.0.0.1"
-    port = $PORT
-    nofiles = 0
-    maxWebsocketPayloadSize = 131072
-}
-EOF
-            "$BENCH/strfry-pinned.sh" --config "$dir/strfry.conf" relay > "$dir/relay.log" 2>&1 &
+        strfry|strfry+*)
+            [ "$name" != "$bin" ] && variant="$BENCH/variants/${name#*+}.conf"
+            "$BENCH/relays/strfry.sh" "$BENCH/strfry-1.1.3/strfry" "$PORT" "$dir" "$variant" \
+                > "$dir/relay.log" 2>&1 &
+            ;;
+        nostr-rs*|nostr-rs*+*)
+            [ "$name" != "$bin" ] && variant="$BENCH/variants/${name#*+}.toml"
+            "$BENCH/relays/nostr-rs-relay.sh" "$BENCH/bin/$bin" "$PORT" "$dir" "$variant" \
+                > "$dir/relay.log" 2>&1 &
             ;;
         *)
-            # An entry is bin or bin+variant; the variant selects a
-            # config fragment appended by nosfry-relay.sh.
-            local bin="${name%%+*}" variant=""
-            if [ "$name" != "$bin" ]; then
-                variant="$BENCH/variants/${name#*+}.toml"
-            fi
-            "$BENCH/nosfry-relay.sh" "$BENCH/bin/$bin" "$PORT" "$dir" "$variant" \
+            [ "$name" != "$bin" ] && variant="$BENCH/variants/${name#*+}.toml"
+            "$BENCH/relays/nosfry.sh" "$BENCH/bin/$bin" "$PORT" "$dir" "$variant" \
                 > "$dir/relay.log" 2>&1 &
             ;;
     esac
