@@ -75,7 +75,7 @@ admins = ["<64-char hex pubkey>"]         # NIP-86 management API, NIP-98 auth
 Notable knobs: `[events]` caps `max_event_size`, event age windows and tag
 limits; `[relay.filter_validation]` (`enabled`, `allowed_kinds`,
 `require_author_or_tag`) constrains REQ shapes; `[relay.rate_limits]` sets
-global and per-IP event/REQ buckets; `[relay.write_policy].plugin` loads an
+per-connection and per-address (`ip_*`) event/REQ token buckets; `[relay.write_policy].plugin` loads an
 external write-policy plugin with `timeout_seconds`;
 `[relay.auth].restricted_read_kinds` / `restrict_read_to_involved` gate
 reads on NIP-42 auth; `[relay.compression]` (`enabled`, `sliding_window`)
